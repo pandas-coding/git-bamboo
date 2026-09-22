@@ -242,6 +242,20 @@ impl WorkbenchError {
         }
     }
 
+    pub fn invalid_argument(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::INVALID_ARGUMENT,
+            message: msg.into(),
+        }
+    }
+
+    pub fn not_initialized(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::NOT_INITIALIZED,
+            message: msg.into(),
+        }
+    }
+
     pub fn epoch_mismatch(expected: u64, actual: u64) -> Self {
         Self {
             code: Self::EPOCH_MISMATCH,

@@ -1,5 +1,7 @@
 use tracing_subscriber::EnvFilter;
 
+use git_workbench_engine::server::WorkbenchServer;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -8,6 +10,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("git-workbench-engine starting");
 
-    // TODO: Step 8 — start tower-lsp server over stdio
+    let (server, notify_rx) = WorkbenchServer::new();
+    server.run(notify_rx).await;
+
+    tracing::info!("git-workbench-engine stopped");
     Ok(())
 }

@@ -29,3 +29,5 @@ async-trait = "0.1"
 crossbeam-channel = "0.5"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
