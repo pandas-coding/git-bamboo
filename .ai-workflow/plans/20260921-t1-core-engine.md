@@ -324,3 +324,19 @@ Before marking Phase 1 complete, run the following benchmarks and spikes:
 - .ai-workflow/research/20260921-git-workbench-research.md
 - (Phase 2 plan: `.ai-workflow/plans/20260921-t2-advanced-workflow.md` — to be created after Phase 1 approval)
 - (Phase 3 plan: `.ai-workflow/plans/20260921-t3-llm-agent.md` — to be created after Phase 1 approval)
+
+## Implementation Notes (added during implementation)
+
+1. **JSON-RPC server**: implemented manually (Content-Length framing over stdio) instead of `tower-lsp` — LSP machinery was unnecessary for a custom protocol; the dependency remains declared but unused and can be removed in cleanup.
+2. **Undo semantics**: snapshot-based cascade rollback. Each write transaction records pre- AND post-write snapshots. `undo(tx_id)` restores the pre-write snapshot and removes all journal entries ≥ tx_id from the stack. Undo is blocked (UNDO_BLOCKED) when current refs differ from the latest transaction's post-snapshot (external changes detection).
+3. **Epoch invalidation**: bumped both synchronously by the write queue (after each successful write) and by the fs watcher (coalesced 50ms batches). Double bumps are harmless — the epoch is an invalidation counter, not a sequence number.
+4. **fs watcher**: notify watches `.git/HEAD`, `.git/index`, `.git/packed-refs`, `.git/refs/` (recursive), `.git/sequencer/` (if present), and the worktree (recursive; `.git` internals other than the watched paths are filtered out). Events coalesce within 50ms.
+5. **Multi-session**: server supports one session (T1 simplification, `get_any_session`); multi-root arrives in T2 per plan.
+6. **Multi-step undo across restarts**: journal is `.git/git-workbench/undo/journal.jsonl`; transaction ids persist across restarts (next_id scans journal + snapshot files).
+
+## Benchmark Results (scaled-down, local)
+
+- Spike C: external terminal commit → refsChanged + graphInvalidated notifications in **8ms** (target <200ms) ✓
+- Spike D: 5 sequential writes → 5 undo snapshots, cascade undo of last 2 verified (switchBranch + stage, then createBranch deleted branch, commit reverted refs), audit.log has 5 entries ✓
+- Perf smoke (2000-commit repo, 1000 files, release build): full process (init + 3 graph pages + status with 20 dirty files) in **200ms** ✓
+  - Benchmark A (linux-scale repo) and Spike E (webview 60fps) require the full extension / large repo clone — deferred to validation with the extension in place.
