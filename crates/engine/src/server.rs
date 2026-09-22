@@ -202,6 +202,11 @@ impl WorkbenchServer {
         params: Value,
     ) -> Result<Value, WorkbenchError> {
         match method {
+            "getRefs" => {
+                let refs = crate::gix_read::read_refs(&session)
+                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                Ok(serde_json::to_value(refs).unwrap())
+            }
             "getGraph" => {
                 let viewport = parse_graph_viewport(&params)?;
                 let page = crate::gix_read::read_graph_page(&session, &viewport)
