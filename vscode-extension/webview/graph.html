@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Replaced at runtime by the extension host with a CSP pinned to this webview. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git Workbench — Commit Graph</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size, 13px);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+    }
+    #container {
+      position: relative;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #scroller {
+      position: absolute;
+      inset: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+    /* Defines the full virtual scroll height (total_approx * ROW_HEIGHT). */
+    #spacer {
+      width: 1px;
+      pointer-events: none;
+    }
+    #rows {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+    }
+    .row {
+      position: absolute;
+      left: 0;
+      right: 12px;
+      height: 24px;
+      line-height: 24px;
+      display: flex;
+      align-items: center;
+      white-space: nowrap;
+      overflow: hidden;
+      cursor: pointer;
+      box-sizing: border-box;
+    }
+    /* Left gutter where the canvas branch curves live. */
+    .row .graph-gap {
+      flex: 0 0 240px;
+    }
+    .row .message {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex: 1 1 auto;
+    }
+    .row .meta {
+      flex: 0 0 auto;
+      margin-left: 16px;
+      padding-left: 16px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .row .meta .author {
+      margin-right: 8px;
+    }
+    .row:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .row.selected {
+      background: var(--vscode-list-activeSelectionBackground);
+      color: var(--vscode-list-activeSelectionForeground);
+    }
+    /* Canvas overlay sits above the rows (branch curves), never intercepts input. */
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 240px;
+      height: 100%;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="scroller">
+      <div id="spacer"></div>
+      <div id="rows"></div>
+    </div>
+    <canvas id="overlay"></canvas>
+  </div>
+  <script type="module" src="./graph.js"></script>
+</body>
+</html>

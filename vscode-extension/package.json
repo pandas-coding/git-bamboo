@@ -57,6 +57,29 @@
         "command": "gitWorkbench.push",
         "title": "Push",
         "category": "Git Workbench"
+      },
+      {
+        "command": "gitWorkbench.commit",
+        "title": "Commit",
+        "category": "Git Workbench",
+        "icon": "$(check)"
+      },
+      {
+        "command": "gitWorkbench.stage",
+        "title": "Stage Changes",
+        "category": "Git Workbench",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitWorkbench.unstage",
+        "title": "Unstage Changes",
+        "category": "Git Workbench",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "gitWorkbench.openResource",
+        "title": "Open Changes",
+        "category": "Git Workbench"
       }
     ],
     "menus": {
@@ -67,10 +90,50 @@
           "when": "scmProvider == git-workbench"
         }
       ],
+      "scm/resourceState": [
+        {
+          "command": "gitWorkbench.stage",
+          "when": "scmProvider == git-workbench && scmResourceGroup in unstaged,untracked",
+          "group": "inline"
+        },
+        {
+          "command": "gitWorkbench.unstage",
+          "when": "scmProvider == git-workbench && scmResourceGroup == staged",
+          "group": "inline"
+        }
+      ],
+      "scm/resourceState/contextual": [
+        {
+          "command": "gitWorkbench.stage",
+          "when": "scmProvider == git-workbench && scmResourceGroup in unstaged,untracked",
+          "group": "1_workbench@1"
+        },
+        {
+          "command": "gitWorkbench.unstage",
+          "when": "scmProvider == git-workbench && scmResourceGroup == staged",
+          "group": "1_workbench@2"
+        }
+      ],
       "commandPalette": [
         {
           "command": "gitWorkbench.openGraph",
           "when": "git-workbench:active"
+        },
+        {
+          "command": "gitWorkbench.commit",
+          "when": "false"
+        },
+        {
+          "command": "gitWorkbench.stage",
+          "when": "false"
+        },
+        {
+          "command": "gitWorkbench.unstage",
+          "when": "false"
+        },
+        {
+          "command": "gitWorkbench.openResource",
+          "when": "false"
         }
       ]
     },
@@ -95,8 +158,10 @@
     }
   },
   "scripts": {
-    "compile": "vite build",
-    "watch": "vite build --watch",
+    "compile": "node build.js",
+    "watch": "node build.js --watch",
+    "build": "node build.js",
+    "typecheck": "tsc --noEmit",
     "package": "vsce package",
     "package-all": "bash ../scripts/package-all.sh"
   },
@@ -105,6 +170,6 @@
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^2.22.0",
     "typescript": "^5.4.0",
-    "vite": "^5.0.0"
+    "vite": "^8.0.0"
   }
 }
