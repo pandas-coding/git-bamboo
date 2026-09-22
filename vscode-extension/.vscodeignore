@@ -1,0 +1,8 @@
+src/
+node_modules/
+*.map
+vite.config.ts
+vite.webview.config.ts
+tsconfig.json
+build.js
+**/.gitignore

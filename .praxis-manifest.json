@@ -1,0 +1,237 @@
+{
+  "version": "1.0.0",
+  "installedAt": "2026-09-20T16:24:06.693346598+00:00",
+  "updatedAt": "2026-09-20T16:24:06.693346598+00:00",
+  "enabledTools": [
+    "pi-coding-agent"
+  ],
+  "selectedComponents": {
+    "skills": [
+      "agent-browser",
+      "figma-to-code",
+      "mobile-mcp"
+    ],
+    "reviewers": [
+      "agent-accessibility",
+      "architecture",
+      "code-quality",
+      "data-integrity",
+      "pattern-recognition",
+      "performance",
+      "security",
+      "simplicity"
+    ]
+  },
+  "files": {
+    "praxis/reviewer-output-format.md": {
+      "hash": "e2cd93f08b0f4ca57abb1bf2aa72ea45829b683cebe43817113285497fdcb9f3"
+    },
+    "praxis/agents/reviewers/architecture.md": {
+      "hash": "66a10c08de8ed2e740650d56c289f480c722cb261c791f36489a9f4e1f8b35ea",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-architecture.md"
+      }
+    },
+    "praxis/skills/pan-implement/SKILL.md": {
+      "hash": "23c654e58d0ae7577bbf56ae0c13ea081b7b27faecc60dd6661ca8185197d138",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-implement/SKILL.md"
+      }
+    },
+    "praxis/skills/agent-browser/references/session-management.md": {
+      "hash": "2ce531bf105aaf827a907a4e255e00321eef5994ca0e21e41c28489c0a8efebb",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/session-management.md"
+      }
+    },
+    "praxis/conventions.md": {
+      "hash": "0dfd107e8120c40860672c1aa64e02606be0e60f14b9a468d9c5f6a1e1f5977a"
+    },
+    "praxis/skills/mobile-mcp/SKILL.md": {
+      "hash": "c4971fbfe0b082044eef6f59ebbadcfdfe660c8985128e5eea6bdfb92726b75d",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/mobile-mcp/SKILL.md"
+      }
+    },
+    "praxis/skills/agent-browser/references/video-recording.md": {
+      "hash": "c2c12bd8c44e5d36fbb94cfc376180d47507d3c26a7ee8876b892fc700dcf332",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/video-recording.md"
+      }
+    },
+    "praxis/skills/mobile-mcp/mcp.json": {
+      "hash": "acdfc1b76baaeccce6ba8ae1354a908270e88876b54f554073760d13ccaf54c3",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/mobile-mcp/mcp.json"
+      }
+    },
+    "praxis/skills/pan-brainstorm/reference/template.md": {
+      "hash": "2d2eaa8172864ef2ffaca886d4c8d13f154e926addf2bdd90d38252a85b28e26",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-brainstorm/reference/template.md"
+      }
+    },
+    "praxis/agents/reviewers/agent-accessibility.md": {
+      "hash": "a6749f24ffe1f2b99c8b72f73dcadc4df363b66aa5b518f8d5e5954f342ba499",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-agent-accessibility.md"
+      }
+    },
+    "praxis/agents/external-researcher.md": {
+      "hash": "5929b1e9c409f613e0f2cfbf0dd2bfaecf775b1d59a328240b2ee5e7e722060b",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/external-researcher.md"
+      }
+    },
+    "praxis/skills/pan-plan/reference/template.md": {
+      "hash": "552a60f4e218dfeba49c83eeab438a470392dda7eeb92f3e09d5415b13677de8",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-plan/reference/template.md"
+      }
+    },
+    "praxis/skills/pan-retrospect/reference/template.md": {
+      "hash": "1feebeaa04592ef10a067d0ddd8792dcf3236846972982633cccfd496a85015b",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-retrospect/reference/template.md"
+      }
+    },
+    "praxis/skills/pan-review/SKILL.md": {
+      "hash": "25dc58a1def2a293109702cedf40c78012a7ba2cbeacb05e9e250bc5c95fbe06",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-review/SKILL.md"
+      }
+    },
+    "praxis/agents/codebase-explorer.md": {
+      "hash": "71d87fdee47610f82b350b3908a45704078fbad27a2d5edf404f8e014a88a80e",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/codebase-explorer.md"
+      }
+    },
+    "praxis/skills/pan-retrospect/SKILL.md": {
+      "hash": "5530fc1ad05089fd82b5016b6f1ea59d33ab80ce9577d794cad23fcc908aaf5e",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-retrospect/SKILL.md"
+      }
+    },
+    "praxis/skills/agent-browser/templates/capture-workflow.sh": {
+      "hash": "bf3f3a2f8413773891d9fa400d2a2fddf6d73ffc7a9b2fa00f797f944171c3d5",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/templates/capture-workflow.sh"
+      }
+    },
+    "praxis/skills/agent-browser/references/profiling.md": {
+      "hash": "15f1e6c7994d7471a274dc1476992d0ec178acd91f8b626e0d6f24a4dbef738f",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/profiling.md"
+      }
+    },
+    "praxis/agents/reviewers/data-integrity.md": {
+      "hash": "8f1924c5c1b282da409d6730de52d6b490ef1779c9d5508484c45eb8651c43c1",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-data-integrity.md"
+      }
+    },
+    "praxis/skills/agent-browser/references/commands.md": {
+      "hash": "cc6cc1780bb8632b3f7694ba454d895059235459469f0401fa251c20d4bbfd87",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/commands.md"
+      }
+    },
+    "praxis/agents/reviewers/code-quality.md": {
+      "hash": "2d4395daade345e6d26929803425798fcedeab008c49484d611021005bcaee35",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-code-quality.md"
+      }
+    },
+    "praxis/skills/agent-browser/SKILL.md": {
+      "hash": "2c7dab0e789873ae237207d5ff0d24f74579d088d878f0cd7e9982940f9f6ae9",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/SKILL.md"
+      }
+    },
+    "praxis/skills/agent-browser/templates/authenticated-session.sh": {
+      "hash": "1fa9926c36dbe71191120ce067e5e3babe732cd1cc605020f3bd04dc430aa58c",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/templates/authenticated-session.sh"
+      }
+    },
+    "praxis/agents/reviewers/security.md": {
+      "hash": "6521775b9514e894148727ea13dee12ac5a7b8fe460e527266d92b63f640b950",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-security.md"
+      }
+    },
+    "praxis/agents/reviewers/pattern-recognition.md": {
+      "hash": "f135dac594fc2cab93a6deb2970a663ea5361fe7a0fb32040bd4916925f07291",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-pattern-recognition.md"
+      }
+    },
+    "praxis/skills/agent-browser/references/proxy-support.md": {
+      "hash": "4c44ba60d9397523109fdbdf1d972739691856c5bf6bf1587fc58793c71b4671",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/proxy-support.md"
+      }
+    },
+    "praxis/skills/agent-browser/templates/form-automation.sh": {
+      "hash": "b86836986d339f736b15ca78cf3d566e845a6293ae25a5b00aa520b837572650",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/templates/form-automation.sh"
+      }
+    },
+    "praxis/agents/reviewers/performance.md": {
+      "hash": "2629cf5b3b4a35dd8382b0fee2b2402575d8ae8b562b575d251069f14e2825b8",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-performance.md"
+      }
+    },
+    "praxis/skills/agent-browser/references/snapshot-refs.md": {
+      "hash": "edfb3fd87f9cd631778b8323096485e4447e2ae85beed92299e5ba25b683f8c3",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/snapshot-refs.md"
+      }
+    },
+    "praxis/skills/figma-to-code/SKILL.md": {
+      "hash": "12b78c1224c9899ef0c23c2b2966f0d95b69140bf222c3ec682e56696f0fd965",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/figma-to-code/SKILL.md"
+      }
+    },
+    "praxis/skills/figma-to-code/mcp.json": {
+      "hash": "59b34c196eb209124c7a9bdb5021a919b1ab798d73ddf7f186578d87e0922fea",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/figma-to-code/mcp.json"
+      }
+    },
+    "praxis/skills/pan-brainstorm/SKILL.md": {
+      "hash": "8ddf0b5d3bf738ac1294e9e57f14f711c196a6d2f7195f1ea5331c0aa040acf9",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-brainstorm/SKILL.md"
+      }
+    },
+    "praxis/agents/reviewers/simplicity.md": {
+      "hash": "dd6d1922437bb25627378c753d8c40436cd8e24b1d638c22d0b7ab4eee200d8e",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/reviewer-simplicity.md"
+      }
+    },
+    "praxis/skills/agent-browser/references/authentication.md": {
+      "hash": "cd56ddc957da3705a2dd2b6956c36a41d0366543f645d2ef1b309dcdee5cdd0e",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/agent-browser/references/authentication.md"
+      }
+    },
+    "praxis/agents/knowledge-reviewer.md": {
+      "hash": "0fa4850b01ed04e2782fb100921b44eae144c2dc83e8593768b788e789a36baa",
+      "destinations": {
+        "pi-coding-agent": ".pi/prompts/knowledge-reviewer.md"
+      }
+    },
+    "praxis/skills/pan-plan/SKILL.md": {
+      "hash": "42f954d718c64560e1790e151e2ecc8ba1a0347b796214c3c1f21949aeef522c",
+      "destinations": {
+        "pi-coding-agent": ".pi/skills/pan-plan/SKILL.md"
+      }
+    }
+  }
+}

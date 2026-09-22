@@ -1,7 +1,7 @@
 ---
 title: T1 Core Engine — Rust Daemon + VS Code Extension Skeleton + Status/Graph/Undo Foundation
 date: 2026-09-21
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20260921-rust-vscode-git-workbench.md
 group: git-workbench

@@ -1,0 +1,110 @@
+{
+  "name": "git-workbench",
+  "displayName": "Git Workbench",
+  "description": "High-performance git workbench with virtual-scrolled commit graph and undo engine",
+  "version": "0.1.0",
+  "publisher": "git-workbench",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["SCM Providers", "Other"],
+  "activationEvents": [
+    "onCommand:gitWorkbench.openGraph"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitWorkbench.openGraph",
+        "title": "Open Commit Graph",
+        "category": "Git Workbench",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "gitWorkbench.undo",
+        "title": "Undo Last Operation",
+        "category": "Git Workbench",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "gitWorkbench.switchBranch",
+        "title": "Switch Branch...",
+        "category": "Git Workbench",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "gitWorkbench.createBranch",
+        "title": "Create Branch...",
+        "category": "Git Workbench"
+      },
+      {
+        "command": "gitWorkbench.deleteBranch",
+        "title": "Delete Branch...",
+        "category": "Git Workbench"
+      },
+      {
+        "command": "gitWorkbench.fetch",
+        "title": "Fetch",
+        "category": "Git Workbench",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "gitWorkbench.pull",
+        "title": "Pull",
+        "category": "Git Workbench"
+      },
+      {
+        "command": "gitWorkbench.push",
+        "title": "Push",
+        "category": "Git Workbench"
+      }
+    ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "gitWorkbench.openGraph",
+          "group": "navigation",
+          "when": "scmProvider == git-workbench"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "gitWorkbench.openGraph",
+          "when": "git-workbench:active"
+        }
+      ]
+    },
+    "views": {
+      "scm": [
+        {
+          "id": "gitWorkbench.graph",
+          "name": "Commit Graph",
+          "when": "scmProvider == git-workbench",
+          "type": "webview"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "gitWorkbench",
+          "title": "Git Workbench",
+          "icon": "$(source-control)"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "vite build",
+    "watch": "vite build --watch",
+    "package": "vsce package",
+    "package-all": "bash ../scripts/package-all.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0"
+  }
+}
