@@ -1,0 +1,34 @@
+# Rust
+target/
+Cargo.lock
+
+# Node / VS Code extension
+node_modules/
+out/
+*.vsix
+.vscode-test/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# AI workflow internals (keep planning docs, ignore transient files)
+.ai-workflow/tags
+
+# Temporary files
+tmp/
+temp/
