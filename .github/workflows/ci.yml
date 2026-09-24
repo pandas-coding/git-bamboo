@@ -78,6 +78,9 @@ jobs:
         # Pinned @vscode/vsce from package-lock.json — no global installs.
         working-directory: vscode-extension
         run: npm ci
+      - name: Build Extension
+        working-directory: vscode-extension
+        run: npm run build
       - name: Copy Binary
         shell: bash
         run: |
