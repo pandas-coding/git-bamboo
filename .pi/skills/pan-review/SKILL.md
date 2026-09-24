@@ -21,7 +21,7 @@ If no arguments, ask the user what to review.
 
 ### 2. Discover and select reviewers
 
-Scan `../agents/reviewers/` for all reviewer agent definitions. Each `.md` file in that directory is a reviewer to run.
+Scan `../../agents/reviewers/` for all reviewer agent definitions. Each `.md` file in that directory is a reviewer to run.
 
 If the directory is empty or doesn't exist, inform the user and stop.
 
@@ -29,7 +29,7 @@ If the directory is empty or doesn't exist, inform the user and stop.
 
 ### 3. Run reviewers in parallel
 
-Launch all discovered reviewers as parallel sub-agents using `Task`. Each reviewer receives:
+Launch all discovered reviewers as parallel sub-agents using the harness's sub-agent tool (`Agent` in pi, `Task` in Claude Code). Each reviewer receives:
 - The list of files to review
 - **The diff only** — never send full file contents. Use `git diff` output so reviewers focus on what changed. Include enough surrounding context lines (`git diff -U8`) for reviewers to understand the change, but no more.
 
@@ -57,7 +57,7 @@ After presenting findings, ask the user which (if any) they want to fix. Only ma
 
 ## Reviewer agent conventions
 
-Each reviewer in `../agents/reviewers/` must follow the output format defined in `../reviewer-output-format.md`.
+Each reviewer in `../../agents/reviewers/` must follow the output format defined in `../../reviewer-output-format.md`.
 
 ## Behavioral rules
 
