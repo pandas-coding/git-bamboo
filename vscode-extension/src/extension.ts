@@ -15,8 +15,57 @@ import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
 
 let activeClient: EngineClient | undefined;
+let activeState: RepoState | undefined;
+
+/** Shown when a command runs without a repository session (no repo folder
+ *  open, or the engine failed to start): silent no-ops are terrible UX. */
+function noSessionWarning(): void {
+  vscode.window.showWarningMessage(
+    'Git Workbench: no repository session. Open a folder containing a git ' +
+      'repository in this window (WSL side, e.g. ~/my-repo) — the workbench ' +
+      'activates automatically once a repo folder is open.',
+  );
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Commands are registered unconditionally (even before a repo is open) so
+  // palette entries never dead-end silently; handlers guard on the session.
+  registerCommand(context, 'gitWorkbench.openGraph', async () => {
+    if (!activeClient || !activeState) {
+      noSessionWarning();
+      return;
+    }
+    try {
+      await vscode.commands.executeCommand('gitWorkbench.graph.focus');
+    } catch {
+      vscode.window.showErrorMessage(
+        'Git Workbench: graph view unavailable — the engine did not start for this workspace.',
+      );
+    }
+  });
+  registerCommand(context, 'gitWorkbench.undo', () =>
+    activeClient ? commands.undoLast(activeClient) : noSessionWarning());
+  registerCommand(context, 'gitWorkbench.switchBranch', () =>
+    activeClient ? commands.switchBranch(activeClient) : noSessionWarning());
+  registerCommand(context, 'gitWorkbench.createBranch', () =>
+    activeClient ? commands.createBranch(activeClient) : noSessionWarning());
+  registerCommand(context, 'gitWorkbench.deleteBranch', () =>
+    activeClient && activeState
+      ? commands.deleteBranch(activeClient, activeState)
+      : noSessionWarning());
+  registerCommand(context, 'gitWorkbench.fetch', () =>
+    activeClient ? commands.fetchRemotes(activeClient) : noSessionWarning());
+  registerCommand(context, 'gitWorkbench.pull', () =>
+    activeClient && activeState
+      ? commands.pull(activeClient, activeState)
+      : noSessionWarning());
+  registerCommand(context, 'gitWorkbench.push', () =>
+    activeClient && activeState
+      ? commands.push(activeClient, activeState)
+      : noSessionWarning());
+  // gitWorkbench.commit / stage / unstage / openResource are registered by
+  // WorkbenchSCMProvider (they only make sense with a live session).
+
   // T1 scope: single repository — use the first workspace folder with a .git.
   const folder = vscode.workspace.workspaceFolders?.find((f) =>
     fs.existsSync(path.join(f.uri.fsPath, '.git')),
@@ -45,18 +94,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const state: RepoState = {
     epoch: init.epoch,
-    currentBranch: readCurrentBranch(folder.uri.fsPath),
+    currentBranch: undefined,
   };
+  activeState = state;
 
   const scm = new WorkbenchSCMProvider(client, folder.uri);
   context.subscriptions.push(scm);
 
   const graph = new GraphWebviewProvider(context, client, state);
+  context.subscriptions.push(graph);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(GraphWebviewProvider.viewId, graph, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
   );
+  // graphInvalidated is handled inside GraphWebviewProvider (it owns its
+  // own engine subscription so dispose() can unhook it).
+
+  // TODO(ahead-behind): showing ahead/behind counts needs upstream tracking
+  // info, which the engine does not expose yet.
+  const branchItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  context.subscriptions.push(branchItem);
+
+  /** Refreshes current branch + status bar from the engine's getHead RPC. */
+  const refreshHead = async (): Promise<void> => {
+    try {
+      const { head, branch } = await client.getHead();
+      state.currentBranch = branch ?? undefined;
+      branchItem.text = `$(git-branch) ${branch ?? head.slice(0, 8)}`;
+      branchItem.tooltip = branch
+        ? `Git Workbench: on branch ${branch}`
+        : `Git Workbench: detached HEAD at ${head}`;
+      branchItem.show();
+    } catch (err) {
+      console.error('[git-workbench] getHead failed:', err);
+    }
+  };
+  await refreshHead();
 
   // Engine notifications drive all UI refreshes.
   onNotification(client, context, 'refsChanged', () => scm.refresh());
@@ -65,28 +139,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     state.epoch = numberField(params, 'epoch', state.epoch);
     scm.refresh();
   });
-  onNotification(client, context, 'headChanged', (params) => {
-    state.epoch = numberField(params, 'epoch', state.epoch);
-    const newHead = params['new_head'];
-    if (typeof newHead === 'string') state.currentBranch = branchFromHead(newHead);
+  onNotification(client, context, 'headChanged', () => {
+    void refreshHead();
     scm.refresh();
   });
-  onNotification(client, context, 'graphInvalidated', (params) => {
-    state.epoch = numberField(params, 'epoch', state.epoch);
-    graph.invalidate(state.epoch);
-  });
-
-  registerCommand(context, 'gitWorkbench.openGraph', () =>
-    vscode.commands.executeCommand('gitWorkbench.graph.focus'),
-  );
-  registerCommand(context, 'gitWorkbench.undo', () => commands.undoLast(client));
-  registerCommand(context, 'gitWorkbench.switchBranch', () => commands.switchBranch(client));
-  registerCommand(context, 'gitWorkbench.createBranch', () => commands.createBranch(client));
-  registerCommand(context, 'gitWorkbench.deleteBranch', () => commands.deleteBranch(client, state));
-  registerCommand(context, 'gitWorkbench.fetch', () => commands.fetchRemotes(client));
-  registerCommand(context, 'gitWorkbench.pull', () => commands.pull(client, state));
-  registerCommand(context, 'gitWorkbench.push', () => commands.push(client, state));
-  // gitWorkbench.commit / stage / unstage / openResource are registered by WorkbenchSCMProvider.
 
   // Enables commandPalette `when: git-workbench:active` visibility rules.
   await vscode.commands.executeCommand('setContext', 'git-workbench:active', true);
@@ -95,37 +151,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export async function deactivate(): Promise<void> {
   await activeClient?.dispose();
   activeClient = undefined;
+  activeState = undefined;
 }
 
 /**
- * Dev-first binary resolution: bundled server/ copy, then the repo's
- * target/release and target/debug builds (context.asAbsolutePath is
- * relative to the extension install root).
+ * Binary resolution: the bundled `server/` copy first (production order
+ * unchanged), then dev fallbacks — the repo checkout's target/debug and
+ * target/release builds, relative to the extension root — so dev runs
+ * work without copying the binary.
  */
 function resolveEngineBinary(context: vscode.ExtensionContext): string | undefined {
   const suffix = process.platform === 'win32' ? '.exe' : '';
   const name = `git-workbench-engine${suffix}`;
-  const candidates = [
-    context.asAbsolutePath(path.join('server', name)),
-    context.asAbsolutePath(path.join('..', '..', 'target', 'release', name)),
-    context.asAbsolutePath(path.join('..', '..', 'target', 'debug', name)),
+  const bundled = context.asAbsolutePath(path.join('server', name));
+  if (fs.existsSync(bundled)) return bundled;
+
+  const devCandidates = [
+    context.asAbsolutePath(path.join('..', 'target', 'debug', name)),
+    context.asAbsolutePath(path.join('..', 'target', 'release', name)),
   ];
-  return candidates.find((candidate) => fs.existsSync(candidate));
-}
-
-function readCurrentBranch(root: string): string | undefined {
-  try {
-    const head = fs.readFileSync(path.join(root, '.git', 'HEAD'), 'utf8');
-    return branchFromHead(head);
-  } catch {
-    return undefined; // detached HEAD, worktree .git file, or unreadable
+  const dev = devCandidates.find((candidate) => fs.existsSync(candidate));
+  if (dev) {
+    console.warn(`[git-workbench] engine binary not bundled; using dev build at ${dev}`);
+    return dev;
   }
-}
-
-/** "ref: refs/heads/main" -> "main"; detached HEAD -> undefined. */
-function branchFromHead(rawHead: string): string | undefined {
-  const match = /^ref:\s*refs\/heads\/(.+)$/m.exec(rawHead.trim());
-  return match ? match[1] : undefined;
+  return undefined;
 }
 
 function numberField(params: Record<string, unknown>, key: string, fallback: number): number {

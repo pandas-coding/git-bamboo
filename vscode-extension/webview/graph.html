@@ -62,6 +62,26 @@
       text-overflow: ellipsis;
       flex: 1 1 auto;
     }
+    /* Branch-tip tags rendered next to commits that refs point at. */
+    .row .branch-tags {
+      flex: 0 0 auto;
+      margin-left: 8px;
+      display: flex;
+      gap: 4px;
+      overflow: hidden;
+    }
+    .row .branch-tag {
+      flex: 0 0 auto;
+      padding: 0 5px;
+      height: 16px;
+      line-height: 16px;
+      border: 1px solid;
+      border-radius: 4px;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      background: var(--vscode-editorWidget-background, transparent);
+      box-sizing: border-box;
+    }
     .row .meta {
       flex: 0 0 auto;
       margin-left: 16px;

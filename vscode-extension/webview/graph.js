@@ -11,7 +11,7 @@
 
   const ROW_HEIGHT = 24;
   const ROW_BUFFER = 20; // rows rendered beyond each edge of the viewport
-  const VIEWPORT_DEBOUNCE_MS = 32;
+  const VIEWPORT_DEBOUNCE_MS = 16;
   const GRAPH_WIDTH = 240; // must match the .graph-gap / #overlay CSS widths
   const LANE_X_START = 14;
   const LANE_X_STEP = 12;
@@ -26,6 +26,9 @@
   const rowsEl = document.getElementById('rows');
   const canvas = document.getElementById('overlay');
   const ctx = canvas.getContext('2d');
+
+  /** Branch names by commit id (branch tips, from the extension's getRefs). */
+  let branchTips = new Map();
 
   /** Virtual row index -> commit (trimmed to roughly the last 2 viewports). */
   const commits = new Map();
@@ -94,6 +97,11 @@
         el.className = 'row';
         el.style.top = `${row * ROW_HEIGHT}px`;
         el.addEventListener('click', () => selectRow(row));
+        // Double-click requests a (detached) checkout of that commit.
+        el.addEventListener('dblclick', () => {
+          const commit = commits.get(row);
+          if (commit) vscode.postMessage({ type: 'checkoutCommit', id: commit.id });
+        });
         rowsEl.appendChild(el);
         rowEls.set(row, el);
       }
@@ -120,6 +128,20 @@
     message.className = 'message';
     message.textContent = commit.message.split('\n')[0];
     el.appendChild(message);
+
+    const tips = branchTips.get(commit.id);
+    if (tips) {
+      const tags = document.createElement('span');
+      tags.className = 'branch-tags';
+      for (const name of tips) {
+        const tag = document.createElement('span');
+        tag.className = 'branch-tag';
+        tag.style.borderColor = tagColor(name);
+        tag.textContent = name; // textContent-only: ref names are untrusted
+        tags.appendChild(tag);
+      }
+      el.appendChild(tags);
+    }
 
     const meta = document.createElement('span');
     meta.className = 'meta';
@@ -148,6 +170,15 @@
     } catch {
       return '';
     }
+  }
+
+  /** Stable color per branch name (same palette as the lanes). */
+  function tagColor(name) {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = (hash * 31 + name.charCodeAt(i)) | 0;
+    }
+    return LANE_COLORS[Math.abs(hash) % LANE_COLORS.length];
   }
 
   // ------------------------------------------------------------------- canvas
@@ -292,11 +323,26 @@
       applyPage(message.offset | 0, message.page);
     } else if (message.type === 'graphInvalidated') {
       invalidate();
+    } else if (message.type === 'refs' && Array.isArray(message.refs)) {
+      applyRefs(message.refs);
     }
   });
 
+  /** Index branch tips by target commit id and re-render visible rows. */
+  function applyRefs(refs) {
+    branchTips = new Map();
+    for (const ref of refs) {
+      if (!ref || ref.kind !== 'branch' || typeof ref.name !== 'string' || !ref.target) continue;
+      const list = branchTips.get(ref.target);
+      if (list) list.push(ref.name);
+      else branchTips.set(ref.target, [ref.name]);
+    }
+    // Force re-fill of already-rendered rows so tags appear without a scroll.
+    for (const el of rowEls.values()) el.dataset.commitId = '';
+    renderRows();
+  }
+
   // Initial load.
   renderRows();
-  vscode.postMessage({ type: 'ready' });
   requestViewport();
 })();

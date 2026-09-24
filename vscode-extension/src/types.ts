@@ -17,6 +17,8 @@ export interface StatusItem {
   path: string;
   status: StatusCode;
   old_path?: string;
+  /** Whether the change is staged (index vs HEAD) vs a worktree change. */
+  staged: boolean;
 }
 
 export interface Commit {
@@ -51,6 +53,14 @@ export interface Ref {
   name: string;
   kind: RefKind;
   target: string;
+}
+
+/** Result of the engine's `getHead` RPC (replaces parsing `.git/HEAD`). */
+export interface GetHeadResult {
+  /** Full HEAD commit sha. */
+  head: string;
+  /** Short branch name like "main"; null when HEAD is detached. */
+  branch: string | null;
 }
 
 export interface UndoEntry {

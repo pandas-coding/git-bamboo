@@ -15,7 +15,7 @@ pub struct Commit {
     pub author_email: String,
     pub author_time: i64,
     pub parent_ids: Vec<String>,
-    pub lane: u8,
+    pub lane: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +38,10 @@ pub struct StatusItem {
     pub path: String,
     pub status: StatusCode,
     pub old_path: Option<String>,
+    /// Whether the change is staged (index vs HEAD) as opposed to a
+    /// worktree change (index vs worktree). `Modified`/`Deleted` can be
+    /// either; this flag disambiguates them for the SCM view.
+    pub staged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,9 +89,43 @@ pub struct Initialize {
     pub repo_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InitializeResult {
     pub session_id: SessionId,
+    pub protocol_version: u32,
+    pub engine_version: String,
+    /// The session's epoch at response time (may already have been bumped
+    /// by the fs watcher between session open and this response).
+    pub epoch: u64,
+    pub capabilities: Capabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Capabilities {
+    pub graph: bool,
+    pub status: bool,
+    #[serde(rename = "writeOps")]
+    pub write_ops: bool,
+    pub undo: bool,
+    pub notifications: bool,
+}
+
+/// Result of git commands whose stdout is surfaced to the user
+/// (`switchBranch`, `fetch`, `pull`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputResult {
+    pub output: String,
+}
+
+/// Result of the `undo` request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndoResponse {
+    pub restored_refs: usize,
+    /// Informational only; not serialized to keep the wire format
+    /// identical to the original hand-rolled response.
+    #[serde(skip)]
+    pub noop: bool,
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +136,21 @@ pub struct GetGraph {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStatus {
     pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBlob {
+    pub revision: String,
+    pub path: String,
+}
+
+/// Result of `getHead`: current HEAD and branch (worktree-safe; replaces
+/// clients parsing `.git/HEAD` directly).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GetHeadResult {
+    pub head: String,
+    /// Short branch name (e.g. "main"); `None` when HEAD is detached.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +166,7 @@ pub struct Unstage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitMsg {
     pub message: String,
+    #[serde(default)]
     pub amend: bool,
 }
 
@@ -130,12 +184,16 @@ pub struct CreateBranch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteBranch {
     pub name: String,
+    #[serde(default)]
     pub force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwitchBranch {
     pub name: String,
+    /// Defaults to `true` when absent, matching the original hand-rolled
+    /// parser's behavior.
+    #[serde(default = "default_true")]
     pub auto_stash: bool,
 }
 
@@ -154,6 +212,7 @@ pub struct Pull {
 pub struct Push {
     pub remote: String,
     pub branch: String,
+    #[serde(default)]
     pub force: bool,
 }
 
@@ -169,8 +228,15 @@ pub struct UndoResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Raw (unclamped) limit as sent by the client; the server clamps it
+/// to [1, 500] before use.
 pub struct ListUndoStack {
-    pub limit: u32,
+    #[serde(default = "default_limit")]
+    pub limit: u64,
+}
+
+fn default_limit() -> u64 {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,9 +251,14 @@ pub struct UndoEntry {
 // JSON-RPC notification types (server → client)
 // ---------------------------------------------------------------------------
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefsChanged {
     pub changed_refs: Vec<String>,
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,11 +267,14 @@ pub struct WorktreeChanged {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexChanged;
+pub struct IndexChanged {
+    pub epoch: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadChanged {
     pub new_head: String,
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,7 +296,6 @@ pub struct WorkbenchError {
 impl WorkbenchError {
     pub const REPO_NOT_FOUND: i32 = -32001;
     pub const GIT_ERROR: i32 = -32002;
-    pub const CONCURRENT_OPERATION: i32 = -32003;
     pub const EPOCH_MISMATCH: i32 = -32004;
     pub const INVALID_ARGUMENT: i32 = -32005;
     pub const NOT_INITIALIZED: i32 = -32006;

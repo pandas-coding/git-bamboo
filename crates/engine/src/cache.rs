@@ -1,77 +1,168 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use git_workbench_protocol::Commit;
-
 const COMMIT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("commit_meta");
-const COMMIT_LANES: TableDefinition<&str, u8> = TableDefinition::new("commit_lanes");
+const COMMIT_LANES: TableDefinition<&str, u16> = TableDefinition::new("commit_lanes");
 const CACHE_EPOCH: TableDefinition<&str, u64> = TableDefinition::new("cache_epoch");
+const REPO_FINGERPRINT: TableDefinition<&str, &str> = TableDefinition::new("repo_fingerprint");
 
 const EPOCH_KEY: &str = "epoch";
+const FINGERPRINT_KEY: &str = "fingerprint";
+
+/// The immutable, lane-less part of [`git_workbench_protocol::Commit`]
+/// stored in COMMIT_META. Keyed by object id, so entries never go stale —
+/// only the lane table is epoch-guarded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedCommit {
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_time: i64,
+    pub parent_ids: Vec<String>,
+}
 
 pub struct Cache {
     db: Database,
 }
 
 impl Cache {
-    pub fn open(repo_path: &Path) -> anyhow::Result<Self> {
-        let cache_dir = repo_path.join(".git").join("git-workbench");
+    /// Open (or create) the cache inside `git_dir/git-workbench` and
+    /// reconcile the durable epoch with the repository fingerprint.
+    ///
+    /// Returns the cache and the epoch the session must start with:
+    /// - no stored state → epoch 1;
+    /// - stored fingerprint matches → reuse the stored epoch;
+    /// - stored fingerprint differs (refs moved while the engine was down,
+    ///   possibly a different history) → clear COMMIT_META/COMMIT_LANES and
+    ///   bump the epoch (stored + 1).
+    ///
+    /// The fingerprint check, table clearing and epoch write happen in ONE
+    /// redb write transaction, so a crash can never leave a poisoned cache
+    /// (cleared tables with a stale epoch or vice versa).
+    pub fn open(git_dir: &Path, fingerprint: &str) -> anyhow::Result<(Self, u64)> {
+        let cache_dir = git_dir.join("git-workbench");
         std::fs::create_dir_all(&cache_dir)?;
         let db_path = cache_dir.join("cache.redb");
-        let db = Database::create(&db_path)?;
+        // redb takes an exclusive file lock; a just-replaced session may
+        // still be releasing it (its watcher thread can hold the last
+        // Arc briefly), so retry for a short while.
+        let db = open_with_retry(&db_path)?;
 
-        // Ensure tables exist.
-        let txn = db.begin_write()?;
+        // Ensure all tables exist before reading them.
         {
-            let _ = txn.open_table(COMMIT_META)?;
-            let _ = txn.open_table(COMMIT_LANES)?;
-            let _ = txn.open_table(CACHE_EPOCH)?;
+            let txn = db.begin_write()?;
+            {
+                let _ = txn.open_table(COMMIT_META)?;
+                let _ = txn.open_table(COMMIT_LANES)?;
+                let _ = txn.open_table(CACHE_EPOCH)?;
+                let _ = txn.open_table(REPO_FINGERPRINT)?;
+            }
+            txn.commit()?;
         }
-        txn.commit()?;
 
-        info!(db_path = %db_path.display(), "cache opened");
-        Ok(Self { db })
+        // Read the stored state first.
+        let (stored_fp, stored_epoch) = {
+            let txn = db.begin_read()?;
+            let fp = txn.open_table(REPO_FINGERPRINT)?.get(FINGERPRINT_KEY)?.map(|v| v.value().to_string());
+            let epoch = txn.open_table(CACHE_EPOCH)?.get(EPOCH_KEY)?.map(|v| v.value());
+            (fp, epoch)
+        };
+
+        let epoch = match (&stored_fp, stored_epoch) {
+            (Some(fp), Some(e)) if fp == fingerprint => {
+                // Repository unchanged since the last run: reuse the epoch.
+                e
+            }
+            _ => {
+                let new_epoch = stored_epoch.unwrap_or(0) + 1;
+                if stored_epoch.is_some() {
+                    warn!(
+                        new_epoch,
+                        "repo fingerprint changed since last run; clearing cache and bumping epoch"
+                    );
+                }
+                let txn = db.begin_write()?;
+                {
+                    let mut meta = txn.open_table(COMMIT_META)?;
+                    let mut lanes = txn.open_table(COMMIT_LANES)?;
+                    let mut epoch_table = txn.open_table(CACHE_EPOCH)?;
+                    let mut fp_table = txn.open_table(REPO_FINGERPRINT)?;
+                    clear_table(&mut meta)?;
+                    clear_table(&mut lanes)?;
+                    epoch_table.insert(EPOCH_KEY, new_epoch)?;
+                    fp_table.insert(FINGERPRINT_KEY, fingerprint)?;
+                }
+                txn.commit()?;
+                new_epoch
+            }
+        };
+
+        info!(db_path = %db_path.display(), epoch, "cache opened");
+        Ok((Self { db }, epoch))
     }
 
-    pub fn get_commit_meta(&self, id: &str) -> anyhow::Result<Option<Commit>> {
+    /// Look up commit metadata for many ids in a single read transaction.
+    /// COMMIT_META is keyed by immutable object ids, so hits are always
+    /// fresh regardless of the epoch.
+    pub fn get_commit_metas(
+        &self,
+        ids: &[String],
+    ) -> anyhow::Result<HashMap<String, CachedCommit>> {
+        let mut out = HashMap::with_capacity(ids.len());
         let txn = self.db.begin_read()?;
         let table = txn.open_table(COMMIT_META)?;
-        match table.get(id)? {
-            Some(bytes) => {
-                let commit = serde_json::from_slice(bytes.value())?;
-                Ok(Some(commit))
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
             }
-            None => Ok(None),
+            if let Some(bytes) = table.get(id.as_str())? {
+                if let Ok(meta) = serde_json::from_slice::<CachedCommit>(bytes.value()) {
+                    out.insert(id.clone(), meta);
+                }
+            }
         }
+        Ok(out)
     }
 
-    pub fn put_commit_meta(&self, id: &str, commit: &Commit) -> anyhow::Result<()> {
+    /// Persist commit metadata for many commits in a single write
+    /// transaction.
+    pub fn put_commit_metas(&self, entries: &[(String, CachedCommit)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(COMMIT_META)?;
-            let bytes = serde_json::to_vec(commit)?;
-            table.insert(id, bytes.as_slice())?;
+            for (id, meta) in entries {
+                let bytes = serde_json::to_vec(meta)?;
+                table.insert(id.as_str(), bytes.as_slice())?;
+            }
         }
         txn.commit()?;
         Ok(())
     }
 
-    pub fn get_lane(&self, id: &str) -> anyhow::Result<Option<u8>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(COMMIT_LANES)?;
-        Ok(table.get(id)?.map(|v| v.value()))
-    }
-
-    pub fn put_lane(&self, id: &str, lane: u8, epoch: u64) -> anyhow::Result<()> {
+    /// Persist lane assignments together with the epoch they are valid for
+    /// in ONE write transaction (crash between the two writes would
+    /// otherwise poison the cache).
+    pub fn put_lanes_with_epoch(&self, lanes: &[(String, u16)], epoch: u64) -> anyhow::Result<()> {
+        if lanes.is_empty() {
+            return Ok(());
+        }
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(COMMIT_LANES)?;
-            table.insert(id, lane)?;
+            for (id, lane) in lanes {
+                table.insert(id.as_str(), *lane)?;
+            }
+            let mut epoch_table = txn.open_table(CACHE_EPOCH)?;
+            epoch_table.insert(EPOCH_KEY, epoch)?;
         }
         txn.commit()?;
-        self.set_cached_epoch(epoch)?;
         Ok(())
     }
 
@@ -81,16 +172,9 @@ impl Cache {
         Ok(table.get(EPOCH_KEY)?.map(|v| v.value()))
     }
 
-    fn set_cached_epoch(&self, epoch: u64) -> anyhow::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(CACHE_EPOCH)?;
-            table.insert(EPOCH_KEY, epoch)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
+    /// If the cached epoch does not match `current_epoch`, clear the lane
+    /// table and record the new epoch — both in a single write transaction.
+    /// Returns whether a clear happened.
     pub fn invalidate_on_epoch_change(&self, current_epoch: u64) -> anyhow::Result<bool> {
         let cached = self.get_cached_epoch()?;
         if cached != Some(current_epoch) {
@@ -98,21 +182,48 @@ impl Cache {
             let txn = self.db.begin_write()?;
             {
                 let mut table = txn.open_table(COMMIT_LANES)?;
-                // Remove all entries (redb has no Table::clear in 2.x).
-                let keys: Vec<String> = table
-                    .iter()?
-                    .filter_map(|e| e.ok())
-                    .map(|(k, _)| k.value().to_string())
-                    .collect();
-                for k in keys {
-                    table.remove(k.as_str())?;
-                }
+                clear_table(&mut table)?;
+                let mut epoch_table = txn.open_table(CACHE_EPOCH)?;
+                epoch_table.insert(EPOCH_KEY, current_epoch)?;
             }
             txn.commit()?;
-            self.set_cached_epoch(current_epoch)?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
+}
+
+/// Remove all entries from a redb table (redb 2.x has no `clear`).
+fn clear_table<'t, V: redb::Value + 'static>(
+    table: &mut redb::Table<'t, &str, V>,
+) -> anyhow::Result<()> {
+    let keys: Vec<String> = table
+        .iter()?
+        .filter_map(|e| e.ok())
+        .map(|(k, _)| k.value().to_string())
+        .collect();
+    for k in keys {
+        table.remove(k.as_str())?;
+    }
+    Ok(())
+}
+
+/// Open the cache database, retrying briefly while a previous handle in
+/// this process is still releasing the exclusive file lock.
+fn open_with_retry(db_path: &Path) -> anyhow::Result<Database> {
+    let mut last_err = None;
+    for _ in 0..20 {
+        match Database::create(db_path) {
+            Ok(db) => return Ok(db),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "failed to open cache database {}: {last_err:?}",
+        db_path.display()
+    ))
 }

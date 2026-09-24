@@ -299,7 +299,7 @@ Before marking Phase 1 complete, run the following benchmarks and spikes:
 
 ## Acceptance Criteria
 
-- [x] `cargo test --workspace` passes (15 tests: 11 engine integration + 4 protocol); >80% coverage target not formally measured
+- [x] `cargo test --workspace` passes (34 tests: 25 engine integration + 9 protocol — grown from 15 during the post-review hardening pass); >80% coverage target not formally measured
 - [x] `cargo build --release` produces a single `git-workbench-engine` binary (verified on linux-x64; cross-platform targets defined in CI matrix)
 - [x] VS Code extension compiles clean (tsc --noEmit zero errors) and builds via vite; activates/spawns engine/connects via stdio — code paths verified by the subagent's live smoke test against the real engine binary; full in-editor activation pending manual VS Code run
 - [x] Opening a git repository initializes a Session, starts fs watcher, and loads/creates redb cache (verified e2e + integration tests)
@@ -333,6 +333,22 @@ Before marking Phase 1 complete, run the following benchmarks and spikes:
 4. **fs watcher**: notify watches `.git/HEAD`, `.git/index`, `.git/packed-refs`, `.git/refs/` (recursive), `.git/sequencer/` (if present), and the worktree (recursive; `.git` internals other than the watched paths are filtered out). Events coalesce within 50ms.
 5. **Multi-session**: server supports one session (T1 simplification, `get_any_session`); multi-root arrives in T2 per plan.
 6. **Multi-step undo across restarts**: journal is `.git/git-workbench/undo/journal.jsonl`; transaction ids persist across restarts (next_id scans journal + snapshot files).
+
+## Implementation Notes (added during post-review hardening, 2026-09-24)
+
+A full code review against this plan surfaced 5 Critical + ~20 Warning + ~10 Suggestion findings; all Criticals and Warnings were fixed:
+
+7. **Argument-injection hardening** (Critical): every string crossing the RPC boundary into a git argv (staging paths, branch/remote names, push refspecs, snapshot refs/shas restored by undo) is validated (`validate_path_arg`/`validate_ref_arg`/`validate_pushspec` in write_queue.rs; `validate_full_ref_name`/`validate_sha` in undo.rs) and `git add`/`git reset` use `--` separators. Git never receives a client-controlled string as a flag position.
+8. **Undo crash-atomicity** (Critical): undo writes an `undo-in-progress.json` marker (target snapshot included), then atomically truncates the journal (temp+rename+fsync), then restores refs; `UndoEngine::new` → `recover()` rolls an interrupted undo forward. All snapshot/journal writes are fsynced (file + parent dir). Undo restores refs via one `git update-ref --stdin` batch (with old-value guards), the index via `write-tree`/`read-tree`, and HEAD last.
+9. **Undo serialization** (Critical): undo is now `WriteCommand::Undo` routed through the same single-consumer write queue as all writes — concurrent undo/write can no longer interleave journal writes. Structured `UndoErrorKind` (NotFound/Blocked/Failure) maps to invalid_argument / undo_blocked / git_error.
+10. **Staged/unstaged classification** (Critical): `StatusItem` carries `staged: bool` (tree-index changes vs index-worktree changes); the SCM provider buckets on the flag instead of guessing from status codes.
+11. **Graph geometry**: `total_approx` no longer double-counts the viewport offset; `anchor_commit` is now actually used to re-pin the viewport across invalidations; lanes are `u16` (T2 headroom) with a no-panic fallback when lanes are exhausted.
+12. **Server robustness**: Content-Length capped at 16 MiB / headers at 64 KiB (violations close the connection); requests are handled concurrently (JoinSet + single mpsc response writer, gix reads in `spawn_blocking`); handler panics cannot kill the connection; locks are poison-tolerant.
+13. **Epoch/cache durability**: the epoch and a repo fingerprint (HEAD + refs/heads) persist in redb — the epoch no longer resets to 1 on engine restart; a fingerprint mismatch (refs moved while the engine was down) clears the lane cache and bumps the epoch in one transaction. The cache now has a read path (COMMIT_META serves viewport rows on cache hits).
+14. **Watchdog & process lifecycle**: `.git` internals noise (index.lock churn, Access events) is filtered; linked worktrees resolve their real gitdir via `git rev-parse --absolute-git-dir` (shared `gitdir.rs`, also used by undo snapshots and the cache); watcher/write-queue tasks hold `Weak<Session>` (no leak on re-initialize); `--parent-pid` is parsed and polled; the shutdown RPC actually terminates the serve loop.
+15. **Extension architecture**: `git show` and `.git/HEAD` parsing in the extension were replaced with engine RPCs `getBlob`/`getHead`; invalidate/refresh races fixed (requestSeq stale-drop + single EPOCH_MISMATCH retry, error code -32004 defined in the protocol crate); auto-stash is a real stash push/switch/pop flow; amend command added to the SCM title bar; status bar shows the current branch.
+16. **Supply chain**: gix-adapt dead crate and 7 unused dependencies removed; Cargo.lock tracked (CI builds `--locked`); CI actions pinned to commit SHAs (a non-existent `dtolnay/rust-action` reference was found and fixed); vsce runs from package-lock.json via `npm ci` (no global installs); cargo-audit job added.
+17. **Still deferred** (Suggestion-level, T2 candidates): engine auto-restart after unexpected exit, ahead/behind in the status bar (needs upstream info), double-click checkout-to-detach RPC, Benchmark A (linux-scale) numbers, multi-root sessions.
 
 ## Benchmark Results (scaled-down, local)
 

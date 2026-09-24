@@ -4,17 +4,13 @@
  * unstage commands, commit via the SCM input box, and diff-on-click
  * against the HEAD revision (via a TextDocumentContentProvider).
  */
-import { execFile } from 'node:child_process';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
-import type { StatusCode, StatusItem } from './types';
+import type { StatusItem } from './types';
 import { errorMessage } from './util';
 
 export const ENGINE_SCHEME = 'git-workbench';
-
-/** Engine statuses that represent an entry already in the index. */
-const STAGED_STATUSES: ReadonlySet<StatusCode> = new Set(['added', 'copied', 'renamed']);
 
 interface WorkbenchResourceState extends vscode.SourceControlResourceState {
   resourceUri: vscode.Uri;
@@ -65,7 +61,6 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     for (const disposable of this.disposables) disposable.dispose();
     this.disposables.length = 0;
   }
-
   /** Debounced refresh entry point (engine coalesces fs events at 50ms already). */
   refresh(): void {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
@@ -75,6 +70,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
   private registerCommands(): void {
     this.disposables.push(
       vscode.commands.registerCommand('gitWorkbench.commit', (message?: string) => this.commit(message)),
+      vscode.commands.registerCommand('gitWorkbench.commitAmend', () => this.commitAmend()),
       vscode.commands.registerCommand('gitWorkbench.stage', (...states: vscode.SourceControlResourceState[]) =>
         this.changePaths('stage', states),
       ),
@@ -114,7 +110,9 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     for (const item of items) {
       if (item.status === 'ignored') continue; // hidden from the SCM view
       const state = this.makeState(item);
-      if (STAGED_STATUSES.has(item.status)) staged.push(state);
+      // Bucket on the engine's staged flag: tree-index (staged) changes go
+      // to the staged group regardless of their status code.
+      if (item.staged) staged.push(state);
       else if (item.status === 'untracked') untracked.push(state);
       else unstaged.push(state);
     }
@@ -163,6 +161,24 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     }
   }
 
+  /**
+   * Amend Last Commit: a non-empty SCM input box becomes the new commit
+   * message; an empty one amends keeping the existing message (the
+   * engine's CommitMsg { message, amend: true } path runs
+   * `git commit --amend --no-edit`, so the message is only used when the
+   * engine chooses to apply it).
+   */
+  private async commitAmend(): Promise<void> {
+    const text = this.sourceControl.inputBox.value.trim();
+    try {
+      await this.client.request('commit', { message: text, amend: true });
+      this.sourceControl.inputBox.value = '';
+      await this.doRefresh();
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Workbench: amend failed — ${errorMessage(err)}`);
+    }
+  }
+
   private async changePaths(
     operation: 'stage' | 'unstage',
     states: vscode.SourceControlResourceState[],
@@ -190,16 +206,14 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     await vscode.commands.executeCommand('vscode.diff', left, uri, title);
   }
 
-  /** Reads `git show HEAD:<path>` for diff side-by-sides. Uses the git CLI. */
-  private readHeadRevision(uri: vscode.Uri): Thenable<string> {
+  /** Engine `getBlob` RPC: HEAD-revision content for diff side-by-sides. */
+  private async readHeadRevision(uri: vscode.Uri): Promise<string> {
     const relativePath = this.toRelativePath(uri);
-    return new Promise((resolve) => {
-      execFile(
-        'git',
-        ['show', `HEAD:${relativePath}`],
-        { cwd: this.root.fsPath, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
-        (err, stdout) => resolve(err ? '' : (stdout as string)),
-      );
-    });
+    try {
+      return await this.client.getBlob('HEAD', relativePath);
+    } catch (err) {
+      console.error(`[git-workbench] getBlob HEAD:${relativePath} failed:`, err);
+      return ''; // empty diff side, like the old git-CLI fallback
+    }
   }
 }

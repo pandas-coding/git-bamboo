@@ -1,12 +1,14 @@
 # Rust
 target/
-Cargo.lock
 
 # Node / VS Code extension
 node_modules/
 out/
 *.vsix
 .vscode-test/
+
+# Engine binary copied in during packaging (CI / package-all.sh)
+vscode-extension/server/
 
 # IDE
 .idea/

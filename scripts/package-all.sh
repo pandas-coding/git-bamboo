@@ -43,7 +43,7 @@ for entry in "${TARGETS[@]}"; do
   cp "$ROOT/target/$TRIPLE/release/$ENGINE_NAME$SUFFIX" \
      "$EXT_DIR/server/$ENGINE_NAME$SUFFIX"
 
-  (cd "$EXT_DIR" && npx vsce package --target "$VSCE_TARGET" \
+  (cd "$EXT_DIR" && npm run package -- --target "$VSCE_TARGET" \
      -o "$OUT_DIR/git-workbench-$VERSION-$VSCE_TARGET.vsix")
 
   # Remove the binary so a later iteration can never package a stale
