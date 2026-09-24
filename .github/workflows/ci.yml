@@ -33,6 +33,10 @@ jobs:
   cargo-audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
+    # The action reports results as a Check Run via the REST API.
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
