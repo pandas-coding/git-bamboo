@@ -146,15 +146,17 @@ Commit 的 UI（纯 HTML/CSS/JS，与 `graph.html`/`graph.js` 同构，主题全
 
 ## Acceptance Criteria
 
-- [ ] `grep -rn "vscode\.scm\|createSourceControl\|SourceControlResourceState" editors/vscode/src/` 无结果（SCM API 依赖清零）
-- [ ] SCM 面板中不再出现 "Git Bamboo" provider（完全归还内置 git）
-- [ ] Git Bamboo Activity Bar 容器（`$(git-branch)` 图标）含两个视图：Commit、Commit Graph，均正常渲染
-- [ ] Commit 一体化完成：message 输入 + 三节文件列表 + 底部 Commit/Amend；stage/unstage/diff 全部行内操作可用
-- [ ] commit 与 amend（含空消息 `--no-edit`）从 Commit 视图可完成，成功后列表刷新、输入框清空
-- [ ] 提交/外部 git 操作后 Commit 视图列表经引擎通知自动刷新
-- [ ] `tsc --noEmit` 零错误；`npm run compile` 成功且产出 `out/webview/commit.html`
-- [ ] `gitBamboo.openGraph` 打开编辑器区全宽 graph 面板：单例 reveal、序列化跨重启恢复、侧栏紧凑视图与面板互不干扰
-- [ ] undo/branch/fetch/pull/push/openGraph 既有命令行为无回归
+实现完成于 2026-09-27（branch `implement/independent-panel-ui`）。✅ = 代码/静态验证通过；◐ = 已实现，留待 VS Code F5 冒烟验证（agent 环境无 GUI）。
+
+- [x] `grep -rn "vscode\.scm\|createSourceControl\|SourceControlResourceState" editors/vscode/src/` 无结果（SCM API 依赖清零）✅
+- [ ] SCM 面板中不再出现 "Git Bamboo" provider（完全归还内置 git）◐
+- [ ] Git Bamboo Activity Bar 容器（`$(git-branch)` 图标）含两个视图：Commit、Commit Graph，均正常渲染 ◐
+- [ ] Commit 一体化完成：message 输入 + 三节文件列表 + 底部 Commit/Amend；stage/unstage/diff 全部行内操作可用 ◐
+- [ ] commit 与 amend（含空消息 `--no-edit`）从 Commit 视图可完成，成功后列表刷新、输入框清空 ◐
+- [ ] 提交/外部 git 操作后 Commit 视图列表经引擎通知自动刷新 ◐
+- [x] `tsc --noEmit` 零错误；`npm run compile` 成功且产出 `out/webview/commit.html` ✅
+- [ ] `gitBamboo.openGraph` 打开编辑器区全宽 graph 面板：单例 reveal、序列化跨重启恢复、侧栏紧凑视图与面板互不干扰 ◐
+- [ ] undo/branch/fetch/pull/push/openGraph 既有命令行为无回归 ◐
 
 ## Dependencies
 
