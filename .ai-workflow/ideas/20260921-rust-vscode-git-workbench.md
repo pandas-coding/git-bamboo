@@ -48,3 +48,4 @@ VS Code 内置 git 扩展交互差、功能受限，显示大量 commit 时页�
 
 - .ai-workflow/research/20260921-git-workbench-research.md —— 工程选型研究报告（git 引擎选型 / VS Code 前端 / 协议+Zed+LLM；含深度审查补充与范围决策）。**规划时请以此报告为研究结论来源，其中的“范围决策（已定）”表不可推翻，PoC 清单应纳入计划验证步骤。**
 - .ai-workflow/plans/20260921-t1-core-engine.md —— Phase 1 实施计划：Rust daemon 核心 + VS Code 扩展骨架 + status/graph/undo 基础（T1 闭环）
+- .ai-workflow/plans/20260927-independent-panel-ui.md —— Phase 2 实施计划：UI 从 SCM 面板独立为自有 Activity Bar 面板（统一 Commit 视图 + graph 双模式，JetBrains/GitStudio 式）；其后续待建计划：graph 二进制数据面（ArrayBuffer 零拷贝 + Rust 预计算 lane 几何 + ±500 预取）
