@@ -7,11 +7,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use git_workbench_protocol::{
+use bamboo_protocol::{
     Capabilities, CommitMsg, CreateBranch, DeleteBranch, Fetch, GetBlob, GetGraph, GetHeadResult,
     GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
     OutputResult, Pull, Push, RefsChanged, Stage, StatusItem, SwitchBranch, Unstage, Undo,
-    UndoResponse, WorkbenchError, WorktreeChanged,
+    UndoResponse, BambooError, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session};
@@ -36,7 +36,7 @@ pub struct IncomingMessage {
     pub params: Value,
 }
 
-pub struct WorkbenchServer {
+pub struct BambooServer {
     /// T1 is single-session: the current session (replaced by `initialize`,
     /// cleared by session close). The old session is dropped on replacement
     /// — its watcher and write-queue tasks hold only Weak handles.
@@ -54,7 +54,7 @@ pub struct WorkbenchServer {
     session_ready_tx: tokio::sync::watch::Sender<bool>,
 }
 
-impl WorkbenchServer {
+impl BambooServer {
     pub fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<EngineEvent>) {
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
@@ -273,7 +273,7 @@ impl WorkbenchServer {
         Some(serde_json::to_string(&response).unwrap_or_default())
     }
 
-    async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value, WorkbenchError> {
+    async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value, BambooError> {
         match method {
             "initialize" => self.handle_initialize(params).await,
             "shutdown" => {
@@ -287,13 +287,13 @@ impl WorkbenchServer {
             }        }
     }
 
-    async fn handle_initialize(&self, params: Value) -> Result<Value, WorkbenchError> {
+    async fn handle_initialize(&self, params: Value) -> Result<Value, BambooError> {
         let params: Initialize = parse_params("initialize", params)?;
         let repo_path = PathBuf::from(&params.repo_path);
         // Canonicalize so watcher paths, gitdir resolution and undo
         // snapshots all agree on one absolute spelling of the worktree.
         let repo_path = repo_path.canonicalize().map_err(|e| {
-            WorkbenchError::invalid_argument(format!(
+            BambooError::invalid_argument(format!(
                 "initialize: cannot resolve repo_path {:?}: {e}",
                 params.repo_path
             ))
@@ -301,7 +301,7 @@ impl WorkbenchServer {
         // `.git` may be a directory (normal repo) or a file (linked
         // worktree); either is valid, neither must be missing.
         if !repo_path.join(".git").exists() {
-            return Err(WorkbenchError::repo_not_found(repo_path.display().to_string()));
+            return Err(BambooError::repo_not_found(repo_path.display().to_string()));
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -321,7 +321,7 @@ impl WorkbenchServer {
                 // Release waiters so a request racing this failed initialize
                 // fails fast instead of waiting until shutdown.
                 let _ = self.session_ready_tx.send(true);
-                return Err(WorkbenchError::git_error(format!(
+                return Err(BambooError::git_error(format!(
                     "failed to open session: {e}"
                 )));
             }
@@ -351,8 +351,8 @@ impl WorkbenchServer {
         to_json_value(&result)
     }
 
-    async fn get_any_session(&self) -> Result<Arc<Session>, WorkbenchError> {
-        let err = || WorkbenchError::not_initialized("no session; call initialize first");
+    async fn get_any_session(&self) -> Result<Arc<Session>, BambooError> {
+        let err = || BambooError::not_initialized("no session; call initialize first");
         if let Some(session) = self.session.lock().await.clone() {
             return Ok(session);
         }
@@ -374,14 +374,14 @@ impl WorkbenchServer {
         session: Arc<Session>,
         method: &str,
         params: Value,
-    ) -> Result<Value, WorkbenchError> {
+    ) -> Result<Value, BambooError> {
         match method {
             "getRefs" => {
                 let refs = spawn_blocking_read(session, |session| {
                     crate::gix_read::read_refs(session)
                 })
                 .await
-                .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&refs)
             }
             "getBlob" => {
@@ -390,14 +390,14 @@ impl WorkbenchServer {
                     crate::gix_read::read_blob(s, &req.revision, &req.path)
                 })
                 .await
-                .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&content)
             }
             "getHead" => {
                 let head: GetHeadResult =
                     spawn_blocking_read(session, crate::gix_read::read_head)
                         .await
-                        .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                        .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&head)
             }
             "getGraph" => {
@@ -410,8 +410,8 @@ impl WorkbenchServer {
                 .await
                 .map_err(|e| {
                     // Preserve structured errors (e.g. EPOCH_MISMATCH).
-                    e.downcast::<WorkbenchError>()
-                        .unwrap_or_else(|e| WorkbenchError::git_error(e.to_string()))
+                    e.downcast::<BambooError>()
+                        .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
                 })?;
                 to_json_value(&page)
             }
@@ -422,7 +422,7 @@ impl WorkbenchServer {
                         crate::gix_read::read_status(s, req.paths.as_deref())
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&items)
             }
             "stage" => {
@@ -430,7 +430,7 @@ impl WorkbenchServer {
                 session
                     .enqueue_write(WriteCommand::Stage(req.paths))
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)
             }
             "unstage" => {
@@ -438,7 +438,7 @@ impl WorkbenchServer {
                 session
                     .enqueue_write(WriteCommand::Unstage(req.paths))
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)
             }
             "commit" => {
@@ -449,7 +449,7 @@ impl WorkbenchServer {
                         amend: req.amend,
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)
             }
             "createBranch" => {
@@ -460,7 +460,7 @@ impl WorkbenchServer {
                         base: req.base,
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)
             }
             "deleteBranch" => {
@@ -471,7 +471,7 @@ impl WorkbenchServer {
                         force: req.force,
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)
             }
             "switchBranch" => {
@@ -482,7 +482,7 @@ impl WorkbenchServer {
                         auto_stash: req.auto_stash,
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&OutputResult { output })
             }
             "fetch" => {
@@ -490,7 +490,7 @@ impl WorkbenchServer {
                 let output = session
                     .enqueue_write(WriteCommand::Fetch { remote: req.remote })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&OutputResult { output })
             }
             "pull" => {
@@ -501,7 +501,7 @@ impl WorkbenchServer {
                         branch: req.branch,
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&OutputResult { output })
             }
             "push" => {
@@ -513,7 +513,7 @@ impl WorkbenchServer {
                         force: req.force,
                     })
                     .await
-                    .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)
             }
             "listUndoStack" => {
@@ -526,8 +526,8 @@ impl WorkbenchServer {
                     session_for_list.undo.list_transactions(limit)
                 })
                 .await
-                .map_err(|e| WorkbenchError::git_error(format!("list task failed: {e}")))?
-                .map_err(|e| WorkbenchError::git_error(e.to_string()))?;
+                .map_err(|e| BambooError::git_error(format!("list task failed: {e}")))?
+                .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&entries)
             }
             "undo" => {
@@ -538,7 +538,7 @@ impl WorkbenchServer {
                 let result = session
                     .enqueue_undo(req.transaction_id)
                     .await
-                    .map_err(|e| WorkbenchError::git_error(format!("{e}")))?;
+                    .map_err(|e| BambooError::git_error(format!("{e}")))?;
 
                 match result {
                     Ok(summary) => {
@@ -550,20 +550,20 @@ impl WorkbenchServer {
                         })
                     }
                     Err(crate::undo::UndoErrorKind::NotFound) => {
-                        Err(WorkbenchError::invalid_argument(format!(
+                        Err(BambooError::invalid_argument(format!(
                             "undo: transaction {} not found",
                             req.transaction_id
                         )))
                     }
                     Err(crate::undo::UndoErrorKind::Blocked { reason }) => {
-                        Err(WorkbenchError::undo_blocked(reason))
+                        Err(BambooError::undo_blocked(reason))
                     }
                     Err(crate::undo::UndoErrorKind::Failure { msg }) => {
-                        Err(WorkbenchError::git_error(msg))
+                        Err(BambooError::git_error(msg))
                     }
                 }
             }
-            _ => Err(WorkbenchError::invalid_argument(format!(
+            _ => Err(BambooError::invalid_argument(format!(
                 "unknown method: {method}"
             ))),
         }
@@ -589,7 +589,7 @@ impl WorkbenchServer {
             ),
             EngineEvent::GraphInvalidated { epoch } => (
                 "graphInvalidated",
-                serde_json::to_value(git_workbench_protocol::GraphInvalidated { epoch }),
+                serde_json::to_value(bamboo_protocol::GraphInvalidated { epoch }),
             ),
         };
         let params = params.unwrap_or(Value::Null);
@@ -601,16 +601,16 @@ impl WorkbenchServer {
 fn parse_params<T: serde::de::DeserializeOwned>(
     method: &str,
     params: Value,
-) -> Result<T, WorkbenchError> {
+) -> Result<T, BambooError> {
     serde_json::from_value(params)
-        .map_err(|e| WorkbenchError::invalid_argument(format!("{method}: {e}")))
+        .map_err(|e| BambooError::invalid_argument(format!("{method}: {e}")))
 }
 
 /// Serialize a typed response, mapping (impossible) failures to a git error
 /// instead of panicking in a request path.
-fn to_json_value<T: serde::Serialize>(value: &T) -> Result<Value, WorkbenchError> {
+fn to_json_value<T: serde::Serialize>(value: &T) -> Result<Value, BambooError> {
     serde_json::to_value(value)
-        .map_err(|e| WorkbenchError::git_error(format!("response serialization failed: {e}")))
+        .map_err(|e| BambooError::git_error(format!("response serialization failed: {e}")))
 }
 
 /// Run a blocking gix read on the blocking pool, returning its result.

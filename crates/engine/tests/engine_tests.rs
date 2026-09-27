@@ -54,9 +54,9 @@ fn test_repo() -> anyhow::Result<tempfile::TempDir> {
 /// Open a session with a live (but unconsumed) notification channel.
 async fn open_session(
     dir: &tempfile::TempDir,
-) -> anyhow::Result<std::sync::Arc<git_workbench_engine::session::Session>> {
+) -> anyhow::Result<std::sync::Arc<bamboo_engine::session::Session>> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    git_workbench_engine::session::Session::open(dir.path(), tx).await
+    bamboo_engine::session::Session::open(dir.path(), tx).await
 }
 
 #[tokio::test]
@@ -75,13 +75,13 @@ async fn graph_page_reads_commits() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    let viewport = git_workbench_protocol::GraphViewport {
+    let viewport = bamboo_protocol::GraphViewport {
         offset: 0,
         limit: 10,
         anchor_commit: None,
         epoch: session.current_epoch(),
     };
-    let page = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)?;
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     assert_eq!(page.commits.len(), 3);
     assert_eq!(page.epoch, 1);
     assert!(!page.has_more);
@@ -107,18 +107,18 @@ async fn graph_page_epoch_mismatch() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    let viewport = git_workbench_protocol::GraphViewport {
+    let viewport = bamboo_protocol::GraphViewport {
         offset: 0,
         limit: 10,
         anchor_commit: None,
         epoch: 999, // stale
     };
-    let err = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)
+    let err = bamboo_engine::gix_read::read_graph_page(&session, &viewport)
         .expect_err("should fail");
     let wb_err = err
-        .downcast_ref::<git_workbench_protocol::WorkbenchError>()
-        .expect("should be WorkbenchError");
-    assert_eq!(wb_err.code, git_workbench_protocol::WorkbenchError::EPOCH_MISMATCH);
+        .downcast_ref::<bamboo_protocol::BambooError>()
+        .expect("should be BambooError");
+    assert_eq!(wb_err.code, bamboo_protocol::BambooError::EPOCH_MISMATCH);
     Ok(())
 }
 
@@ -127,13 +127,13 @@ async fn graph_page_pagination() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    let viewport = git_workbench_protocol::GraphViewport {
+    let viewport = bamboo_protocol::GraphViewport {
         offset: 1,
         limit: 1,
         anchor_commit: None,
         epoch: 0, // 0 = skip check
     };
-    let page = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)?;
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     assert_eq!(page.commits.len(), 1);
     assert!(page.commits[0].message.contains("second"));
     assert!(page.has_more);
@@ -150,18 +150,18 @@ async fn status_reads_untracked_and_staged() -> anyhow::Result<()> {
     // Modify a tracked file.
     std::fs::write(dir.path().join("a.txt"), "modified\n")?;
 
-    let items = git_workbench_engine::gix_read::read_status(&session, None)?;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
     let has_untracked = items
         .iter()
-        .any(|i| i.path == "d.txt" && i.status == git_workbench_protocol::StatusCode::Untracked);
+        .any(|i| i.path == "d.txt" && i.status == bamboo_protocol::StatusCode::Untracked);
     let has_modified = items
         .iter()
-        .any(|i| i.path == "a.txt" && i.status == git_workbench_protocol::StatusCode::Modified);
+        .any(|i| i.path == "a.txt" && i.status == bamboo_protocol::StatusCode::Modified);
     assert!(has_untracked, "expected untracked d.txt, got {:?}", items);
     assert!(has_modified, "expected modified a.txt, got {:?}", items);
 
     // Path filter.
-    let filtered = git_workbench_engine::gix_read::read_status(&session, Some(&["d.txt".into()]))?;
+    let filtered = bamboo_engine::gix_read::read_status(&session, Some(&["d.txt".into()]))?;
     assert!(filtered.iter().all(|i| i.path.starts_with("d.txt")));
     assert!(!filtered.is_empty());
     Ok(())
@@ -172,7 +172,7 @@ async fn refs_read_includes_branches() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    let refs = git_workbench_engine::gix_read::read_refs(&session)?;
+    let refs = bamboo_engine::gix_read::read_refs(&session)?;
     let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
     assert!(names.contains(&"main"));
     assert!(names.contains(&"feature"));
@@ -195,7 +195,7 @@ async fn undo_snapshot_and_list() -> anyhow::Result<()> {
     assert_eq!(entries[0].epoch_at_creation, 1);
 
     // Transactions are persisted across engine restarts.
-    let undo2 = git_workbench_engine::undo::UndoEngine::new(
+    let undo2 = bamboo_engine::undo::UndoEngine::new(
         dir.path(),
         &dir.path().join(".git"),
     )?;
@@ -214,7 +214,7 @@ async fn write_queue_stage_and_epoch_bump() -> anyhow::Result<()> {
 
     // Stage the new file through the write queue.
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Stage(vec![
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
             "new.txt".to_string(),
         ]))
         .await?;
@@ -225,10 +225,10 @@ async fn write_queue_stage_and_epoch_bump() -> anyhow::Result<()> {
 
     settle().await;
     // The file should now appear as staged (tree-index change).
-    let items = git_workbench_engine::gix_read::read_status(&session, None)?;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
     let staged = items
         .iter()
-        .any(|i| i.path == "new.txt" && i.status == git_workbench_protocol::StatusCode::Added && i.staged);
+        .any(|i| i.path == "new.txt" && i.status == bamboo_protocol::StatusCode::Added && i.staged);
     assert!(staged, "expected staged new.txt, got {:?}", items);
     // Worktree changes must be flagged as unstaged.
     let unstaged = items
@@ -240,7 +240,7 @@ async fn write_queue_stage_and_epoch_bump() -> anyhow::Result<()> {
     let entries = session.undo.list_transactions(10)?;
     assert_eq!(entries.len(), 1);
     let audit = std::fs::read_to_string(
-        dir.path().join(".git").join("git-workbench").join("audit.log"),
+        dir.path().join(".git").join("bamboo").join("audit.log"),
     )?;
     assert!(audit.contains("\"status\":\"ok\""));
     Ok(())
@@ -261,12 +261,12 @@ async fn write_queue_commit_and_graph_refresh() -> anyhow::Result<()> {
 
     std::fs::write(dir.path().join("new.txt"), "new\n")?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Stage(vec![
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
             "new.txt".to_string(),
         ]))
         .await?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Commit {
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
             message: "fourth".to_string(),
             amend: false,
         })
@@ -274,13 +274,13 @@ async fn write_queue_commit_and_graph_refresh() -> anyhow::Result<()> {
 
     settle().await;
     // Graph should now contain 4 commits.
-    let viewport = git_workbench_protocol::GraphViewport {
+    let viewport = bamboo_protocol::GraphViewport {
         offset: 0,
         limit: 10,
         anchor_commit: None,
         epoch: 0,
     };
-    let page = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)?;
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     assert_eq!(page.commits.len(), 4);
     assert!(page.commits[0].message.contains("fourth"));
     Ok(())
@@ -293,14 +293,14 @@ async fn undo_restores_refs_after_commit() -> anyhow::Result<()> {
 
     std::fs::write(dir.path().join("new.txt"), "new\n")?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Stage(vec![
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
             "new.txt".to_string(),
         ]))
         .await?;
     let entries = session.undo.list_transactions(10)?;
     let stage_tx = entries[0].id;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Commit {
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
             message: "fourth".to_string(),
             amend: false,
         })
@@ -308,13 +308,13 @@ async fn undo_restores_refs_after_commit() -> anyhow::Result<()> {
 
     settle().await;
     // 4 commits now.
-    let viewport = git_workbench_protocol::GraphViewport {
+    let viewport = bamboo_protocol::GraphViewport {
         offset: 0,
         limit: 10,
         anchor_commit: None,
         epoch: 0,
     };
-    let page = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)?;
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     assert_eq!(page.commits.len(), 4);
 
     // Undo the commit (the latest transaction).
@@ -323,12 +323,12 @@ async fn undo_restores_refs_after_commit() -> anyhow::Result<()> {
     let outcome = session.undo.undo(commit_tx)?;
     assert!(matches!(
         outcome,
-        git_workbench_engine::undo::UndoOutcome::Restored { .. }
+        bamboo_engine::undo::UndoOutcome::Restored { .. }
     ));
 
     settle().await;
     // Graph back to 3 commits, main restored to "third".
-    let page = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)?;
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     assert_eq!(page.commits.len(), 3);
     assert!(page.commits[0].message.contains("third"));
 
@@ -338,7 +338,7 @@ async fn undo_restores_refs_after_commit() -> anyhow::Result<()> {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].id, stage_tx);
     let outcome = session.undo.undo(stage_tx)?;
-    assert!(matches!(outcome, git_workbench_engine::undo::UndoOutcome::Restored { .. }));
+    assert!(matches!(outcome, bamboo_engine::undo::UndoOutcome::Restored { .. }));
     assert!(session.undo.list_transactions(10)?.is_empty());
     Ok(())
 }
@@ -351,12 +351,12 @@ async fn undo_blocked_on_external_change() -> anyhow::Result<()> {
     // Our journaled write: stage + commit.
     std::fs::write(dir.path().join("new.txt"), "new\n")?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Stage(vec![
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
             "new.txt".to_string(),
         ]))
         .await?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Commit {
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
             message: "fourth".to_string(),
             amend: false,
         })
@@ -382,7 +382,7 @@ async fn undo_blocked_on_external_change() -> anyhow::Result<()> {
     assert!(
         matches!(
             result,
-            Err(git_workbench_engine::undo::UndoError::Blocked { .. })
+            Err(bamboo_engine::undo::UndoError::Blocked { .. })
         ),
         "expected Blocked, got {:?}",
         result
@@ -404,7 +404,7 @@ fn read_message(
     data: Vec<u8>,
 ) -> anyhow::Result<Option<(Option<serde_json::Value>, String, serde_json::Value)>> {
     let mut reader = Cursor::new(data);
-    git_workbench_engine::server::read_message(&mut reader)
+    bamboo_engine::server::read_message(&mut reader)
 }
 
 #[test]
@@ -514,23 +514,23 @@ async fn graph_page_anchor_repins_viewport() -> anyhow::Result<()> {
     let session = open_session(&dir).await?;
 
     // Full list to find the anchor commit.
-    let viewport = git_workbench_protocol::GraphViewport {
+    let viewport = bamboo_protocol::GraphViewport {
         offset: 0,
         limit: 10,
         anchor_commit: None,
         epoch: 0,
     };
-    let page = git_workbench_engine::gix_read::read_graph_page(&session, &viewport)?;
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     let anchor = page.commits[1].id.clone(); // "second"
 
     // Requested offset 0, but the anchor pins the page at its index.
-    let vp = git_workbench_protocol::GraphViewport {
+    let vp = bamboo_protocol::GraphViewport {
         offset: 0,
         limit: 2,
         anchor_commit: Some(anchor.clone()),
         epoch: 0,
     };
-    let anchored = git_workbench_engine::gix_read::read_graph_page(&session, &vp)?;
+    let anchored = bamboo_engine::gix_read::read_graph_page(&session, &vp)?;
     assert_eq!(anchored.commits[0].message, "second");
     assert_eq!(anchored.commits.len(), 2);
     assert_eq!(anchored.anchor_commit.as_deref(), Some(anchor.as_str()));
@@ -554,17 +554,17 @@ async fn graph_page_anchor_repins_viewport() -> anyhow::Result<()> {
     assert!(out.status.success());
     settle().await;
 
-    let anchored_again = git_workbench_engine::gix_read::read_graph_page(&session, &vp)?;
+    let anchored_again = bamboo_engine::gix_read::read_graph_page(&session, &vp)?;
     assert_eq!(anchored_again.commits[0].message, "second");
 
     // Unknown anchor: the requested offset is kept.
-    let vp = git_workbench_protocol::GraphViewport {
+    let vp = bamboo_protocol::GraphViewport {
         offset: 1,
         limit: 1,
         anchor_commit: Some("0000000000000000000000000000000000000000".to_string()),
         epoch: 0,
     };
-    let fallback = git_workbench_engine::gix_read::read_graph_page(&session, &vp)?;
+    let fallback = bamboo_engine::gix_read::read_graph_page(&session, &vp)?;
     assert_eq!(fallback.commits.len(), 1);
     assert_eq!(fallback.commits[0].message, "third");
     Ok(())
@@ -583,7 +583,7 @@ async fn status_path_filter_is_component_aware() -> anyhow::Result<()> {
     std::fs::write(dir.path().join("dir").join("x.txt"), "x\n")?;
     std::fs::write(dir.path().join("dirx.txt"), "y\n")?;
 
-    let items = git_workbench_engine::gix_read::read_status(
+    let items = bamboo_engine::gix_read::read_status(
         &session,
         Some(&["dir".to_string()]),
     )?;
@@ -595,7 +595,7 @@ async fn status_path_filter_is_component_aware() -> anyhow::Result<()> {
         .all(|i| i.path == "dir" || i.path.starts_with("dir/")));
 
     // Exact file matches still work (use a non-directory sibling).
-    let items = git_workbench_engine::gix_read::read_status(
+    let items = bamboo_engine::gix_read::read_status(
         &session,
         Some(&["dirx.txt".to_string()]),
     )?;
@@ -603,7 +603,7 @@ async fn status_path_filter_is_component_aware() -> anyhow::Result<()> {
     assert!(items.iter().all(|i| i.path == "dirx.txt"));
 
     // A prefix that is not a component boundary must not match.
-    let items = git_workbench_engine::gix_read::read_status(
+    let items = bamboo_engine::gix_read::read_status(
         &session,
         Some(&["dirx".to_string()]),
     )?;
@@ -625,7 +625,7 @@ async fn switch_branch_auto_stash_carries_changes() -> anyhow::Result<()> {
     std::fs::write(dir.path().join("untracked.txt"), "u\n")?;
 
     let output = session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::SwitchBranch {
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::SwitchBranch {
             name: "feature".to_string(),
             auto_stash: true,
         })
@@ -659,18 +659,18 @@ async fn journal_and_audit_redact_message_and_paths() -> anyhow::Result<()> {
 
     std::fs::write(dir.path().join("secret.txt"), "s\n")?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Stage(vec![
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
             "secret.txt".to_string(),
         ]))
         .await?;
     session
-        .enqueue_write(git_workbench_engine::write_queue::WriteCommand::Commit {
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
             message: "SECRET MESSAGE".to_string(),
             amend: false,
         })
         .await?;
 
-    let git_wb = dir.path().join(".git").join("git-workbench");
+    let git_wb = dir.path().join(".git").join("bamboo");
     let journal = std::fs::read_to_string(git_wb.join("undo").join("journal.jsonl"))?;
     assert!(journal.contains("Stage(1 paths)"));
     assert!(journal.contains("Commit"));
@@ -689,17 +689,17 @@ async fn blob_read_from_head_and_missing_path() -> anyhow::Result<()> {
     let session = open_session(&dir).await?;
 
     let content =
-        git_workbench_engine::gix_read::read_blob(&session, "HEAD", "a.txt")?;
+        bamboo_engine::gix_read::read_blob(&session, "HEAD", "a.txt")?;
     assert_eq!(content.trim(), "a");
 
     // Missing path resolves to empty content, not an error.
     let missing =
-        git_workbench_engine::gix_read::read_blob(&session, "HEAD", "no/such/file.txt")?;
+        bamboo_engine::gix_read::read_blob(&session, "HEAD", "no/such/file.txt")?;
     assert_eq!(missing, "");
 
     // Option-like revisions are rejected defensively (no shell involved).
     assert!(
-        git_workbench_engine::gix_read::read_blob(&session, "--upload-pack=x", "a.txt").is_err()
+        bamboo_engine::gix_read::read_blob(&session, "--upload-pack=x", "a.txt").is_err()
     );
     Ok(())
 }
@@ -709,7 +709,7 @@ async fn head_read_reports_branch_and_commit() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    let head = git_workbench_engine::gix_read::read_head(&session)?;
+    let head = bamboo_engine::gix_read::read_head(&session)?;
     assert_eq!(head.branch.as_deref(), Some("main"));
     assert_eq!(head.head.len(), 40, "expected a full sha, got {:?}", head.head);
 
@@ -724,7 +724,7 @@ async fn head_read_reports_branch_and_commit() -> anyhow::Result<()> {
     };
     let sha = head.head.clone();
     assert!(git(&["checkout", "-q", &sha]));
-    let detached = git_workbench_engine::gix_read::read_head(&session)?;
+    let detached = bamboo_engine::gix_read::read_head(&session)?;
     assert_eq!(detached.branch, None);
     assert_eq!(detached.head, sha);
     Ok(())

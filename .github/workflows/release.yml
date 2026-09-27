@@ -1,0 +1,63 @@
+name: Release
+
+# Packages platform-specific VSIX bundles. Triggered by version tags
+# (e.g. v0.1.0) so everyday pushes to main do not pay the packaging cost.
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package VSIX (${{ matrix.vscode_target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            vscode_target: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            vscode_target: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            vscode_target: win32-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build Engine
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+      - name: Install Extension Dependencies
+        # Pinned @vscode/vsce from package-lock.json — no global installs.
+        working-directory: editors/vscode
+        run: npm ci
+      - name: Build Extension
+        working-directory: editors/vscode
+        run: npm run build
+      - name: Copy Binary
+        shell: bash
+        run: |
+          mkdir -p editors/vscode/server
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/bamboo-engine.exe editors/vscode/server/bamboo-engine.exe
+          else
+            cp target/${{ matrix.target }}/release/bamboo-engine editors/vscode/server/bamboo-engine
+          fi
+      - name: Package Extension
+        working-directory: editors/vscode
+        run: npx vsce package --target ${{ matrix.vscode_target }}
+      - name: Upload VSIX
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: git-bamboo-${{ matrix.vscode_target }}.vsix
+          path: editors/vscode/*.vsix

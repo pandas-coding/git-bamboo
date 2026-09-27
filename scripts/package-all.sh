@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds platform-specific VSIX packages for Git Workbench (plan step 13):
+# Builds platform-specific VSIX packages for Git Bamboo (plan step 13):
 #   1. cargo build --release per target triple
-#   2. copy the engine binary into vscode-extension/server/
+#   2. copy the engine binary into editors/vscode/server/
 #   3. vsce package --target <vsce-target>
 #
 # Requires the Rust targets installed (rustup target add <triple>) and, for
@@ -10,15 +10,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXT_DIR="$ROOT/vscode-extension"
-ENGINE_NAME="git-workbench-engine"
+EXT_DIR="$ROOT/editors/vscode"
+ENGINE_NAME="bamboo-engine"
 OUT_DIR="$ROOT/dist"
 
 # rust target triple : vsce target : binary suffix
 TARGETS=(
   "x86_64-unknown-linux-gnu:linux-x64:"
   "x86_64-pc-windows-msvc:win32-x64:.exe"
-  "x86_64-apple-darwin:darwin-x64:"
   "aarch64-apple-darwin:darwin-arm64:"
 )
 
@@ -44,7 +43,7 @@ for entry in "${TARGETS[@]}"; do
      "$EXT_DIR/server/$ENGINE_NAME$SUFFIX"
 
   (cd "$EXT_DIR" && npm run package -- --target "$VSCE_TARGET" \
-     -o "$OUT_DIR/git-workbench-$VERSION-$VSCE_TARGET.vsix")
+     -o "$OUT_DIR/git-bamboo-$VERSION-$VSCE_TARGET.vsix")
 
   # Remove the binary so a later iteration can never package a stale
   # platform build.

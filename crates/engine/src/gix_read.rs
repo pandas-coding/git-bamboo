@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use tracing::{debug, info, warn};
 
-use git_workbench_protocol::{Commit, GraphPage, GraphViewport, Ref, RefKind, StatusCode, StatusItem, WorkbenchError};
+use bamboo_protocol::{Commit, GraphPage, GraphViewport, Ref, RefKind, StatusCode, StatusItem, BambooError};
 
 use crate::cache::CachedCommit;
 use crate::session::Session;
@@ -16,7 +16,7 @@ pub fn read_graph_page(
 ) -> anyhow::Result<GraphPage> {
     let current_epoch = session.current_epoch();
     if viewport.epoch != 0 && viewport.epoch != current_epoch {
-        return Err(WorkbenchError::epoch_mismatch(
+        return Err(BambooError::epoch_mismatch(
             current_epoch,
             viewport.epoch,
         )
@@ -88,7 +88,7 @@ pub fn read_graph_page(
     // the epoch mid-read (refs moved), stale data must neither be returned
     // nor cached under the new epoch.
     if session.current_epoch() != current_epoch {
-        return Err(WorkbenchError::epoch_mismatch(
+        return Err(BambooError::epoch_mismatch(
             session.current_epoch(),
             current_epoch,
         )
@@ -283,7 +283,7 @@ pub fn read_graph_page(
     // Final epoch guard: never serve (nor acknowledge) a page whose epoch
     // is no longer current by the time we finish.
     if session.current_epoch() != current_epoch {
-        return Err(WorkbenchError::epoch_mismatch(
+        return Err(BambooError::epoch_mismatch(
             session.current_epoch(),
             current_epoch,
         )
@@ -353,7 +353,7 @@ pub fn read_status(
     // Epoch TOCTOU guard: if the repo was mutated mid-read, report the
     // mismatch so the client refreshes instead of trusting stale status.
     if session.current_epoch() != current_epoch {
-        return Err(WorkbenchError::epoch_mismatch(
+        return Err(BambooError::epoch_mismatch(
             session.current_epoch(),
             current_epoch,
         )
@@ -561,7 +561,7 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
 /// Read HEAD for the session's repository: the commit id (empty on an
 /// unborn branch) plus the short branch name when HEAD is symbolic.
 /// Uses the resolved git dir, so linked worktrees work.
-pub fn read_head(session: &Session) -> anyhow::Result<git_workbench_protocol::GetHeadResult> {
+pub fn read_head(session: &Session) -> anyhow::Result<bamboo_protocol::GetHeadResult> {
     let git_dir = crate::gitdir::resolve_git_dir(&session.repo_path);
     let raw = std::fs::read_to_string(git_dir.join("HEAD"))
         .with_context(|| format!("failed to read {}", git_dir.join("HEAD").display()))?;
@@ -578,5 +578,5 @@ pub fn read_head(session: &Session) -> anyhow::Result<git_workbench_protocol::Ge
         .map(|c| c.id.to_string())
         .unwrap_or_default();
 
-    Ok(git_workbench_protocol::GetHeadResult { head, branch })
+    Ok(bamboo_protocol::GetHeadResult { head, branch })
 }

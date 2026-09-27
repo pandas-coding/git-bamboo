@@ -237,7 +237,7 @@ impl Session {
         let weak = Arc::downgrade(self);
         let repo_path = self.repo_path.clone();
         std::thread::Builder::new()
-            .name("git-workbench-watcher".into())
+            .name("bamboo-watcher".into())
             .spawn(move || {
                 while let Ok(event) = rx.recv() {
                     let Ok(event) = event else { continue };

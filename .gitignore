@@ -8,7 +8,7 @@ out/
 .vscode-test/
 
 # Engine binary copied in during packaging (CI / package-all.sh)
-vscode-extension/server/
+editors/vscode/server/
 
 # IDE
 .idea/

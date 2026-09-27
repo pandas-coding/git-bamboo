@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.78"
-authors = ["Git Workbench Contributors"]
+authors = ["Git Bamboo Contributors"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]

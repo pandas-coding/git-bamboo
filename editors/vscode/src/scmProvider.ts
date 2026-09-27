@@ -10,9 +10,9 @@ import { EngineClient } from './engineClient';
 import type { StatusItem } from './types';
 import { errorMessage } from './util';
 
-export const ENGINE_SCHEME = 'git-workbench';
+export const ENGINE_SCHEME = 'git-bamboo';
 
-interface WorkbenchResourceState extends vscode.SourceControlResourceState {
+interface BambooResourceState extends vscode.SourceControlResourceState {
   resourceUri: vscode.Uri;
   /** The raw engine status string — usable as a `when`-clause context key. */
   contextValue: string;
@@ -20,7 +20,7 @@ interface WorkbenchResourceState extends vscode.SourceControlResourceState {
   decorations?: vscode.SourceControlResourceDecorations;
 }
 
-export class WorkbenchSCMProvider implements vscode.Disposable {
+export class BambooSCMProvider implements vscode.Disposable {
   readonly sourceControl: vscode.SourceControl;
   private readonly stagedGroup: vscode.SourceControlResourceGroup;
   private readonly unstagedGroup: vscode.SourceControlResourceGroup;
@@ -34,9 +34,9 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     private readonly client: EngineClient,
     private readonly root: vscode.Uri,
   ) {
-    this.sourceControl = vscode.scm.createSourceControl('git-workbench', 'Git Workbench', root);
+    this.sourceControl = vscode.scm.createSourceControl('git-bamboo', 'Git Bamboo', root);
 
-    this.sourceControl.acceptInputCommand = { command: 'gitWorkbench.commit', title: 'Commit', arguments: [] };
+    this.sourceControl.acceptInputCommand = { command: 'gitBamboo.commit', title: 'Commit', arguments: [] };
 
     this.stagedGroup = this.sourceControl.createResourceGroup('staged', 'Staged Changes');
     this.unstagedGroup = this.sourceControl.createResourceGroup('unstaged', 'Changes');
@@ -45,7 +45,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
       group.hideWhenEmpty = true;
     }
 
-    // HEAD revision content for diffs: "git-workbench:/abs/path" URIs.
+    // HEAD revision content for diffs: "git-bamboo:/abs/path" URIs.
     const headContentProvider: vscode.TextDocumentContentProvider = {
       provideTextDocumentContent: (uri) => this.readHeadRevision(uri),
     };
@@ -69,15 +69,15 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
 
   private registerCommands(): void {
     this.disposables.push(
-      vscode.commands.registerCommand('gitWorkbench.commit', (message?: string) => this.commit(message)),
-      vscode.commands.registerCommand('gitWorkbench.commitAmend', () => this.commitAmend()),
-      vscode.commands.registerCommand('gitWorkbench.stage', (...states: vscode.SourceControlResourceState[]) =>
+      vscode.commands.registerCommand('gitBamboo.commit', (message?: string) => this.commit(message)),
+      vscode.commands.registerCommand('gitBamboo.commitAmend', () => this.commitAmend()),
+      vscode.commands.registerCommand('gitBamboo.stage', (...states: vscode.SourceControlResourceState[]) =>
         this.changePaths('stage', states),
       ),
-      vscode.commands.registerCommand('gitWorkbench.unstage', (...states: vscode.SourceControlResourceState[]) =>
+      vscode.commands.registerCommand('gitBamboo.unstage', (...states: vscode.SourceControlResourceState[]) =>
         this.changePaths('unstage', states),
       ),
-      vscode.commands.registerCommand('gitWorkbench.openResource', (state: vscode.SourceControlResourceState) =>
+      vscode.commands.registerCommand('gitBamboo.openResource', (state: vscode.SourceControlResourceState) =>
         this.openResource(state),
       ),
     );
@@ -93,7 +93,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
       const items = await this.client.request<StatusItem[]>('getStatus', {});
       this.applyStatus(Array.isArray(items) ? items : []);
     } catch (err) {
-      vscode.window.showErrorMessage(`Git Workbench: status refresh failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: status refresh failed — ${errorMessage(err)}`);
     } finally {
       this.refreshing = false;
       if (this.refreshQueued) {
@@ -104,9 +104,9 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
   }
 
   private applyStatus(items: StatusItem[]): void {
-    const staged: WorkbenchResourceState[] = [];
-    const unstaged: WorkbenchResourceState[] = [];
-    const untracked: WorkbenchResourceState[] = [];
+    const staged: BambooResourceState[] = [];
+    const unstaged: BambooResourceState[] = [];
+    const untracked: BambooResourceState[] = [];
     for (const item of items) {
       if (item.status === 'ignored') continue; // hidden from the SCM view
       const state = this.makeState(item);
@@ -121,9 +121,9 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     this.untrackedGroup.resourceStates = untracked;
   }
 
-  private makeState(item: StatusItem): WorkbenchResourceState {
+  private makeState(item: StatusItem): BambooResourceState {
     const uri = this.resolveRepoPath(item.path);
-    const state: WorkbenchResourceState = {
+    const state: BambooResourceState = {
       resourceUri: uri,
       contextValue: item.status,
       command: undefined,
@@ -132,7 +132,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
           ? { tooltip: `Renamed from ${item.old_path}` }
           : { tooltip: `${item.status}: ${item.path}` },
     };
-    state.command = { command: 'gitWorkbench.openResource', title: 'Open Changes', arguments: [state] };
+    state.command = { command: 'gitBamboo.openResource', title: 'Open Changes', arguments: [state] };
     return state;
   }
 
@@ -149,7 +149,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
   private async commit(message?: string): Promise<void> {
     const text = (message ?? this.sourceControl.inputBox.value).trim();
     if (!text) {
-      vscode.window.showWarningMessage('Git Workbench: commit message is empty');
+      vscode.window.showWarningMessage('Git Bamboo: commit message is empty');
       return;
     }
     try {
@@ -157,7 +157,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
       this.sourceControl.inputBox.value = '';
       await this.doRefresh();
     } catch (err) {
-      vscode.window.showErrorMessage(`Git Workbench: commit failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: commit failed — ${errorMessage(err)}`);
     }
   }
 
@@ -175,7 +175,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
       this.sourceControl.inputBox.value = '';
       await this.doRefresh();
     } catch (err) {
-      vscode.window.showErrorMessage(`Git Workbench: amend failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: amend failed — ${errorMessage(err)}`);
     }
   }
 
@@ -189,13 +189,13 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
       await this.client.request(operation, { paths });
       await this.doRefresh();
     } catch (err) {
-      vscode.window.showErrorMessage(`Git Workbench: ${operation} failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: ${operation} failed — ${errorMessage(err)}`);
     }
   }
 
   private async openResource(state: vscode.SourceControlResourceState): Promise<void> {
     const uri = state.resourceUri;
-    const status = (state as WorkbenchResourceState).contextValue;
+    const status = (state as BambooResourceState).contextValue;
     // Untracked/added files have no HEAD revision to diff against.
     if (status === 'untracked' || status === 'added' || status === 'ignored') {
       await vscode.commands.executeCommand('vscode.open', uri);
@@ -212,7 +212,7 @@ export class WorkbenchSCMProvider implements vscode.Disposable {
     try {
       return await this.client.getBlob('HEAD', relativePath);
     } catch (err) {
-      console.error(`[git-workbench] getBlob HEAD:${relativePath} failed:`, err);
+      console.error(`[git-bamboo] getBlob HEAD:${relativePath} failed:`, err);
       return ''; // empty diff side, like the old git-CLI fallback
     }
   }

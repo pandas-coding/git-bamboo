@@ -10,7 +10,7 @@ import * as vscode from 'vscode';
 import * as commands from './commands';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
-import { WorkbenchSCMProvider } from './scmProvider';
+import { BambooSCMProvider } from './scmProvider';
 import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
 
@@ -21,8 +21,8 @@ let activeState: RepoState | undefined;
  *  open, or the engine failed to start): silent no-ops are terrible UX. */
 function noSessionWarning(): void {
   vscode.window.showWarningMessage(
-    'Git Workbench: no repository session. Open a folder containing a git ' +
-      'repository in this window (WSL side, e.g. ~/my-repo) — the workbench ' +
+    'Git Bamboo: no repository session. Open a folder containing a git ' +
+      'repository in this window (WSL side, e.g. ~/my-repo) — the extension ' +
       'activates automatically once a repo folder is open.',
   );
 }
@@ -30,41 +30,41 @@ function noSessionWarning(): void {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Commands are registered unconditionally (even before a repo is open) so
   // palette entries never dead-end silently; handlers guard on the session.
-  registerCommand(context, 'gitWorkbench.openGraph', async () => {
+  registerCommand(context, 'gitBamboo.openGraph', async () => {
     if (!activeClient || !activeState) {
       noSessionWarning();
       return;
     }
     try {
-      await vscode.commands.executeCommand('gitWorkbench.graph.focus');
+      await vscode.commands.executeCommand('gitBamboo.graph.focus');
     } catch {
       vscode.window.showErrorMessage(
-        'Git Workbench: graph view unavailable — the engine did not start for this workspace.',
+        'Git Bamboo: graph view unavailable — the engine did not start for this workspace.',
       );
     }
   });
-  registerCommand(context, 'gitWorkbench.undo', () =>
+  registerCommand(context, 'gitBamboo.undo', () =>
     activeClient ? commands.undoLast(activeClient) : noSessionWarning());
-  registerCommand(context, 'gitWorkbench.switchBranch', () =>
+  registerCommand(context, 'gitBamboo.switchBranch', () =>
     activeClient ? commands.switchBranch(activeClient) : noSessionWarning());
-  registerCommand(context, 'gitWorkbench.createBranch', () =>
+  registerCommand(context, 'gitBamboo.createBranch', () =>
     activeClient ? commands.createBranch(activeClient) : noSessionWarning());
-  registerCommand(context, 'gitWorkbench.deleteBranch', () =>
+  registerCommand(context, 'gitBamboo.deleteBranch', () =>
     activeClient && activeState
       ? commands.deleteBranch(activeClient, activeState)
       : noSessionWarning());
-  registerCommand(context, 'gitWorkbench.fetch', () =>
+  registerCommand(context, 'gitBamboo.fetch', () =>
     activeClient ? commands.fetchRemotes(activeClient) : noSessionWarning());
-  registerCommand(context, 'gitWorkbench.pull', () =>
+  registerCommand(context, 'gitBamboo.pull', () =>
     activeClient && activeState
       ? commands.pull(activeClient, activeState)
       : noSessionWarning());
-  registerCommand(context, 'gitWorkbench.push', () =>
+  registerCommand(context, 'gitBamboo.push', () =>
     activeClient && activeState
       ? commands.push(activeClient, activeState)
       : noSessionWarning());
-  // gitWorkbench.commit / stage / unstage / openResource are registered by
-  // WorkbenchSCMProvider (they only make sense with a live session).
+  // gitBamboo.commit / stage / unstage / openResource are registered by
+  // BambooSCMProvider (they only make sense with a live session).
 
   // T1 scope: single repository — use the first workspace folder with a .git.
   const folder = vscode.workspace.workspaceFolders?.find((f) =>
@@ -75,8 +75,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const binaryPath = resolveEngineBinary(context);
   if (!binaryPath) {
     vscode.window.showErrorMessage(
-      'Git Workbench: engine binary not found. Expected server/git-workbench-engine ' +
-        '(bundled) or target/release|debug/git-workbench-engine (dev build).',
+      'Git Bamboo: engine binary not found. Expected server/bamboo-engine ' +
+        '(bundled) or target/release|debug/bamboo-engine (dev build).',
     );
     return;
   }
@@ -87,7 +87,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     client = new EngineClient(binaryPath, ['--parent-pid', String(process.pid)]);
     init = await client.request<InitializeResult>('initialize', { repo_path: folder.uri.fsPath });
   } catch (err) {
-    vscode.window.showErrorMessage(`Git Workbench: failed to start engine — ${errorMessage(err)}`);
+    vscode.window.showErrorMessage(`Git Bamboo: failed to start engine — ${errorMessage(err)}`);
     return;
   }
   activeClient = client;
@@ -98,7 +98,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   activeState = state;
 
-  const scm = new WorkbenchSCMProvider(client, folder.uri);
+  const scm = new BambooSCMProvider(client, folder.uri);
   context.subscriptions.push(scm);
 
   const graph = new GraphWebviewProvider(context, client, state);
@@ -123,11 +123,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       state.currentBranch = branch ?? undefined;
       branchItem.text = `$(git-branch) ${branch ?? head.slice(0, 8)}`;
       branchItem.tooltip = branch
-        ? `Git Workbench: on branch ${branch}`
-        : `Git Workbench: detached HEAD at ${head}`;
+        ? `Git Bamboo: on branch ${branch}`
+        : `Git Bamboo: detached HEAD at ${head}`;
       branchItem.show();
     } catch (err) {
-      console.error('[git-workbench] getHead failed:', err);
+      console.error('[git-bamboo] getHead failed:', err);
     }
   };
   await refreshHead();
@@ -144,8 +144,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     scm.refresh();
   });
 
-  // Enables commandPalette `when: git-workbench:active` visibility rules.
-  await vscode.commands.executeCommand('setContext', 'git-workbench:active', true);
+  // Enables commandPalette `when: git-bamboo:active` visibility rules.
+  await vscode.commands.executeCommand('setContext', 'git-bamboo:active', true);
 }
 
 export async function deactivate(): Promise<void> {
@@ -162,17 +162,17 @@ export async function deactivate(): Promise<void> {
  */
 function resolveEngineBinary(context: vscode.ExtensionContext): string | undefined {
   const suffix = process.platform === 'win32' ? '.exe' : '';
-  const name = `git-workbench-engine${suffix}`;
+  const name = `bamboo-engine${suffix}`;
   const bundled = context.asAbsolutePath(path.join('server', name));
   if (fs.existsSync(bundled)) return bundled;
 
   const devCandidates = [
-    context.asAbsolutePath(path.join('..', 'target', 'debug', name)),
-    context.asAbsolutePath(path.join('..', 'target', 'release', name)),
+    context.asAbsolutePath(path.join('..', '..', 'target', 'debug', name)),
+    context.asAbsolutePath(path.join('..', '..', 'target', 'release', name)),
   ];
   const dev = devCandidates.find((candidate) => fs.existsSync(candidate));
   if (dev) {
-    console.warn(`[git-workbench] engine binary not bundled; using dev build at ${dev}`);
+    console.warn(`[git-bamboo] engine binary not bundled; using dev build at ${dev}`);
     return dev;
   }
   return undefined;
@@ -203,7 +203,7 @@ function registerCommand(
       try {
         await callback(...args);
       } catch (err) {
-        vscode.window.showErrorMessage(`Git Workbench: ${errorMessage(err)}`);
+        vscode.window.showErrorMessage(`Git Bamboo: ${errorMessage(err)}`);
       }
     }),
   );

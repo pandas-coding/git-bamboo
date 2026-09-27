@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use git_workbench_protocol::UndoEntry;
+use bamboo_protocol::UndoEntry;
 
 use crate::write_queue::WriteResult;
 
@@ -84,12 +84,12 @@ pub struct UndoEngine {
 
 impl UndoEngine {
     pub fn new(repo_path: &Path, git_dir: &Path) -> anyhow::Result<Self> {
-        let undo_dir = git_dir.join("git-workbench").join("undo");
+        let undo_dir = git_dir.join("bamboo").join("undo");
         fs::create_dir_all(&undo_dir)?;
 
         let journal_path = undo_dir.join("journal.jsonl");
         let audit_log = git_dir
-            .join("git-workbench")
+            .join("bamboo")
             .join("audit.log");
 
         // Determine next transaction id from existing journal and snapshot
@@ -275,7 +275,7 @@ impl UndoEngine {
     ///
     /// Safety: the current repository state must match the post-write
     /// snapshot of the most recent journaled transaction. If refs changed
-    /// externally (outside the workbench), undo is blocked.
+    /// externally (outside the bamboo), undo is blocked.
     /// All transactions at or after `transaction_id` are rolled back and
     /// removed from the journal (cascade rollback semantics).
     ///
@@ -304,7 +304,7 @@ impl UndoEngine {
 
         // Safety check: current state must equal the latest transaction's
         // post-write snapshot (i.e. no external ref changes since the last
-        // workbench write).
+        // bamboo write).
         let latest = transactions.last().expect("non-empty journal");
         let expected = self
             .load_snapshot(latest.id, SnapshotKind::Post)
@@ -312,7 +312,7 @@ impl UndoEngine {
         let current = self.read_snapshot().map_err(UndoError::Io)?;
         if current != expected {
             return Err(UndoError::Blocked {
-                reason: "repository state changed externally since the last workbench operation"
+                reason: "repository state changed externally since the last bamboo operation"
                     .to_string(),
             });
         }

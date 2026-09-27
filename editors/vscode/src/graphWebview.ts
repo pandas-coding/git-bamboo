@@ -1,5 +1,5 @@
 /**
- * Webview view provider for the commit graph (view id: gitWorkbench.graph).
+ * Webview view provider for the commit graph (view id: gitBamboo.graph).
  *
  * Serves the built webview bundle (out/webview/graph.html) with CSP and
  * webview asset URIs rewritten, relays viewportChanged messages from the
@@ -24,7 +24,7 @@ const EPOCH_MISMATCH = -32004;
 const VIEWPORT_DEBOUNCE_MS = 16;
 
 export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
-  static readonly viewId = 'gitWorkbench.graph';
+  static readonly viewId = 'gitBamboo.graph';
 
   private view: vscode.WebviewView | undefined;
   private debounceTimer: NodeJS.Timeout | undefined;
@@ -105,7 +105,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
       });
       this.state.epoch = probe.epoch;
     } catch (err) {
-      console.error('[git-workbench] epoch probe after invalidation failed:', err);
+      console.error('[git-bamboo] epoch probe after invalidation failed:', err);
       this.state.epoch = notifiedEpoch;
     }
     await this.view?.webview.postMessage({ type: 'graphInvalidated', epoch: this.state.epoch });
@@ -129,7 +129,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
       // crates/protocol and the engine dispatch); the real detach flow
       // lands in T2.
       vscode.window.showInformationMessage(
-        `Git Workbench: detached checkout of ${message.id.slice(0, 8)} coming in T2`,
+        `Git Bamboo: detached checkout of ${message.id.slice(0, 8)} coming in T2`,
       );
     }
   }
@@ -154,7 +154,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
         return;
       }
       if (seq !== this.requestSeq || this.disposed) return;
-      vscode.window.showErrorMessage(`Git Workbench: graph request failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: graph request failed — ${errorMessage(err)}`);
     }
   }
 
@@ -165,7 +165,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
       const refs = await this.client.getRefs();
       await this.view?.webview.postMessage({ type: 'refs', refs });
     } catch (err) {
-      console.error('[git-workbench] refs fetch for graph failed:', err);
+      console.error('[git-bamboo] refs fetch for graph failed:', err);
     }
   }
 

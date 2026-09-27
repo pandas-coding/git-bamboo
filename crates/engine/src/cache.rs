@@ -13,7 +13,7 @@ const REPO_FINGERPRINT: TableDefinition<&str, &str> = TableDefinition::new("repo
 const EPOCH_KEY: &str = "epoch";
 const FINGERPRINT_KEY: &str = "fingerprint";
 
-/// The immutable, lane-less part of [`git_workbench_protocol::Commit`]
+/// The immutable, lane-less part of [`bamboo_protocol::Commit`]
 /// stored in COMMIT_META. Keyed by object id, so entries never go stale —
 /// only the lane table is epoch-guarded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// Open (or create) the cache inside `git_dir/git-workbench` and
+    /// Open (or create) the cache inside `git_dir/bamboo` and
     /// reconcile the durable epoch with the repository fingerprint.
     ///
     /// Returns the cache and the epoch the session must start with:
@@ -44,7 +44,7 @@ impl Cache {
     /// redb write transaction, so a crash can never leave a poisoned cache
     /// (cleared tables with a stale epoch or vice versa).
     pub fn open(git_dir: &Path, fingerprint: &str) -> anyhow::Result<(Self, u64)> {
-        let cache_dir = git_dir.join("git-workbench");
+        let cache_dir = git_dir.join("bamboo");
         std::fs::create_dir_all(&cache_dir)?;
         let db_path = cache_dir.join("cache.redb");
         // redb takes an exclusive file lock; a just-replaced session may

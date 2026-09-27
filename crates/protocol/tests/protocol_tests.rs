@@ -1,4 +1,4 @@
-use git_workbench_protocol::*;
+use bamboo_protocol::*;
 
 #[test]
 fn commit_roundtrip() {
@@ -29,11 +29,11 @@ fn status_code_serializes_snake_case() {
 }
 
 #[test]
-fn workbench_error_codes() {
-    let e = WorkbenchError::epoch_mismatch(4, 5);
-    assert_eq!(e.code, WorkbenchError::EPOCH_MISMATCH);
+fn bamboo_error_codes() {
+    let e = BambooError::epoch_mismatch(4, 5);
+    assert_eq!(e.code, BambooError::EPOCH_MISMATCH);
     assert!(e.message.contains("expected 4"));
-    assert!(e.to_string().contains("WorkbenchError"));
+    assert!(e.to_string().contains("BambooError"));
 }
 
 #[test]

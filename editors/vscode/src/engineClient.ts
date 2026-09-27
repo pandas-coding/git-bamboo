@@ -49,18 +49,18 @@ export class EngineClient {
     // EPIPE when the engine exits while we are still writing (e.g. during
     // shutdown) must not crash the extension host.
     this.proc.stdin!.on('error', (err) => {
-      console.error(`[git-workbench] engine stdin error: ${err.message}`);
+      console.error(`[git-bamboo] engine stdin error: ${err.message}`);
     });
     this.proc.stdout!.on('data', (chunk: Buffer) => this.onStdoutData(chunk));
     this.proc.stderr!.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trim();
-      if (text) console.error(`[git-workbench-engine] ${text}`);
+      if (text) console.error(`[bamboo-engine] ${text}`);
     });
     this.proc.on('error', (err) => {
       // Spawn failure or runtime I/O error: tear the client down before
       // surfacing the error to pending callers.
       if (this.disposed) return;
-      console.error(`[git-workbench] engine process error: ${err.message}`);
+      console.error(`[git-bamboo] engine process error: ${err.message}`);
       this.rejectAllPending(new Error(`engine process error: ${err.message}`));
       void this.dispose();
     });
@@ -71,17 +71,17 @@ export class EngineClient {
         return;
       }
       // Limitation: no auto-restart is implemented — the user must reload
-      // the window to restart Git Workbench.
+      // the window to restart Git Bamboo.
       console.error(
-        `[git-workbench] engine exited unexpectedly (${signal ?? `code ${code}`}); ` +
-          'auto-restart is not implemented — reload the window to restart Git Workbench',
+        `[git-bamboo] engine exited unexpectedly (${signal ?? `code ${code}`}); ` +
+          'auto-restart is not implemented — reload the window to restart Git Bamboo',
       );
       this.rejectAllPending(new Error(`engine exited unexpectedly (${signal ?? `code ${code}`})`));
       for (const handler of [...this.exitHandlers]) {
         try {
           handler(code, signal);
         } catch (err) {
-          console.error('[git-workbench] exit handler failed:', err);
+          console.error('[git-bamboo] exit handler failed:', err);
         }
       }
     });
@@ -92,7 +92,7 @@ export class EngineClient {
     return new Promise<T>((resolve, reject) => {
       const stdin = this.proc.stdin;
       if (this.disposed || !stdin || stdin.destroyed) {
-        reject(new Error('Git Workbench engine is not running'));
+        reject(new Error('Git Bamboo engine is not running'));
         return;
       }
       const id = this.nextId++;
@@ -100,7 +100,7 @@ export class EngineClient {
       if (timeoutMs !== undefined) {
         timer = setTimeout(() => {
           this.pending.delete(id);
-          reject(new Error(`Git Workbench: '${method}' request timed out after ${timeoutMs}ms`));
+          reject(new Error(`Git Bamboo: '${method}' request timed out after ${timeoutMs}ms`));
         }, timeoutMs);
       }
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
@@ -208,7 +208,7 @@ export class EngineClient {
       try {
         message = JSON.parse(body.toString('utf8'));
       } catch {
-        console.error('[git-workbench] dropping malformed JSON-RPC frame');
+        console.error('[git-bamboo] dropping malformed JSON-RPC frame');
         continue;
       }
       this.handleMessage(message as Record<string, unknown>);
@@ -224,7 +224,7 @@ export class EngineClient {
         try {
           handler(params);
         } catch (err) {
-          console.error(`[git-workbench] handler for ${message.method} failed:`, err);
+          console.error(`[git-bamboo] handler for ${message.method} failed:`, err);
         }
       }
       return;

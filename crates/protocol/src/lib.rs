@@ -287,13 +287,13 @@ pub struct GraphInvalidated {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
-#[error("WorkbenchError {code}: {message}")]
-pub struct WorkbenchError {
+#[error("BambooError {code}: {message}")]
+pub struct BambooError {
     pub code: i32,
     pub message: String,
 }
 
-impl WorkbenchError {
+impl BambooError {
     pub const REPO_NOT_FOUND: i32 = -32001;
     pub const GIT_ERROR: i32 = -32002;
     pub const EPOCH_MISMATCH: i32 = -32004;

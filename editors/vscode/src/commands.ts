@@ -22,7 +22,7 @@ async function pickBranch(
   const refs = await client.request<Ref[]>('getRefs', {});
   const branches = refs.filter((ref) => ref.kind === 'branch' && ref.name !== exclude);
   if (branches.length === 0) {
-    vscode.window.showWarningMessage('Git Workbench: no branches found');
+    vscode.window.showWarningMessage('Git Bamboo: no branches found');
     return undefined;
   }
   const picked = await vscode.window.showQuickPick<BranchPickItem>(
@@ -46,13 +46,13 @@ export async function switchBranch(client: EngineClient): Promise<void> {
   const name = await pickBranch(client, 'Switch to branch');
   if (!name) return;
   await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Git Workbench: switching to ${name}…` },
+    { location: vscode.ProgressLocation.Notification, title: `Git Bamboo: switching to ${name}…` },
     async () => {
       try {
         await client.request('switchBranch', { name, auto_stash: true });
-        vscode.window.showInformationMessage(`Git Workbench: switched to ${name}`);
+        vscode.window.showInformationMessage(`Git Bamboo: switched to ${name}`);
       } catch (err) {
-        vscode.window.showErrorMessage(`Git Workbench: switch failed — ${errorMessage(err)}`);
+        vscode.window.showErrorMessage(`Git Bamboo: switch failed — ${errorMessage(err)}`);
       }
     },
   );
@@ -78,9 +78,9 @@ export async function createBranch(client: EngineClient): Promise<void> {
   const base = picked.branchName === 'HEAD' ? undefined : picked.branchName;
   try {
     await client.request('createBranch', { name, ...(base ? { base } : {}) });
-    vscode.window.showInformationMessage(`Git Workbench: created branch ${name}`);
+    vscode.window.showInformationMessage(`Git Bamboo: created branch ${name}`);
   } catch (err) {
-    vscode.window.showErrorMessage(`Git Workbench: create branch failed — ${errorMessage(err)}`);
+    vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
   }
 }
 
@@ -95,9 +95,9 @@ export async function deleteBranch(client: EngineClient, state: RepoState): Prom
   if (confirmed !== 'Delete') return;
   try {
     await client.request('deleteBranch', { name, force: false });
-    vscode.window.showInformationMessage(`Git Workbench: deleted branch ${name}`);
+    vscode.window.showInformationMessage(`Git Bamboo: deleted branch ${name}`);
   } catch (err) {
-    vscode.window.showErrorMessage(`Git Workbench: delete failed — ${errorMessage(err)}`);
+    vscode.window.showErrorMessage(`Git Bamboo: delete failed — ${errorMessage(err)}`);
   }
 }
 
@@ -108,7 +108,7 @@ interface UndoPickItem extends vscode.QuickPickItem {
 export async function undoLast(client: EngineClient): Promise<void> {
   const entries = await client.request<UndoEntry[]>('listUndoStack', { limit: 20 });
   if (!Array.isArray(entries) || entries.length === 0) {
-    vscode.window.showInformationMessage('Git Workbench: nothing to undo');
+    vscode.window.showInformationMessage('Git Bamboo: nothing to undo');
     return;
   }
   const picked = await vscode.window.showQuickPick<UndoPickItem>(
@@ -123,12 +123,12 @@ export async function undoLast(client: EngineClient): Promise<void> {
   if (!picked) return;
   try {
     await client.request('undo', { transaction_id: picked.entryId });
-    vscode.window.showInformationMessage('Git Workbench: operation undone');
+    vscode.window.showInformationMessage('Git Bamboo: operation undone');
   } catch (err) {
     if (err instanceof RpcError && err.code === UNDO_BLOCKED) {
-      vscode.window.showWarningMessage(`Git Workbench: undo blocked — ${err.message}`);
+      vscode.window.showWarningMessage(`Git Bamboo: undo blocked — ${err.message}`);
     } else {
-      vscode.window.showErrorMessage(`Git Workbench: undo failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: undo failed — ${errorMessage(err)}`);
     }
   }
 }
@@ -136,15 +136,15 @@ export async function undoLast(client: EngineClient): Promise<void> {
 export async function fetchRemotes(client: EngineClient): Promise<void> {
   const remote = await pickRemote();
   if (remote === undefined) return; // cancelled
-  await runNetworkCommand(client, 'Git Workbench: fetching…', 'fetch', remote ? { remote } : {});
-  vscode.window.showInformationMessage('Git Workbench: fetch complete');
+  await runNetworkCommand(client, 'Git Bamboo: fetching…', 'fetch', remote ? { remote } : {});
+  vscode.window.showInformationMessage('Git Bamboo: fetch complete');
 }
 
 export async function pull(client: EngineClient, state: RepoState): Promise<void> {
   const params: Record<string, unknown> = {};
   if (state.currentBranch) params.branch = state.currentBranch;
-  await runNetworkCommand(client, `Git Workbench: pulling${state.currentBranch ? ` ${state.currentBranch}` : ''}…`, 'pull', params);
-  vscode.window.showInformationMessage('Git Workbench: pull complete');
+  await runNetworkCommand(client, `Git Bamboo: pulling${state.currentBranch ? ` ${state.currentBranch}` : ''}…`, 'pull', params);
+  vscode.window.showInformationMessage('Git Bamboo: pull complete');
 }
 
 export async function push(client: EngineClient, state: RepoState): Promise<void> {
@@ -155,12 +155,12 @@ export async function push(client: EngineClient, state: RepoState): Promise<void
     branch = await pickBranch(client, 'Push which branch?');
     if (!branch) return;
   }
-  await runNetworkCommand(client, `Git Workbench: pushing ${branch}…`, 'push', {
+  await runNetworkCommand(client, `Git Bamboo: pushing ${branch}…`, 'push', {
     remote: remote ?? 'origin',
     branch,
     force: false,
   });
-  vscode.window.showInformationMessage(`Git Workbench: pushed ${branch}`);
+  vscode.window.showInformationMessage(`Git Bamboo: pushed ${branch}`);
 }
 
 async function runNetworkCommand(
@@ -173,7 +173,7 @@ async function runNetworkCommand(
     try {
       await client.request(method, params);
     } catch (err) {
-      vscode.window.showErrorMessage(`Git Workbench: ${method} failed — ${errorMessage(err)}`);
+      vscode.window.showErrorMessage(`Git Bamboo: ${method} failed — ${errorMessage(err)}`);
     }
   });
 }

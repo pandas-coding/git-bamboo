@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tracing_subscriber::EnvFilter;
 
-use git_workbench_engine::server::WorkbenchServer;
+use bamboo_engine::server::BambooServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("git-workbench-engine starting");
+    tracing::info!("bamboo-engine starting");
 
     // Optionally watch the parent process and exit when it is gone, so a
     // crashed/killed extension cannot leak a running engine.
@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "invalid --parent-pid argument; ignoring");
     }
 
-    let (server, notify_rx) = WorkbenchServer::new();
+    let (server, notify_rx) = BambooServer::new();
 
     // SIGINT: request a graceful shutdown of the serve loop (installing the
     // handler replaces the default terminate behavior).
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     server.run(notify_rx).await;
 
-    tracing::info!("git-workbench-engine stopped");
+    tracing::info!("bamboo-engine stopped");
     Ok(())
 }
 
@@ -62,7 +62,7 @@ fn spawn_parent_watch() -> anyhow::Result<()> {
     };
 
     std::thread::Builder::new()
-        .name("git-workbench-parent-watch".into())
+        .name("bamboo-parent-watch".into())
         .spawn(move || parent_watch_loop(pid))?;
     Ok(())
 }
