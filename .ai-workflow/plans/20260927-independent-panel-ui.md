@@ -1,7 +1,7 @@
 ---
 title: Independent Panel UI — Git Bamboo 从 SCM 面板独立为 GitLens 式自有面板（统一 Commit 视图）
 date: 2026-09-27
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20260921-rust-vscode-git-workbench.md
 group: git-workbench
