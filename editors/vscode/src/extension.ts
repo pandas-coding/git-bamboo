@@ -1,16 +1,20 @@
 /**
  * Extension entry point: finds the workspace repo (T1: single repo — the
  * first folder containing .git), spawns the Rust engine process, wires
- * engine notifications to SCM refresh / graph invalidation, and registers
- * all contributed commands.
+ * engine notifications to Commit view refresh / graph invalidation, and
+ * registers all contributed commands. All UI lives in the gitBamboo
+ * activity bar container (Commit webview + Commit Graph webview) and the
+ * editor-area graph panel — the SCM API is not used.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import * as commands from './commands';
+import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
-import { BambooSCMProvider } from './scmProvider';
+import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
+import { HeadContentProvider } from './headContent';
 import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
 
@@ -36,10 +40,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return;
     }
     try {
-      await vscode.commands.executeCommand('gitBamboo.graph.focus');
-    } catch {
+      openGraphPanel(context, activeClient, activeState);
+    } catch (err) {
       vscode.window.showErrorMessage(
-        'Git Bamboo: graph view unavailable — the engine did not start for this workspace.',
+        `Git Bamboo: opening the graph panel failed — ${errorMessage(err)}`,
       );
     }
   });
@@ -63,8 +67,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     activeClient && activeState
       ? commands.push(activeClient, activeState)
       : noSessionWarning());
-  // gitBamboo.commit / stage / unstage / openResource are registered by
-  // BambooSCMProvider (they only make sense with a live session).
+  // Palette "Commit" just focuses the Commit view — the message box and
+  // commit button live there.
+  registerCommand(context, 'gitBamboo.commit', async () => {
+    if (!activeClient || !activeState) {
+      noSessionWarning();
+      return;
+    }
+    try {
+      await vscode.commands.executeCommand('gitBamboo.commit.focus');
+    } catch {
+      vscode.window.showErrorMessage(
+        'Git Bamboo: Commit view unavailable — the engine did not start for this workspace.',
+      );
+    }
+  });
+  // Palette amend has no input box to source a message from, so it is
+  // always the engine's `--amend --no-edit` path (empty message).
+  registerCommand(context, 'gitBamboo.commitAmend', async () => {
+    if (!activeClient || !activeState) {
+      noSessionWarning();
+      return;
+    }
+    try {
+      await activeClient.request('commit', { message: '', amend: true });
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Bamboo: amend failed — ${errorMessage(err)}`);
+    }
+  });
 
   // T1 scope: single repository — use the first workspace folder with a .git.
   const folder = vscode.workspace.workspaceFolders?.find((f) =>
@@ -98,9 +128,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   activeState = state;
 
-  const scm = new BambooSCMProvider(client, folder.uri);
-  context.subscriptions.push(scm);
+  // HEAD-revision content provider backing the Commit view's diffs.
+  const headContent = new HeadContentProvider(client, folder.uri);
+  context.subscriptions.push(headContent);
 
+  // Commit view: message box + change list + commit/amend, one webview.
+  const commitView = new CommitViewProvider(context, client, folder.uri, state);
+  context.subscriptions.push(commitView);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(CommitViewProvider.viewId, commitView, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+  );
+  // View title "Refresh Changes" (also a valid palette entry once a
+  // session is live — the command only exists after the view is wired).
+  registerCommand(context, 'gitBamboo.refreshChanges', () => commitView.refresh());
+
+  // Sidebar commit graph (compact mode) + editor-area graph panel (full
+  // width mode) share the same webview bundle via GraphSession.
   const graph = new GraphWebviewProvider(context, client, state);
   context.subscriptions.push(graph);
   context.subscriptions.push(
@@ -108,8 +153,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       webviewOptions: { retainContextWhenHidden: true },
     }),
   );
-  // graphInvalidated is handled inside GraphWebviewProvider (it owns its
-  // own engine subscription so dispose() can unhook it).
+  registerGraphPanelSerializer(context, client, state);
 
   // TODO(ahead-behind): showing ahead/behind counts needs upstream tracking
   // info, which the engine does not expose yet.
@@ -133,15 +177,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await refreshHead();
 
   // Engine notifications drive all UI refreshes.
-  onNotification(client, context, 'refsChanged', () => scm.refresh());
-  onNotification(client, context, 'worktreeChanged', () => scm.refresh());
+  onNotification(client, context, 'refsChanged', () => commitView.refresh());
+  onNotification(client, context, 'worktreeChanged', () => commitView.refresh());
   onNotification(client, context, 'indexChanged', (params) => {
     state.epoch = numberField(params, 'epoch', state.epoch);
-    scm.refresh();
+    commitView.refresh();
   });
   onNotification(client, context, 'headChanged', () => {
     void refreshHead();
-    scm.refresh();
+    commitView.refresh();
   });
 
   // Enables commandPalette `when: git-bamboo:active` visibility rules.
