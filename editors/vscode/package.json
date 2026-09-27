@@ -11,7 +11,7 @@
     "type": "git",
     "url": "https://github.com/pandas-coding/git-bamboo"
   },
-  "categories": ["SCM Providers", "Other"],
+  "categories": ["Other"],
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -64,7 +64,7 @@
       },
       {
         "command": "gitBamboo.commit",
-        "title": "Commit",
+        "title": "Focus Commit View",
         "category": "Git Bamboo",
         "icon": "$(check)"
       },
@@ -75,58 +75,33 @@
         "icon": "$(edit)"
       },
       {
-        "command": "gitBamboo.stage",
-        "title": "Stage Changes",
+        "command": "gitBamboo.refreshChanges",
+        "title": "Refresh Changes",
         "category": "Git Bamboo",
-        "icon": "$(add)"
-      },
-      {
-        "command": "gitBamboo.unstage",
-        "title": "Unstage Changes",
-        "category": "Git Bamboo",
-        "icon": "$(remove)"
-      },
-      {
-        "command": "gitBamboo.openResource",
-        "title": "Open Changes",
-        "category": "Git Bamboo"
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
-      "scm/title": [
+      "view/title": [
         {
-          "command": "gitBamboo.openGraph",
-          "group": "navigation",
-          "when": "scmProvider == git-bamboo"
+          "command": "gitBamboo.refreshChanges",
+          "when": "view == gitBamboo.commit",
+          "group": "navigation"
         },
         {
           "command": "gitBamboo.commitAmend",
-          "group": "navigation",
-          "when": "scmProvider == git-bamboo"
-        }
-      ],
-      "scm/resourceState": [
-        {
-          "command": "gitBamboo.stage",
-          "when": "scmProvider == git-bamboo && scmResourceGroup in unstaged,untracked",
-          "group": "inline"
+          "when": "view == gitBamboo.commit",
+          "group": "navigation"
         },
         {
-          "command": "gitBamboo.unstage",
-          "when": "scmProvider == git-bamboo && scmResourceGroup == staged",
-          "group": "inline"
-        }
-      ],
-      "scm/resourceState/contextual": [
-        {
-          "command": "gitBamboo.stage",
-          "when": "scmProvider == git-bamboo && scmResourceGroup in unstaged,untracked",
-          "group": "1_bamboo@1"
+          "command": "gitBamboo.undo",
+          "when": "view == gitBamboo.graph",
+          "group": "navigation"
         },
         {
-          "command": "gitBamboo.unstage",
-          "when": "scmProvider == git-bamboo && scmResourceGroup == staged",
-          "group": "1_bamboo@2"
+          "command": "gitBamboo.fetch",
+          "when": "view == gitBamboo.commit",
+          "group": "navigation"
         }
       ],
       "commandPalette": [
@@ -135,28 +110,22 @@
         },
         {
           "command": "gitBamboo.commit",
-          "when": "false"
+          "when": "git-bamboo:active"
         },
         {
           "command": "gitBamboo.commitAmend",
           "when": "git-bamboo:active"
-        },
-        {
-          "command": "gitBamboo.stage",
-          "when": "false"
-        },
-        {
-          "command": "gitBamboo.unstage",
-          "when": "false"
-        },
-        {
-          "command": "gitBamboo.openResource",
-          "when": "false"
         }
       ]
     },
     "views": {
-      "scm": [
+      "gitBamboo": [
+        {
+          "id": "gitBamboo.commit",
+          "name": "Commit",
+          "when": "git-bamboo:active",
+          "type": "webview"
+        },
         {
           "id": "gitBamboo.graph",
           "name": "Commit Graph",
@@ -170,7 +139,7 @@
         {
           "id": "gitBamboo",
           "title": "Git Bamboo",
-          "icon": "$(source-control)"
+          "icon": "$(git-branch)"
         }
       ]
     }
