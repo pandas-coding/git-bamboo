@@ -1,8 +1,11 @@
 src/
 node_modules/
-*.map
+**/*.map
+webview/
 vite.config.ts
 vite.webview.config.ts
 tsconfig.json
 build.js
+.vscodeignore
 **/.gitignore
+*.vsix
