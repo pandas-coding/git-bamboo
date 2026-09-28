@@ -1,0 +1,4 @@
+# Workspace task runner convention (https://github.com/matklad/cargo-xtask):
+# `cargo xtask <task>` dispatches to crates/xtask, e.g. `cargo xtask vsix`.
+[alias]
+xtask = "run --package xtask --"

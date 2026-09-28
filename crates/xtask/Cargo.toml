@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Deliberately dependency-free: xtask must build fast and never break
+# behind a dependency update. Everything it needs is std.
+
+[dependencies]
