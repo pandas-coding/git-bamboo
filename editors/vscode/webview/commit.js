@@ -35,7 +35,6 @@ const STATUS_LETTER = {
 
 const els = {
   message: document.getElementById('commit-message'),
-  list: document.getElementById('file-list'),
   empty: document.getElementById('empty-state'),
   sections: {
     staged: document.getElementById('staged-section'),
@@ -71,10 +70,9 @@ function splitPath(p) {
   return { filename: p.slice(slash + 1), dirname: p.slice(0, slash) };
 }
 
-function createButton(kind, label, title, onClick) {
+function createButton(label, title, onClick) {
   const btn = document.createElement('button');
   btn.className = 'action-btn';
-  btn.dataset.kind = kind;
   btn.textContent = label;
   btn.title = title;
   btn.addEventListener('click', (event) => {
@@ -113,17 +111,17 @@ function createFileRow(item) {
   const actions = document.createElement('span');
   actions.className = 'actions';
   if (bucket === 'staged') {
-    actions.appendChild(createButton('unstage', '−', 'Unstage Changes', () => {
+    actions.appendChild(createButton('−', 'Unstage Changes', () => {
       vscode.postMessage({ type: 'unstage', paths: [item.path] });
     }));
-    actions.appendChild(createButton('diff', '⇄', 'Open Changes', () => {
+    actions.appendChild(createButton('⇄', 'Open Changes', () => {
       vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
     }));
   } else {
-    actions.appendChild(createButton('stage', '+', 'Stage Changes', () => {
+    actions.appendChild(createButton('+', 'Stage Changes', () => {
       vscode.postMessage({ type: 'stage', paths: [item.path] });
     }));
-    actions.appendChild(createButton('diff', '⇄', item.status === 'untracked' ? 'Open File' : 'Open Changes', () => {
+    actions.appendChild(createButton('⇄', item.status === 'untracked' ? 'Open File' : 'Open Changes', () => {
       vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
     }));
   }
@@ -160,10 +158,7 @@ function render(items) {
     body.replaceChildren(...list.map(createFileRow));
     els.counts[key].textContent = String(list.length);
     section.style.display = list.length > 0 ? '' : 'none';
-
-    const header = section.querySelector('.section-header');
-    header.classList.toggle('collapsed', collapsed.has(key));
-    body.style.display = collapsed.has(key) ? 'none' : '';
+    applyCollapsed(key);
   }
 
   els.empty.classList.toggle('visible', total === 0);
@@ -194,10 +189,16 @@ for (const key of BUCKETS) {
   els.sections[key].querySelector('.section-header').addEventListener('click', () => {
     if (collapsed.has(key)) collapsed.delete(key);
     else collapsed.add(key);
-    const header = els.sections[key].querySelector('.section-header');
-    header.classList.toggle('collapsed', collapsed.has(key));
-    els.bodies[key].style.display = collapsed.has(key) ? 'none' : '';
+    applyCollapsed(key);
   });
+}
+
+/** Syncs a section's collapsed state to the DOM (shared by render() and
+ *  the header click handler). */
+function applyCollapsed(key) {
+  const header = els.sections[key].querySelector('.section-header');
+  header.classList.toggle('collapsed', collapsed.has(key));
+  els.bodies[key].style.display = collapsed.has(key) ? 'none' : '';
 }
 
 window.addEventListener('message', (event) => {
@@ -207,9 +208,11 @@ window.addEventListener('message', (event) => {
     render(message.items);
   } else if (message.type === 'committed') {
     els.message.value = '';
+    autoGrow(); // programmatic clears don't fire the input event
   }
 });
 
-// Initial status request: the host pushes status on refresh(), but a
-// freshly resolved view may resolve before the first engine notification.
+// The host's first status push rides on this ready handshake: postMessage
+// before the webview finishes loading would be dropped, so the host waits
+// for 'ready' instead of pushing at resolve time.
 vscode.postMessage({ type: 'ready' });

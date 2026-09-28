@@ -20,6 +20,7 @@ import { errorMessage } from './util';
 
 let activeClient: EngineClient | undefined;
 let activeState: RepoState | undefined;
+let activeCommitView: CommitViewProvider | undefined;
 
 /** Shown when a command runs without a repository session (no repo folder
  *  open, or the engine failed to start): silent no-ops are terrible UX. */
@@ -39,13 +40,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       noSessionWarning();
       return;
     }
-    try {
-      openGraphPanel(context, activeClient, activeState);
-    } catch (err) {
-      vscode.window.showErrorMessage(
-        `Git Bamboo: opening the graph panel failed — ${errorMessage(err)}`,
-      );
-    }
+    openGraphPanel(context, activeClient, activeState);
   });
   registerCommand(context, 'gitBamboo.undo', () =>
     activeClient ? commands.undoLast(activeClient) : noSessionWarning());
@@ -82,6 +77,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
     }
   });
+  // View title "Refresh Changes" — also a palette entry; registered with the
+  // other commands (unconditionally) so it never dead-ends without a repo.
+  registerCommand(context, 'gitBamboo.refreshChanges', () =>
+    activeCommitView ? activeCommitView.refresh() : noSessionWarning());
+
   // Palette amend has no input box to source a message from, so it is
   // always the engine's `--amend --no-edit` path (empty message).
   registerCommand(context, 'gitBamboo.commitAmend', async () => {
@@ -133,16 +133,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(headContent);
 
   // Commit view: message box + change list + commit/amend, one webview.
-  const commitView = new CommitViewProvider(context, client, folder.uri, state);
+  const commitView = new CommitViewProvider(context, client, folder.uri);
+  activeCommitView = commitView;
   context.subscriptions.push(commitView);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(CommitViewProvider.viewId, commitView, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
   );
-  // View title "Refresh Changes" (also a valid palette entry once a
-  // session is live — the command only exists after the view is wired).
-  registerCommand(context, 'gitBamboo.refreshChanges', () => commitView.refresh());
 
   // Sidebar commit graph (compact mode) + editor-area graph panel (full
   // width mode) share the same webview bundle via GraphSession.
@@ -196,6 +194,7 @@ export async function deactivate(): Promise<void> {
   await activeClient?.dispose();
   activeClient = undefined;
   activeState = undefined;
+  activeCommitView = undefined;
 }
 
 /**

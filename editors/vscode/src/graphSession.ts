@@ -121,7 +121,16 @@ export class GraphSession implements vscode.Disposable {
       this.state.epoch = page.epoch;
       await this.webview.postMessage({ type: 'graphPage', offset, page });
     } catch (err) {
-      if (!retried && !this.disposed && err instanceof RpcError && err.code === EPOCH_MISMATCH) {
+      // Retry only if this request is still the newest: a newer viewport
+      // request already carries fresh data, and retrying here would bump
+      // requestSeq past it and clobber its response with stale data.
+      if (
+        !retried &&
+        seq === this.requestSeq &&
+        !this.disposed &&
+        err instanceof RpcError &&
+        err.code === EPOCH_MISMATCH
+      ) {
         // Our epoch is stale: retry ONCE with the fresh epoch from the
         // error (or epoch 0 = "no validation" if unavailable), then adopt
         // the epoch from the successful response.

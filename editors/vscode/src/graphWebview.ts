@@ -39,6 +39,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
     this.session = new GraphSession(this.client, this.state, view.webview, () => {
       this.session = undefined;
     });
+    this.viewDisposable?.dispose();
     this.viewDisposable = view.onDidDispose(() => this.teardownSession());
   }
 

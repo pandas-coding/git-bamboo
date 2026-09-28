@@ -1,8 +1,8 @@
 /**
  * HEAD-revision diff infrastructure (extracted from the old scmProvider):
  * the ENGINE_SCHEME TextDocumentContentProvider that serves blob content
- * at HEAD for vscode.diff side-by-sides, plus openResource / repo-path
- * helpers reused by the Commit view.
+ * at HEAD for vscode.diff side-by-sides, plus openResource and repo-path
+ * validation helpers.
  */
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -53,12 +53,30 @@ export async function openResource(root: vscode.Uri, relativePath: string, statu
   await vscode.commands.executeCommand('vscode.diff', left, uri, title);
 }
 
-/** Resolve a repo-relative (slash-separated) path against the repo root. */
-export function resolveRepoPath(root: vscode.Uri, relativePath: string): vscode.Uri {
+/** True for plain repo-relative slash paths — rejects anything that could
+ *  escape the repository (absolute paths, drive letters, backslashes,
+ *  `.`/`..` segments). Paths arriving from the webview via postMessage are
+ *  a trust boundary, so they are validated before any file access or
+ *  engine write RPC. */
+export function isValidRepoPath(p: string): boolean {
+  if (typeof p !== 'string' || p.length === 0 || p.includes('\\')) return false;
+  if (path.isAbsolute(p) || /^[a-zA-Z]:/.test(p)) return false;
+  for (const segment of p.split('/')) {
+    if (segment === '' || segment === '.' || segment === '..') return false;
+  }
+  return true;
+}
+
+/** Resolve a repo-relative (slash-separated) path against the repo root;
+ *  throws on paths that could escape the repository. */
+function resolveRepoPath(root: vscode.Uri, relativePath: string): vscode.Uri {
+  if (!isValidRepoPath(relativePath)) {
+    throw new Error(`path escapes the repository: ${relativePath}`);
+  }
   return vscode.Uri.joinPath(root, ...relativePath.split('/'));
 }
 
 /** Repo-relative path (forward slashes) for engine write requests. */
-export function toRelativePath(root: vscode.Uri, uri: vscode.Uri): string {
+function toRelativePath(root: vscode.Uri, uri: vscode.Uri): string {
   return path.relative(root.fsPath, uri.fsPath).replace(/\\/g, '/');
 }

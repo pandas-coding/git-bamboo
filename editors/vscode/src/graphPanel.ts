@@ -11,7 +11,7 @@ import { GraphSession } from './graphSession';
 import type { RepoState } from './types';
 import { buildWebviewHtml } from './webviewHtml';
 
-export const GRAPH_PANEL_TYPE = 'gitBamboo.graphPanel';
+const GRAPH_PANEL_TYPE = 'gitBamboo.graphPanel';
 
 /** The currently open editor-area graph panel (singleton). */
 let activePanel: vscode.WebviewPanel | undefined;
@@ -23,7 +23,9 @@ export function openGraphPanel(
   state: RepoState,
 ): vscode.WebviewPanel {
   if (activePanel) {
-    activePanel.reveal(vscode.ViewColumn.Beside);
+    // Reveal where the panel already lives — forcing ViewColumn.Beside
+    // would yank a panel the user deliberately pinned elsewhere.
+    activePanel.reveal();
     return activePanel;
   }
 

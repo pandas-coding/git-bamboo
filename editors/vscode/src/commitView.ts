@@ -8,8 +8,8 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
-import { openResource } from './headContent';
-import type { RepoState, StatusItem } from './types';
+import { isValidRepoPath, openResource } from './headContent';
+import type { StatusItem } from './types';
 import { errorMessage } from './util';
 import { buildWebviewHtml } from './webviewHtml';
 
@@ -32,18 +32,23 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   private refreshTimer: NodeJS.Timeout | undefined;
   private refreshQueued = false;
   private refreshing = false;
+  private committing = false;
   private disposed = false;
-  private readonly disposables: vscode.Disposable[] = [];
+  /** Per-view subscriptions, torn down on re-resolution so listeners
+   *  never double up (mirrors GraphWebviewProvider.teardownSession). */
+  private viewDisposables: vscode.Disposable[] = [];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly client: EngineClient,
     private readonly root: vscode.Uri,
-    /** Shared per-repo state (epoch); exposed for future host-side use. */
-    readonly state: RepoState,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
+    // Re-resolution (view disposed then re-opened): tear down any prior
+    // view subscriptions first, so stale onDidDispose handlers can never
+    // clear the new view or accumulate.
+    this.teardownView();
     this.view = view;
     view.webview.options = {
       enableScripts: true,
@@ -53,15 +58,22 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       ],
     };
     view.webview.html = buildWebviewHtml(this.context.extensionUri, view.webview, 'commit.html');
-    this.disposables.push(
+    this.viewDisposables.push(
       view.webview.onDidReceiveMessage((message: CommitViewMessage) => this.onMessage(message)),
       view.onDidDispose(() => {
         this.view = undefined;
+        this.teardownView();
       }),
     );
-    // Push the first status snapshot as soon as the view comes up (the
-    // engine notifications only cover later changes).
-    void this.doRefresh();
+    // No initial push here: the webview sends 'ready' once it has finished
+    // loading (a postMessage before that would be dropped anyway), and the
+    // ready handler performs the first status fetch.
+  }
+
+  /** Disposes the current view's subscriptions (re-resolution / disposal). */
+  private teardownView(): void {
+    for (const disposable of this.viewDisposables) disposable.dispose();
+    this.viewDisposables.length = 0;
   }
 
   /** Debounced refresh entry point — engine notification hooks call this. */
@@ -74,8 +86,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     if (this.disposed) return;
     this.disposed = true;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    for (const disposable of this.disposables) disposable.dispose();
-    this.disposables.length = 0;
+    this.teardownView();
     this.view = undefined;
   }
 
@@ -128,9 +139,12 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   }
 
   private async changePaths(operation: 'stage' | 'unstage', paths: string[]): Promise<void> {
-    if (paths.length === 0) return;
+    // Webview-supplied paths are a trust boundary: only forward repo-relative
+    // paths reach the engine write RPCs.
+    const safePaths = paths.filter((p) => isValidRepoPath(p));
+    if (safePaths.length === 0) return;
     try {
-      await this.client.request(operation, { paths });
+      await this.client.request(operation, { paths: safePaths });
       await this.doRefresh();
     } catch (err) {
       vscode.window.showErrorMessage(`Git Bamboo: ${operation} failed — ${errorMessage(err)}`);
@@ -151,10 +165,12 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
    * engine's `--amend --no-edit` path.
    */
   private async commit(message: string, amend: boolean): Promise<void> {
+    if (this.committing) return; // in-flight guard: no double commits
     if (!message && !amend) {
       vscode.window.showWarningMessage('Git Bamboo: commit message is empty');
       return;
     }
+    this.committing = true;
     try {
       await this.client.request('commit', { message, amend });
       await this.view?.webview.postMessage({ type: 'committed' });
@@ -163,6 +179,8 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       vscode.window.showErrorMessage(
         `Git Bamboo: ${amend ? 'amend' : 'commit'} failed — ${errorMessage(err)}`,
       );
+    } finally {
+      this.committing = false;
     }
   }
 }
