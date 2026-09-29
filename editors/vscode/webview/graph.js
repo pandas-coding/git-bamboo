@@ -12,9 +12,15 @@
   const ROW_HEIGHT = 24;
   const ROW_BUFFER = 20; // rows rendered beyond each edge of the viewport
   const VIEWPORT_DEBOUNCE_MS = 16;
-  const GRAPH_WIDTH = 240; // must match the .graph-gap / #overlay CSS widths
   const LANE_X_START = 14;
   const LANE_X_STEP = 12;
+
+  /** Lane-area width bounds: below MIN the first lane is cramped, above MAX
+   *  there is no point widening further (the old hard-coded width). */
+  const GRAPH_MIN_WIDTH = 44;
+  const GRAPH_MAX_WIDTH = 240;
+  /** Right padding inside the lane area after the last lane's column. */
+  const GRAPH_RIGHT_PAD = 14;
 
   const LANE_COLORS = [
     '#4fc1ff', '#ffd479', '#b180d7', '#89d185',
@@ -42,6 +48,11 @@
   let anchorCommit = null;
   let selectedRow = -1;
   let needsRedraw = false;
+  /** Lane-area width override set by the user (splitter drag / keyboard);
+   *  null = auto-size to the visible lane count. */
+  let manualWidth = null;
+  /** The lane-area width currently applied (via the --graph-width CSS var). */
+  let graphWidth = GRAPH_MAX_WIDTH;
 
   // ---------------------------------------------------------------- scrolling
 
@@ -176,6 +187,27 @@
     return LANE_COLORS[Math.abs(hash) % LANE_COLORS.length];
   }
 
+  // ------------------------------------------------------- lane-area width
+
+  /** Auto width from the widest lane in the cached commits (the cache keeps
+   *  ~3 pages of rows, so it is representative of the visible window). */
+  function computeAutoWidth() {
+    let maxLane = 0;
+    for (const commit of commits.values()) {
+      if (typeof commit.lane === 'number' && commit.lane > maxLane) maxLane = commit.lane;
+    }
+    const width = LANE_X_START + (maxLane + 1) * LANE_X_STEP + GRAPH_RIGHT_PAD;
+    return Math.min(GRAPH_MAX_WIDTH, Math.max(GRAPH_MIN_WIDTH, width));
+  }
+
+  /** Applies manualWidth ?? computeAutoWidth() to the CSS variable the rows,
+   *  overlay, and splitter all derive their geometry from. */
+  function applyWidth() {
+    graphWidth = manualWidth !== null ? manualWidth : computeAutoWidth();
+    document.documentElement.style.setProperty('--graph-width', `${graphWidth}px`);
+    needsRedraw = true; // canvas re-reads clientWidth on the next draw
+  }
+
   // ------------------------------------------------------------------- canvas
 
   function laneX(lane) {
@@ -192,7 +224,7 @@
 
   function draw() {
     const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth || GRAPH_WIDTH;
+    const width = canvas.clientWidth || graphWidth;
     const height = canvas.clientHeight || 0;
     if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
       canvas.width = Math.round(width * dpr);
@@ -272,6 +304,7 @@
     }
     trimCache();
     rebuildIdIndex();
+    applyWidth(); // new data may change the visible lane count
     renderRows();
   }
 
@@ -301,6 +334,7 @@
       el.textContent = '';
       el.dataset.commitId = '';
     }
+    applyWidth(); // auto mode: the lane count of the refetched data may differ
     renderRows(); // skeletons
     // Preserve the scroll anchor; the server uses anchor_commit to re-pin.
     vscode.postMessage({
@@ -339,5 +373,6 @@
 
   // Initial load.
   renderRows();
+  applyWidth();
   requestViewport();
 })();

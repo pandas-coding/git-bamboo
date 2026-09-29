@@ -53,9 +53,10 @@
       cursor: pointer;
       box-sizing: border-box;
     }
-    /* Left gutter where the canvas branch curves live. */
+    /* Left gutter where the canvas branch curves live. Width follows the
+     * visible lane count (JS sets the --graph-width variable). */
     .row .graph-gap {
-      flex: 0 0 240px;
+      flex: 0 0 var(--graph-width, 240px);
     }
     .row .message {
       overflow: hidden;
@@ -103,7 +104,7 @@
       position: absolute;
       top: 0;
       left: 0;
-      width: 240px;
+      width: var(--graph-width, 240px);
       height: 100%;
       pointer-events: none;
     }
