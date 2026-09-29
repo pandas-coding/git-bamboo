@@ -97,11 +97,6 @@
         el.className = 'row';
         el.style.top = `${row * ROW_HEIGHT}px`;
         el.addEventListener('click', () => selectRow(row));
-        // Double-click requests a (detached) checkout of that commit.
-        el.addEventListener('dblclick', () => {
-          const commit = commits.get(row);
-          if (commit) vscode.postMessage({ type: 'checkoutCommit', id: commit.id });
-        });
         rowsEl.appendChild(el);
         rowEls.set(row, el);
       }

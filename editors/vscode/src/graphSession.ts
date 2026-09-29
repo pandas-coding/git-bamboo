@@ -22,7 +22,6 @@ interface GraphViewMessage {
   offset?: number;
   limit?: number;
   anchorCommit?: string | null;
-  id?: string;
 }
 
 export class GraphSession implements vscode.Disposable {
@@ -100,13 +99,6 @@ export class GraphSession implements vscode.Disposable {
       const anchor = message.anchorCommit ?? null;
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
       this.debounceTimer = setTimeout(() => void this.requestGraph(offset, limit, anchor), VIEWPORT_DEBOUNCE_MS);
-    } else if (message?.type === 'checkoutCommit' && typeof message.id === 'string') {
-      // The engine has no checkout-commit RPC yet (checked against
-      // crates/protocol and the engine dispatch); the real detach flow
-      // lands in T2.
-      vscode.window.showInformationMessage(
-        `Git Bamboo: detached checkout of ${message.id.slice(0, 8)} coming in T2`,
-      );
     }
   }
 

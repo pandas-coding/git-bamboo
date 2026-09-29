@@ -1,7 +1,7 @@
 ---
 title: UX Polish Round 1 — Phase 1（A1）：Commit Graph 交互修复
 date: 2026-09-29
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 group: vscode-ux-polish-round1
