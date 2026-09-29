@@ -90,6 +90,23 @@
     scheduleViewportRequest();
   }).observe(scroller);
 
+  // Fires before the native webview/context menu opens: report the
+  // right-clicked commit so the host can park it for the menu commands
+  // (contextmenu -> menu command is the hand-off path; command arguments
+  // cannot carry webview data). Skeleton rows have no data-vscode-context
+  // attribute and thus no menu — and no target either.
+  rowsEl.addEventListener('contextmenu', (e) => {
+    const rowEl = e.target instanceof Element ? e.target.closest('.row') : null;
+    if (!rowEl) return;
+    const commit = commits.get(Number(rowEl.dataset.row));
+    if (commit) {
+      vscode.postMessage({
+        type: 'contextTarget',
+        commit: { id: commit.id, message: commit.message, author_name: commit.author_name },
+      });
+    }
+  });
+
   // ------------------------------------------------------------- row rendering
 
   function renderRows() {
@@ -109,6 +126,8 @@
         el.className = 'row';
         el.style.top = `${row * ROW_HEIGHT}px`;
         el.addEventListener('click', () => selectRow(row));
+        // Row index for the delegated contextmenu handler (element -> row).
+        el.dataset.row = String(row);
         rowsEl.appendChild(el);
         rowEls.set(row, el);
       }
@@ -126,6 +145,16 @@
     el.dataset.commitId = commit ? commit.id : '';
     // textContent-only population: commit messages are untrusted.
     el.textContent = '';
+    // Native webview/context menu targeting: only real commit rows opt in
+    // (skeleton rows show no menu). The value is static JSON, not markup.
+    if (commit) {
+      el.setAttribute(
+        'data-vscode-context',
+        JSON.stringify({ webviewSection: 'commitRow', preventDefaultContextMenuItems: true }),
+      );
+    } else {
+      el.removeAttribute('data-vscode-context');
+    }
     const gap = document.createElement('span');
     gap.className = 'graph-gap';
     el.appendChild(gap);

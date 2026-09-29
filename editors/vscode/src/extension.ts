@@ -14,6 +14,7 @@ import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
 import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
+import { takeGraphContextTarget } from './graphSession';
 import { HeadContentProvider } from './headContent';
 import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
@@ -81,6 +82,62 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // other commands (unconditionally) so it never dead-ends without a repo.
   registerCommand(context, 'gitBamboo.refreshChanges', () =>
     activeCommitView ? activeCommitView.refresh() : noSessionWarning());
+
+  // Commit-row context menu (native webview/context menus): the webview
+  // reports the right-clicked commit right before the menu opens, and
+  // takeGraphContextTarget() hands it (plus its engine client) to whichever
+  // menu command the user picks. Palette entries are hidden (`when: false`) —
+  // without a pending target these commands have nothing to act on.
+  registerCommand(context, 'gitBamboo.graph.copySha', async () => {
+    const target = takeGraphContextTarget();
+    if (!target) return noGraphTargetWarning();
+    await vscode.env.clipboard.writeText(target.commit.id);
+    vscode.window.setStatusBarMessage(`Git Bamboo: copied ${target.commit.id.slice(0, 8)}`, 3000);
+  });
+  registerCommand(context, 'gitBamboo.graph.copyMessage', async () => {
+    const target = takeGraphContextTarget();
+    if (!target) return noGraphTargetWarning();
+    await vscode.env.clipboard.writeText(target.commit.message);
+    vscode.window.setStatusBarMessage('Git Bamboo: copied commit message', 3000);
+  });
+  registerCommand(context, 'gitBamboo.graph.createBranchAt', async () => {
+    const target = takeGraphContextTarget();
+    if (!target) return noGraphTargetWarning();
+    const name = await promptBranchName(`Create branch at ${target.commit.id.slice(0, 8)}`);
+    if (!name) return;
+    try {
+      await target.client.request('createBranch', { name, base: target.commit.id });
+      // refsChanged from the engine refreshes the graph pills automatically.
+      vscode.window.showInformationMessage(`Git Bamboo: created branch ${name}`);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
+    }
+  });
+  // "Checkout" = create a branch at the commit, then switch to it (the
+  // branch-based form needs no confirmation: nothing is discarded, and
+  // auto-stash protects a dirty worktree). Bare detached checkout stays in
+  // phase B per the UX polish plan.
+  registerCommand(context, 'gitBamboo.graph.checkoutNewBranch', async () => {
+    const target = takeGraphContextTarget();
+    if (!target) return noGraphTargetWarning();
+    const name = await promptBranchName(`Checkout at ${target.commit.id.slice(0, 8)} (new branch)`);
+    if (!name) return;
+    try {
+      await target.client.request('createBranch', { name, base: target.commit.id });
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
+      return;
+    }
+    try {
+      await target.client.request('switchBranch', { name, auto_stash: true });
+      vscode.window.showInformationMessage(`Git Bamboo: checked out ${name}`);
+    } catch (err) {
+      // Two-step flow, not atomic: be explicit that step 1 did land.
+      vscode.window.showWarningMessage(
+        `Git Bamboo: branch ${name} was created but not checked out — ${errorMessage(err)}`,
+      );
+    }
+  });
 
   // Palette amend has no input box to source a message from, so it is
   // always the engine's `--amend --no-edit` path (empty message).
@@ -233,6 +290,24 @@ function onNotification(
   handler: (params: Record<string, unknown>) => void,
 ): void {
   context.subscriptions.push(client.onNotification(method, handler));
+}
+
+/** Shown when a graph context-menu command runs with no pending target
+ *  (e.g. invoked programmatically). Palette entries are `when: false`, so
+ *  this is a safety net, not the normal path. */
+function noGraphTargetWarning(): void {
+  vscode.window.showWarningMessage(
+    'Git Bamboo: no commit selected — right-click a commit row in the graph first.',
+  );
+}
+
+/** Input box for context-menu branch creation; trimmed name or undefined. */
+async function promptBranchName(prompt: string): Promise<string | undefined> {
+  const value = await vscode.window.showInputBox({
+    prompt,
+    validateInput: (input) => (input.trim() ? undefined : 'Name is required'),
+  });
+  return value?.trim() || undefined; // cancelled or empty
 }
 
 /** Registers a command with a uniform error surface. */

@@ -79,6 +79,26 @@
         "title": "Refresh Changes",
         "category": "Git Bamboo",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "gitBamboo.graph.copySha",
+        "title": "Copy Commit SHA",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.graph.copyMessage",
+        "title": "Copy Commit Message",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.graph.createBranchAt",
+        "title": "Create Branch at Commit...",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.graph.checkoutNewBranch",
+        "title": "Checkout Commit (New Branch)...",
+        "category": "Git Bamboo"
       }
     ],
     "menus": {
@@ -115,6 +135,44 @@
         {
           "command": "gitBamboo.commitAmend",
           "when": "git-bamboo:active"
+        },
+        {
+          "command": "gitBamboo.graph.copySha",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.graph.copyMessage",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.graph.createBranchAt",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.graph.checkoutNewBranch",
+          "when": "false"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "gitBamboo.graph.checkoutNewBranch",
+          "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "1_checkout"
+        },
+        {
+          "command": "gitBamboo.graph.createBranchAt",
+          "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "2_branch"
+        },
+        {
+          "command": "gitBamboo.graph.copySha",
+          "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "9_clipboard@1"
+        },
+        {
+          "command": "gitBamboo.graph.copyMessage",
+          "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "9_clipboard@2"
         }
       ]
     },

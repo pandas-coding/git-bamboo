@@ -25,6 +25,8 @@ interface GraphViewMessage {
   /** graphWidthChanged payload: the new manual width, or null to clear the
    *  override and return to auto width. */
   width?: number | null;
+  /** contextTarget payload: the commit under the webview's context menu. */
+  commit?: { id?: unknown; message?: unknown; author_name?: unknown };
 }
 
 /** Which webview host owns a graph session — widths are persisted per host. */
@@ -33,6 +35,33 @@ export type GraphHost = 'sidebar' | 'panel';
 /** globalState key for the manual lane-area width of a given host. */
 function widthKey(host: GraphHost): string {
   return `gitBamboo.graphWidth.${host}`;
+}
+
+/** The commit a graph webview right-clicked, as shown in its row. */
+export interface GraphContextCommit {
+  id: string;
+  message: string;
+  author_name: string;
+}
+
+/** The parked context-menu target: the commit plus the engine client of the
+ *  session whose webview was right-clicked (commands use that client). */
+interface GraphContextTarget {
+  client: EngineClient;
+  commit: GraphContextCommit;
+  /** Owning session — the target is dropped when the session goes away. */
+  owner: GraphSession;
+}
+
+/** The pending webview context-menu target (weak single-slot registry). */
+let graphContextTarget: GraphContextTarget | undefined;
+
+/** Returns (and clears) the commit targeted by the graph context menu, if
+ *  any. Called by the context-menu command handlers in extension.ts. */
+export function takeGraphContextTarget(): { client: EngineClient; commit: GraphContextCommit } | undefined {
+  const target = graphContextTarget;
+  graphContextTarget = undefined;
+  return target;
 }
 
 export class GraphSession implements vscode.Disposable {
@@ -70,6 +99,7 @@ export class GraphSession implements vscode.Disposable {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (graphContextTarget?.owner === this) graphContextTarget = undefined;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.invalidateTimer) clearTimeout(this.invalidateTimer);
     // Unsubscribe engine notification listeners and webview subscriptions.
@@ -123,6 +153,20 @@ export class GraphSession implements vscode.Disposable {
       // null clears the override (back to auto width); update() with
       // undefined removes the key from globalState.
       void this.context.globalState.update(widthKey(this.host), message.width ?? undefined);
+    } else if (message?.type === 'contextTarget') {
+      // Right-click on a commit row (fires before the native menu opens).
+      const commit = message.commit;
+      if (
+        typeof commit?.id === 'string' &&
+        typeof commit.message === 'string' &&
+        typeof commit.author_name === 'string'
+      ) {
+        graphContextTarget = {
+          client: this.client,
+          commit: { id: commit.id, message: commit.message, author_name: commit.author_name },
+          owner: this,
+        };
+      }
     }
   }
 
