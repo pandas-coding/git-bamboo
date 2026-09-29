@@ -119,8 +119,8 @@ independent-panel-ui 计划（branch `implement/independent-panel-ui`，未合�
 
 ## Acceptance Criteria
 
-- [ ] `grep -rn "checkoutCommit\|GRAPH_WIDTH" editors/vscode/` 无结果 ✅（静态可验）
-- [ ] `tsc --noEmit` 零错误；`npm run compile` 成功 ✅
+- [x] `grep -rn "checkoutCommit\|GRAPH_WIDTH" editors/vscode/` 无结果 ✅（静态可验）
+- [x] `tsc --noEmit` 零错误；`npm run compile` 成功 ✅
 - [ ] lane 区宽度随可见 lane 数自适应（不再恒 240px），message 列在侧栏可读 ◐
 - [ ] 分隔条可拖拽（含键盘操作），宽度按宿主（侧栏/面板）分别持久化到 globalState，重开恢复 ◐
 - [ ] 双击 commit 无动作、无 "coming in T2" 提示 ◐
