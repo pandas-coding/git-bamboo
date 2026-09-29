@@ -556,7 +556,7 @@
     branchTips = new Map();
     for (const ref of refs) {
       if (!ref || typeof ref.name !== 'string' || !ref.target) continue;
-      if (!(ref.kind in REF_ORDER)) continue; // branch | tag | remote_branch
+      if (!Object.hasOwn(REF_ORDER, ref.kind)) continue; // branch | tag | remote_branch
       const list = branchTips.get(ref.target);
       if (list) list.push({ name: ref.name, kind: ref.kind });
       else branchTips.set(ref.target, [{ name: ref.name, kind: ref.kind }]);
