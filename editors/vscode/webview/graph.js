@@ -22,6 +22,10 @@
   /** Right padding inside the lane area after the last lane's column. */
   const GRAPH_RIGHT_PAD = 14;
 
+  /** dataset.commitId sentinel that forces fillRow to re-run (see
+   *  refillRows): never equal to a real commit id or to '' (skeleton). */
+  const REFILL_SENTINEL = '\u0000';
+
   const LANE_COLORS = [
     '#4fc1ff', '#ffd479', '#b180d7', '#89d185',
     '#e2a9a8', '#d7ba7d', '#75beff', '#f69d50',
@@ -95,18 +99,18 @@
   // Fires before the native webview/context menu opens: report the
   // right-clicked commit so the host can park it for the menu commands
   // (contextmenu -> menu command is the hand-off path; command arguments
-  // cannot carry webview data). Skeleton rows have no data-vscode-context
-  // attribute and thus no menu — and no target either.
+  // cannot carry webview data). A null commit (skeleton row or any row the
+  // delegated lookup misses) clears the host's parked target so a stale
+  // one can't outlive the row it came from — skeleton rows carry no
+  // data-vscode-context and thus show no native menu either.
   rowsEl.addEventListener('contextmenu', (e) => {
     const rowEl = e.target instanceof Element ? e.target.closest('.row') : null;
     if (!rowEl) return;
     const commit = commits.get(Number(rowEl.dataset.row));
-    if (commit) {
-      vscode.postMessage({
-        type: 'contextTarget',
-        commit: { id: commit.id, message: commit.message, author_name: commit.author_name },
-      });
-    }
+    vscode.postMessage({
+      type: 'contextTarget',
+      commit: commit ? { id: commit.id, message: commit.message } : null,
+    });
   });
 
   // ------------------------------------------------------------- row rendering
@@ -188,12 +192,9 @@
         const ordered = [...tips].sort((a, b) => REF_ORDER[a.kind] - REF_ORDER[b.kind]);
         for (const ref of ordered) {
           const pill = document.createElement('span');
-          pill.className =
-            ref.kind === 'tag'
-              ? 'branch-tag tag-pill'
-              : ref.kind === 'remote_branch'
-                ? 'branch-tag remote-pill'
-                : 'branch-tag';
+          // Tags are distinguished by the tag icon + per-name border color
+          // (no dedicated class); remote branches by the remote-pill style.
+          pill.className = ref.kind === 'remote_branch' ? 'branch-tag remote-pill' : 'branch-tag';
           if (ref.kind !== 'remote_branch') pill.style.borderColor = tagColor(ref.name);
           if (ref.kind === 'tag') pill.appendChild(tagIcon());
           // Text node, not innerHTML: ref names are untrusted.
@@ -253,8 +254,9 @@
   /** Pill render order by ref kind (branch → tag → remote). */
   const REF_ORDER = { branch: 0, tag: 1, remote_branch: 2 };
 
-  /** Inline DOM SVG tag icon (CSP allows inline SVG; no markup injection). */
-  function tagIcon() {
+  /** Inline DOM SVG tag icon (CSP allows inline SVG; no markup injection).
+   *  The icon is invariant, so build it once and clone per pill. */
+  const TAG_ICON_TEMPLATE = (() => {
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 16 16');
     svg.setAttribute('class', 'tag-icon');
@@ -267,19 +269,30 @@
     );
     svg.appendChild(shape);
     return svg;
+  })();
+
+  function tagIcon() {
+    return TAG_ICON_TEMPLATE.cloneNode(true);
   }
 
   // ------------------------------------------------------- lane-area width
 
+  /** Last width computed from real commit data (never shrinks back to the
+   *  minimum when the cache is momentarily empty, so invalidation bursts
+   *  don't make the gutter visually collapse and re-expand). */
+  let lastAutoWidth = GRAPH_MAX_WIDTH;
+
   /** Auto width from the widest lane in the cached commits (the cache keeps
    *  ~3 pages of rows, so it is representative of the visible window). */
   function computeAutoWidth() {
+    if (commits.size === 0) return lastAutoWidth; // invalidated/empty cache
     let maxLane = 0;
     for (const commit of commits.values()) {
       if (typeof commit.lane === 'number' && commit.lane > maxLane) maxLane = commit.lane;
     }
     const width = LANE_X_START + (maxLane + 1) * LANE_X_STEP + GRAPH_RIGHT_PAD;
-    return Math.min(GRAPH_MAX_WIDTH, Math.max(GRAPH_MIN_WIDTH, width));
+    lastAutoWidth = Math.min(GRAPH_MAX_WIDTH, Math.max(GRAPH_MIN_WIDTH, width));
+    return lastAutoWidth;
   }
 
   /** Applies manualWidth ?? computeAutoWidth() to the CSS variable the rows,
@@ -342,11 +355,22 @@
   splitter.addEventListener('lostpointercapture', endDrag);
 
   // The splitter sits outside #scroller (it must overlay the rows), so wheel
-  // events over it would not reach the scroller — forward them manually.
+  // events over it would not reach the scroller — forward them manually,
+  // normalizing delta modes (line/page) so the scroll distance matches what
+  // the scroller itself would do. preventDefault only when we consumed a
+  // delta, so zero-delta events keep their default behavior (e.g. zoom).
   splitter.addEventListener(
     'wheel',
     (e) => {
-      scroller.scrollTop += e.deltaY;
+      const unit =
+        e.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? ROW_HEIGHT
+          : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? Math.max(ROW_HEIGHT, scroller.clientHeight)
+            : 1;
+      const delta = e.deltaY * unit;
+      if (delta === 0) return;
+      scroller.scrollTop += delta;
       e.preventDefault();
     },
     { passive: false },
@@ -510,17 +534,22 @@
     }
   }
 
+  /** Forces the next renderRows() pass to re-run fillRow on every rendered
+   *  row. '' is the skeleton commitId, so a plain clear would NOT re-run
+   *  fillRow on skeleton rows and their stale attributes (context-menu
+   *  target, title, head-row class) would survive; the sentinel never
+   * matches a real commit id, and fillRow's skeleton path clears them. */
+  function refillRows() {
+    for (const el of rowEls.values()) el.dataset.commitId = REFILL_SENTINEL;
+    renderRows();
+  }
+
   function invalidate() {
     const topRow = firstVisibleRow();
     commits.clear();
     idToRow = new Map();
-    for (const el of rowEls.values()) {
-      el.textContent = '';
-      el.dataset.commitId = '';
-      el.classList.remove('head-row');
-    }
+    refillRows(); // skeleton-reset via fillRow (clears stale row state)
     applyWidth(); // auto mode: the lane count of the refetched data may differ
-    renderRows(); // skeletons
     // Preserve the scroll anchor; the server uses anchor_commit to re-pin.
     vscode.postMessage({
       type: 'viewportChanged',
@@ -542,11 +571,16 @@
     } else if (message.type === 'head' && typeof message.sha === 'string') {
       // Force re-fill of rendered rows so the HEAD marker moves.
       headSha = message.sha;
-      for (const el of rowEls.values()) el.dataset.commitId = '';
-      renderRows();
+      refillRows();
     } else if (message.type === 'graphWidth') {
-      // Host-persisted width from the initial 'ready' handshake (null = auto).
-      manualWidth = typeof message.width === 'number' ? clampWidth(message.width) : null;
+      // Host-persisted width from the 'ready' handshake (null = auto). Clamp
+      // to the static bounds only — the container is typically not laid out
+      // yet at handshake time, and the 60%-of-container bound (maxWidth)
+      // applies to user resizing, not to restoring a persisted value.
+      manualWidth =
+        typeof message.width === 'number'
+          ? Math.min(GRAPH_MAX_WIDTH, Math.max(GRAPH_MIN_WIDTH, Math.round(message.width)))
+          : null;
       applyWidth();
     }
   });
@@ -562,8 +596,7 @@
       else branchTips.set(ref.target, [{ name: ref.name, kind: ref.kind }]);
     }
     // Force re-fill of already-rendered rows so tags appear without a scroll.
-    for (const el of rowEls.values()) el.dataset.commitId = '';
-    renderRows();
+    refillRows();
   }
 
   // Initial load. The 'ready' message triggers the host to send back the

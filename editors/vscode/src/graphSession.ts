@@ -17,6 +17,21 @@ const EPOCH_MISMATCH = -32004;
 /** Debounce for viewport requests coming from scroll events. */
 const VIEWPORT_DEBOUNCE_MS = 16;
 
+/** Lane-area width bounds, mirrored from the webview (graph.js) so the host
+ *  can validate webview-supplied widths before persisting them. */
+const GRAPH_MIN_WIDTH = 44;
+const GRAPH_MAX_WIDTH = 240;
+
+/** How long a parked context-menu target stays usable: the native menu
+ *  opens (and is either acted on or dismissed) immediately, so anything
+ *  not consumed within this window is stale — this guards against
+ *  programmatic invocation of the hidden palette commands long after the
+ *  menu was dismissed. */
+const CONTEXT_TARGET_TTL_MS = 30_000;
+
+/** Full commit ids as the engine reports them (SHA-1: 40 hex, SHA-256: 64). */
+const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/i;
+
 interface GraphViewMessage {
   type?: string;
   offset?: number;
@@ -25,8 +40,9 @@ interface GraphViewMessage {
   /** graphWidthChanged payload: the new manual width, or null to clear the
    *  override and return to auto width. */
   width?: number | null;
-  /** contextTarget payload: the commit under the webview's context menu. */
-  commit?: { id?: unknown; message?: unknown; author_name?: unknown };
+  /** contextTarget payload: the commit under the webview's context menu
+   *  (null = right-click landed on a non-commit row; clears any target). */
+  commit?: { id?: unknown; message?: unknown } | null;
 }
 
 /** Which webview host owns a graph session — widths are persisted per host. */
@@ -41,7 +57,6 @@ function widthKey(host: GraphHost): string {
 export interface GraphContextCommit {
   id: string;
   message: string;
-  author_name: string;
 }
 
 /** The parked context-menu target: the commit plus the engine client of the
@@ -55,10 +70,33 @@ interface GraphContextTarget {
 
 /** The pending webview context-menu target (weak single-slot registry). */
 let graphContextTarget: GraphContextTarget | undefined;
+let graphContextTargetTimer: NodeJS.Timeout | undefined;
+
+function clearGraphContextTargetTimer(): void {
+  if (graphContextTargetTimer) clearTimeout(graphContextTargetTimer);
+  graphContextTargetTimer = undefined;
+}
+
+function clearGraphContextTarget(owner: GraphSession): void {
+  if (graphContextTarget?.owner === owner) {
+    graphContextTarget = undefined;
+    clearGraphContextTargetTimer();
+  }
+}
+
+function parkGraphContextTarget(target: GraphContextTarget): void {
+  graphContextTarget = target;
+  clearGraphContextTargetTimer();
+  graphContextTargetTimer = setTimeout(() => {
+    graphContextTarget = undefined;
+    graphContextTargetTimer = undefined;
+  }, CONTEXT_TARGET_TTL_MS);
+}
 
 /** Returns (and clears) the commit targeted by the graph context menu, if
  *  any. Called by the context-menu command handlers in extension.ts. */
 export function takeGraphContextTarget(): { client: EngineClient; commit: GraphContextCommit } | undefined {
+  clearGraphContextTargetTimer();
   const target = graphContextTarget;
   graphContextTarget = undefined;
   return target;
@@ -94,14 +132,14 @@ export class GraphSession implements vscode.Disposable {
       client.onNotification('headChanged', () => void this.sendHead()),
       { dispose: onDispose },
     );
-    void this.sendRefs();
-    void this.sendHead();
+    // Initial refs/HEAD are pushed from the 'ready' handler: messages posted
+    // here (before the webview document loads its listener) are dropped.
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    if (graphContextTarget?.owner === this) graphContextTarget = undefined;
+    clearGraphContextTarget(this);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.invalidateTimer) clearTimeout(this.invalidateTimer);
     // Unsubscribe engine notification listeners and webview subscriptions.
@@ -147,27 +185,50 @@ export class GraphSession implements vscode.Disposable {
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
       this.debounceTimer = setTimeout(() => void this.requestGraph(offset, limit, anchor), VIEWPORT_DEBOUNCE_MS);
     } else if (message?.type === 'ready') {
-      // Webview finished initializing: hand it the persisted width. By the
-      // time the webview can send this, the message channel is up.
-      const width = this.context.globalState.get<number | null>(widthKey(this.host), null);
+      // Webview finished initializing: by the time it can send this, its
+      // message listener is up — so this is the first point where pushes
+      // actually reach it. Hand it the persisted width (sanitized on read:
+      // globalState is durable and older/corrupt entries must not leak
+      // through), plus the current refs and HEAD.
+      const stored = this.context.globalState.get<unknown>(widthKey(this.host), null);
+      const width =
+        typeof stored === 'number' && Number.isFinite(stored)
+          ? Math.min(GRAPH_MAX_WIDTH, Math.max(GRAPH_MIN_WIDTH, stored))
+          : null;
       void this.webview.postMessage({ type: 'graphWidth', width });
+      void this.sendRefs();
+      void this.sendHead();
     } else if (message?.type === 'graphWidthChanged') {
       // null clears the override (back to auto width); update() with
-      // undefined removes the key from globalState.
-      void this.context.globalState.update(widthKey(this.host), message.width ?? undefined);
-    } else if (message?.type === 'contextTarget') {
-      // Right-click on a commit row (fires before the native menu opens).
-      const commit = message.commit;
+      // undefined removes the key from globalState. The webview is a trust
+      // boundary and globalState is durable: only a finite in-range width
+      // (or an explicit null) is persisted; anything else is ignored.
+      const width = message.width;
       if (
-        typeof commit?.id === 'string' &&
-        typeof commit.message === 'string' &&
-        typeof commit.author_name === 'string'
+        width === null ||
+        (typeof width === 'number' &&
+          Number.isFinite(width) &&
+          width >= GRAPH_MIN_WIDTH &&
+          width <= GRAPH_MAX_WIDTH)
       ) {
-        graphContextTarget = {
+        void this.context.globalState.update(widthKey(this.host), width ?? undefined);
+      }
+    } else if (message?.type === 'contextTarget') {
+      // Right-click on a commit row (fires before the native menu opens);
+      // null (non-commit row) clears this session's parked target.
+      const commit = message.commit;
+      if (commit === null) {
+        clearGraphContextTarget(this);
+      } else if (
+        typeof commit?.id === 'string' &&
+        COMMIT_ID_RE.test(commit.id) &&
+        typeof commit.message === 'string'
+      ) {
+        parkGraphContextTarget({
           client: this.client,
-          commit: { id: commit.id, message: commit.message, author_name: commit.author_name },
+          commit: { id: commit.id, message: commit.message },
           owner: this,
-        };
+        });
       }
     }
   }

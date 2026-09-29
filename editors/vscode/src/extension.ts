@@ -14,7 +14,7 @@ import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
 import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
-import { takeGraphContextTarget } from './graphSession';
+import { takeGraphContextTarget, type GraphContextCommit } from './graphSession';
 import { HeadContentProvider } from './headContent';
 import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
@@ -88,56 +88,70 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // takeGraphContextTarget() hands it (plus its engine client) to whichever
   // menu command the user picks. Palette entries are hidden (`when: false`) —
   // without a pending target these commands have nothing to act on.
-  registerCommand(context, 'gitBamboo.graph.copySha', async () => {
-    const target = takeGraphContextTarget();
-    if (!target) return noGraphTargetWarning();
-    await vscode.env.clipboard.writeText(target.commit.id);
-    vscode.window.setStatusBarMessage(`Git Bamboo: copied ${target.commit.id.slice(0, 8)}`, 3000);
-  });
-  registerCommand(context, 'gitBamboo.graph.copyMessage', async () => {
-    const target = takeGraphContextTarget();
-    if (!target) return noGraphTargetWarning();
-    await vscode.env.clipboard.writeText(target.commit.message);
-    vscode.window.setStatusBarMessage('Git Bamboo: copied commit message', 3000);
-  });
-  registerCommand(context, 'gitBamboo.graph.createBranchAt', async () => {
-    const target = takeGraphContextTarget();
-    if (!target) return noGraphTargetWarning();
-    const name = await promptBranchName(`Create branch at ${target.commit.id.slice(0, 8)}`);
-    if (!name) return;
-    try {
-      await target.client.request('createBranch', { name, base: target.commit.id });
-      // refsChanged from the engine refreshes the graph pills automatically.
-      vscode.window.showInformationMessage(`Git Bamboo: created branch ${name}`);
-    } catch (err) {
-      vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
-    }
-  });
+  registerCommand(context, 'gitBamboo.graph.copySha', () =>
+    withGraphTarget(async ({ commit }) => {
+      await vscode.env.clipboard.writeText(commit.id);
+      vscode.window.setStatusBarMessage(`Git Bamboo: copied ${commit.id.slice(0, 8)}`, 3000);
+    }));
+  registerCommand(context, 'gitBamboo.graph.copyMessage', () =>
+    withGraphTarget(async ({ commit }) => {
+      await vscode.env.clipboard.writeText(commit.message);
+      vscode.window.setStatusBarMessage('Git Bamboo: copied commit message', 3000);
+    }));
+  registerCommand(context, 'gitBamboo.graph.createBranchAt', () =>
+    withGraphTarget(async ({ client, commit }) => {
+      const name = await promptBranchName(`Create branch at ${commit.id.slice(0, 8)}`);
+      if (!name) return;
+      try {
+        await createBranchAt(client, commit.id, name);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
+      }
+    }));
   // "Checkout" = create a branch at the commit, then switch to it (the
   // branch-based form needs no confirmation: nothing is discarded, and
   // auto-stash protects a dirty worktree). Bare detached checkout stays in
   // phase B per the UX polish plan.
-  registerCommand(context, 'gitBamboo.graph.checkoutNewBranch', async () => {
-    const target = takeGraphContextTarget();
-    if (!target) return noGraphTargetWarning();
-    const name = await promptBranchName(`Checkout at ${target.commit.id.slice(0, 8)} (new branch)`);
-    if (!name) return;
-    try {
-      await target.client.request('createBranch', { name, base: target.commit.id });
-    } catch (err) {
-      vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
-      return;
-    }
-    try {
-      await target.client.request('switchBranch', { name, auto_stash: true });
-      vscode.window.showInformationMessage(`Git Bamboo: checked out ${name}`);
-    } catch (err) {
-      // Two-step flow, not atomic: be explicit that step 1 did land.
-      vscode.window.showWarningMessage(
-        `Git Bamboo: branch ${name} was created but not checked out — ${errorMessage(err)}`,
-      );
-    }
-  });
+  registerCommand(context, 'gitBamboo.graph.checkoutNewBranch', () =>
+    withGraphTarget(async ({ client, commit }) => {
+      const name = await promptBranchName(`Checkout at ${commit.id.slice(0, 8)} (new branch)`);
+      if (!name) return;
+      try {
+        await createBranchAt(client, commit.id, name);
+      } catch (err) {
+        // A pre-existing branch with this name may point at a different
+        // commit, so silently switching to it would betray the right-clicked
+        // commit — ask instead of aborting outright.
+        const msg = errorMessage(err);
+        if (!/already exists/i.test(msg)) {
+          vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${msg}`);
+          return;
+        }
+        const choice = await vscode.window.showWarningMessage(
+          `Git Bamboo: branch ${name} already exists (it may point at a different commit).`,
+          'Switch to it',
+        );
+        if (choice !== 'Switch to it') return;
+      }
+      try {
+        await switchToBranch(client, name);
+      } catch (err) {
+        // Two-step flow, not atomic: be explicit that step 1 did land, and
+        // offer a one-click retry (the failure may be transient).
+        const retry = await vscode.window.showWarningMessage(
+          `Git Bamboo: branch ${name} exists but was not checked out — ${errorMessage(err)}`,
+          'Switch Now',
+        );
+        if (retry !== 'Switch Now') return;
+        try {
+          await switchToBranch(client, name);
+        } catch (retryErr) {
+          vscode.window.showErrorMessage(
+            `Git Bamboo: switch failed — ${errorMessage(retryErr)}`,
+          );
+        }
+      }
+    }));
 
   // Palette amend has no input box to source a message from, so it is
   // always the engine's `--amend --no-edit` path (empty message).
@@ -301,13 +315,64 @@ function noGraphTargetWarning(): void {
   );
 }
 
+/** Runs a graph context-menu handler against the pending right-click
+ *  target, warning (safety net) when none is parked. */
+async function withGraphTarget(
+  fn: (target: { client: EngineClient; commit: GraphContextCommit }) => Promise<void>,
+): Promise<void> {
+  const target = takeGraphContextTarget();
+  if (!target) {
+    noGraphTargetWarning();
+    return;
+  }
+  await fn(target);
+}
+
+/** Creates a branch at a commit and reports success (refsChanged from the
+ *  engine refreshes the graph pills automatically). Throws on failure. */
+async function createBranchAt(client: EngineClient, id: string, name: string): Promise<void> {
+  await client.request('createBranch', { name, base: id });
+  vscode.window.showInformationMessage(`Git Bamboo: created branch ${name}`);
+}
+
+/** Switches to a branch (auto-stash protects a dirty worktree) and reports
+ *  success. Throws on failure. */
+async function switchToBranch(client: EngineClient, name: string): Promise<void> {
+  await client.request('switchBranch', { name, auto_stash: true });
+  vscode.window.showInformationMessage(`Git Bamboo: checked out ${name}`);
+}
+
+/** Mirrors the engine's ref validation (validate_ref_arg in
+ *  write_queue.rs) so malformed names are rejected at the input box
+ *  instead of costing an engine round-trip and a raw error message. */
+function validateBranchName(value: string): string | undefined {
+  const name = value.trim();
+  if (!name) return 'Name is required';
+  if (name.length > 512) return 'Name is too long (max 512 characters)';
+  if (/^[-/]/.test(name)) return "Name cannot start with '-' or '/'";
+  if (name.endsWith('/') || name.endsWith('.')) return "Name cannot end with '/' or '.'";
+  if (name.includes('..') || name.includes('//') || name.includes('@')) {
+    return "Name cannot contain '..', '//', or '@'";
+  }
+  if (name.endsWith('.lock')) return "Name cannot end with '.lock'";
+  if (/[\u0000-\u001f\u007f ~^:?*[\\]/.test(name)) {
+    return 'Name contains a character that is not allowed in refs';
+  }
+  for (const part of name.split('/')) {
+    if (part.startsWith('.') || part.endsWith('.')) {
+      return "Each path segment must not start or end with '.'";
+    }
+  }
+  return undefined;
+}
+
 /** Input box for context-menu branch creation; trimmed name or undefined. */
 async function promptBranchName(prompt: string): Promise<string | undefined> {
   const value = await vscode.window.showInputBox({
     prompt,
-    validateInput: (input) => (input.trim() ? undefined : 'Name is required'),
+    validateInput: validateBranchName,
   });
-  return value?.trim() || undefined; // cancelled or empty
+  return value?.trim() || undefined; // cancelled or invalid/empty
 }
 
 /** Registers a command with a uniform error surface. */
