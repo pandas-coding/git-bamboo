@@ -46,3 +46,8 @@ tags: [git, vscode-extension, ui]
 - 实施计划（A 期，group `vscode-ux-polish-round1`）：
   - `.ai-workflow/plans/20260929-vscode-ux-polish-round1-phase-1.md`（A1：graph 宽度自适应/分隔条、删双击、右键菜单、HEAD/tag、meta 排版）
   - `.ai-workflow/plans/20260929-vscode-ux-polish-round1-phase-2.md`（A2：Commit 视图批量操作/文件右键、竹子图标与 marketplace icon）
+- 实施回顾（A1，2026-09-30）：
+  - `.ai-workflow/learnings/20260930-vscode-webview-early-postmessage-dropped.md`
+  - `.ai-workflow/learnings/20260930-empty-string-refill-sentinel-collides-with-skeleton.md`
+  - `.ai-workflow/learnings/20260930-webview-host-two-way-trust-boundary.md`
+  - `.ai-workflow/learnings/20260930-precise-line-number-research-zero-rework.md`

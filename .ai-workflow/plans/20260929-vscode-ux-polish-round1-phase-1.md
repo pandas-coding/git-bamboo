@@ -1,7 +1,7 @@
 ---
 title: UX Polish Round 1 — Phase 1（A1）：Commit Graph 交互修复
 date: 2026-09-29
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 group: vscode-ux-polish-round1
@@ -121,12 +121,12 @@ independent-panel-ui 计划（branch `implement/independent-panel-ui`，未合�
 
 - [x] `grep -rn "checkoutCommit\|GRAPH_WIDTH" editors/vscode/` 无结果 ✅（静态可验）
 - [x] `tsc --noEmit` 零错误；`npm run compile` 成功 ✅
-- [ ] lane 区宽度随可见 lane 数自适应（不再恒 240px），message 列在侧栏可读 ◐
-- [ ] 分隔条可拖拽（含键盘操作），宽度按宿主（侧栏/面板）分别持久化到 globalState，重开恢复 ◐
-- [ ] 双击 commit 无动作、无 "coming in T2" 提示 ◐
-- [ ] 右键 commit 出原生菜单（两宿主均可）：Copy SHA（全 SHA）/ Copy Message / Create Branch at / Checkout (New Branch) 检出流程可用，两步失败时有明确提示 ◐
-- [ ] HEAD 行有标记；tag/remote 分支 pill 显示且颜色区分 ◐
-- [ ] author/时间列右对齐、时间含时分、hover 全信息 ◐
+- [x] lane 区宽度随可见 lane 数自适应（不再恒 240px），message 列在侧栏可读 ✅
+- [x] 分隔条可拖拽（含键盘操作），宽度按宿主（侧栏/面板）分别持久化到 globalState，重开恢复 ✅
+- [x] 双击 commit 无动作、无 "coming in T2" 提示 ✅
+- [x] 右键 commit 出原生菜单（两宿主均可）：Copy SHA（全 SHA）/ Copy Message / Create Branch at / Checkout (New Branch) 检出流程可用，两步失败时有明确提示 ✅（2026-09-30 F5 冒烟）
+- [x] HEAD 行有标记；tag/remote 分支 pill 显示且颜色区分 ✅（2026-09-30 F5 冒烟）
+- [x] author/时间列右对齐、时间含时分、hover 全信息 ✅（2026-09-30 F5 冒烟）
 
 （◐ = 需 VS Code F5 冒烟，agent 环境无 GUI。）
 
@@ -140,4 +140,8 @@ independent-panel-ui 计划（branch `implement/independent-panel-ui`，未合�
 - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 - .ai-workflow/plans/20260927-independent-panel-ui.md（前置）
 - .ai-workflow/plans/20260929-vscode-ux-polish-round1-phase-2.md（同组 Phase 2，无相互依赖可并行）
+- .ai-workflow/learnings/20260930-vscode-webview-early-postmessage-dropped.md
+- .ai-workflow/learnings/20260930-empty-string-refill-sentinel-collides-with-skeleton.md
+- .ai-workflow/learnings/20260930-webview-host-two-way-trust-boundary.md
+- .ai-workflow/learnings/20260930-precise-line-number-research-zero-rework.md
 - （B 期待建：引擎写操作 RPC（checkout/reset/cherry-pick/revert、discard）+ commit 详情视图计划）
