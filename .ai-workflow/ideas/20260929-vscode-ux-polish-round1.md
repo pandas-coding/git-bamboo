@@ -1,7 +1,7 @@
 ---
 title: Git Bamboo VS Code 插件样式与交互优化（A/B 两期）
 date: 2026-09-29
-status: converged
+status: planning
 ideas:
   - .ai-workflow/ideas/20260921-rust-vscode-git-workbench.md
 tags: [git, vscode-extension, ui]
@@ -43,3 +43,6 @@ tags: [git, vscode-extension, ui]
 
 - 母 idea：`.ai-workflow/ideas/20260921-rust-vscode-git-workbench.md`
 - 前置计划（本次反馈来源）：`.ai-workflow/plans/20260927-independent-panel-ui.md`
+- 实施计划（A 期，group `vscode-ux-polish-round1`）：
+  - `.ai-workflow/plans/20260929-vscode-ux-polish-round1-phase-1.md`（A1：graph 宽度自适应/分隔条、删双击、右键菜单、HEAD/tag、meta 排版）
+  - `.ai-workflow/plans/20260929-vscode-ux-polish-round1-phase-2.md`（A2：Commit 视图批量操作/文件右键、竹子图标与 marketplace icon）
