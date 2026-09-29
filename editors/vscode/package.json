@@ -99,6 +99,26 @@
         "command": "gitBamboo.graph.checkoutNewBranch",
         "title": "Checkout Commit (New Branch)...",
         "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.openChanges",
+        "title": "Open Changes",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.stageFile",
+        "title": "Stage Changes",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.unstageFile",
+        "title": "Unstage Changes",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.copyPath",
+        "title": "Copy Path",
+        "category": "Git Bamboo"
       }
     ],
     "menus": {
@@ -151,6 +171,22 @@
         {
           "command": "gitBamboo.graph.checkoutNewBranch",
           "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.openChanges",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.stageFile",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.unstageFile",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.copyPath",
+          "when": "false"
         }
       ],
       "webview/context": [
@@ -173,6 +209,51 @@
           "command": "gitBamboo.graph.copyMessage",
           "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
           "group": "9_clipboard@2"
+        },
+        {
+          "command": "gitBamboo.commitView.stageFile",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileChanges",
+          "group": "1_stage"
+        },
+        {
+          "command": "gitBamboo.commitView.stageFile",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileUntracked",
+          "group": "1_stage"
+        },
+        {
+          "command": "gitBamboo.commitView.unstageFile",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileStaged",
+          "group": "1_stage"
+        },
+        {
+          "command": "gitBamboo.commitView.openChanges",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileChanges",
+          "group": "2_open"
+        },
+        {
+          "command": "gitBamboo.commitView.openChanges",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileUntracked",
+          "group": "2_open"
+        },
+        {
+          "command": "gitBamboo.commitView.openChanges",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileStaged",
+          "group": "2_open"
+        },
+        {
+          "command": "gitBamboo.commitView.copyPath",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileChanges",
+          "group": "9_clipboard"
+        },
+        {
+          "command": "gitBamboo.commitView.copyPath",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileUntracked",
+          "group": "9_clipboard"
+        },
+        {
+          "command": "gitBamboo.commitView.copyPath",
+          "when": "webviewId == gitBamboo.commit && webviewSection == fileStaged",
+          "group": "9_clipboard"
         }
       ]
     },

@@ -169,6 +169,36 @@
     .file-row .action-btn:hover {
       background: var(--vscode-toolbar-hoverBackground);
     }
+    /* Section-header bulk action (Stage All / Unstage All): same visual
+       language as the row buttons, right-aligned in the header and revealed
+       on header hover. Clicks must not toggle the section's collapse (the
+       handlers stopPropagation), and an empty section disables the button. */
+    .section-header .action-btn {
+      margin-left: auto;
+      width: 18px;
+      height: 18px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      background: transparent;
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      border-radius: 3px;
+      font-size: 12px;
+      line-height: 1;
+      padding: 0;
+    }
+    .section-header:hover .action-btn {
+      display: flex;
+    }
+    .section-header .action-btn:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+    .section-header .action-btn:not(:disabled):hover {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
     /* Bottom bar */
     #bottom-bar {
       display: flex;
@@ -229,6 +259,7 @@
         <span class="arrow">▾</span>
         <span>Staged</span>
         <span class="count" id="staged-count">0</span>
+        <button id="staged-bulk" class="action-btn" title="Unstage All Changes">−</button>
       </div>
       <div class="section-body" id="staged-body"></div>
     </div>
@@ -237,6 +268,7 @@
         <span class="arrow">▾</span>
         <span>Changes</span>
         <span class="count" id="changes-count">0</span>
+        <button id="changes-bulk" class="action-btn" title="Stage All Changes">+</button>
       </div>
       <div class="section-body" id="changes-body"></div>
     </div>
@@ -245,6 +277,7 @@
         <span class="arrow">▾</span>
         <span>Untracked</span>
         <span class="count" id="untracked-count">0</span>
+        <button id="untracked-bulk" class="action-btn" title="Stage All Untracked Files">+</button>
       </div>
       <div class="section-body" id="untracked-body"></div>
     </div>

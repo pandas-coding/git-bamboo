@@ -7,6 +7,7 @@
  *   outbound: { type: 'stage' | 'unstage', paths }
  *             { type: 'openResource', path, status }
  *             { type: 'commit', message, amend }
+ *             { type: 'contextTarget', file: { path, status, bucket } | null }
  *   inbound:  { type: 'status', items }  — raw engine StatusItem[], bucketed here
  *             { type: 'committed' }      — clear the message box
  */
@@ -51,10 +52,21 @@ const els = {
     changes: document.getElementById('changes-body'),
     untracked: document.getElementById('untracked-body'),
   },
+  bulk: {
+    staged: document.getElementById('staged-bulk'),
+    changes: document.getElementById('changes-bulk'),
+    untracked: document.getElementById('untracked-bulk'),
+  },
+  fileList: document.getElementById('file-list'),
   btnCommit: document.getElementById('btn-commit'),
   btnAmend: document.getElementById('btn-amend'),
   stats: document.getElementById('stats'),
 };
+
+/** Current paths per bucket, maintained by render() — the bulk buttons
+ *  read them so "Stage All" is just the existing single-path stage message
+ *  with every path of the section. */
+const bucketPaths = { staged: [], changes: [], untracked: [] };
 
 function bucketOf(item) {
   if (item.staged) return 'staged';
@@ -87,6 +99,17 @@ function createFileRow(item) {
   const row = document.createElement('div');
   row.className = 'file-row';
   row.dataset.path = item.path;
+  row.dataset.status = item.status;
+  row.dataset.bucket = bucket;
+  // Native webview/context menu targeting: the section decides which menu
+  // entries apply (stage vs unstage). Static JSON, not markup.
+  row.setAttribute(
+    'data-vscode-context',
+    JSON.stringify({
+      webviewSection: 'file' + bucket.charAt(0).toUpperCase() + bucket.slice(1),
+      preventDefaultContextMenuItems: true,
+    }),
+  );
 
   const { filename, dirname } = splitPath(item.path);
 
@@ -158,6 +181,8 @@ function render(items) {
     body.replaceChildren(...list.map(createFileRow));
     els.counts[key].textContent = String(list.length);
     section.style.display = list.length > 0 ? '' : 'none';
+    bucketPaths[key] = list.map((item) => item.path);
+    els.bulk[key].disabled = list.length === 0;
     applyCollapsed(key);
   }
 
@@ -192,6 +217,34 @@ for (const key of BUCKETS) {
     applyCollapsed(key);
   });
 }
+
+// Section-level bulk actions: reuse the stage/unstage message with every
+// path of the bucket (host side needs no changes). stopPropagation keeps
+// the header's collapse toggle out of it, mirroring createButton().
+for (const key of BUCKETS) {
+  els.bulk[key].addEventListener('click', (event) => {
+    event.stopPropagation();
+    const paths = bucketPaths[key];
+    if (paths.length === 0) return;
+    vscode.postMessage({ type: key === 'staged' ? 'unstage' : 'stage', paths: [...paths] });
+  });
+}
+
+// Fires before the native webview/context menu opens: report the
+// right-clicked file so the host can park it for the menu commands
+// (contextmenu -> menu command is the hand-off path; command arguments
+// cannot carry webview data). A null file (any click that misses a row)
+// clears the host's parked target so a stale one can't outlive its row —
+// blank areas carry no data-vscode-context and thus show no menu either.
+els.fileList.addEventListener('contextmenu', (e) => {
+  const rowEl = e.target instanceof Element ? e.target.closest('.file-row') : null;
+  vscode.postMessage({
+    type: 'contextTarget',
+    file: rowEl
+      ? { path: rowEl.dataset.path, status: rowEl.dataset.status, bucket: rowEl.dataset.bucket }
+      : null,
+  });
+});
 
 /** Syncs a section's collapsed state to the DOM (shared by render() and
  *  the header click handler). */

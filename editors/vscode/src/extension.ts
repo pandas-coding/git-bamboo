@@ -153,6 +153,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }));
 
+  // Commit-view file-row context menu (native webview/context menus): the
+  // webview reports the right-clicked file right before the menu opens, and
+  // the provider parks it for whichever menu command the user picks.
+  // Palette entries are hidden (`when: false`) — without a pending target
+  // these commands have nothing to act on.
+  registerCommand(context, 'gitBamboo.commitView.openChanges', async () => {
+    if (!activeCommitView) {
+      noSessionWarning();
+      return;
+    }
+    if (!(await activeCommitView.runContextCommand('openChanges'))) noCommitTargetWarning();
+  });
+  registerCommand(context, 'gitBamboo.commitView.stageFile', async () => {
+    if (!activeCommitView) {
+      noSessionWarning();
+      return;
+    }
+    if (!(await activeCommitView.runContextCommand('stageFile'))) noCommitTargetWarning();
+  });
+  registerCommand(context, 'gitBamboo.commitView.unstageFile', async () => {
+    if (!activeCommitView) {
+      noSessionWarning();
+      return;
+    }
+    if (!(await activeCommitView.runContextCommand('unstageFile'))) noCommitTargetWarning();
+  });
+  registerCommand(context, 'gitBamboo.commitView.copyPath', async () => {
+    const target = activeCommitView?.takeContextTarget();
+    if (!target) {
+      noCommitTargetWarning();
+      return;
+    }
+    await vscode.env.clipboard.writeText(target.path);
+    vscode.window.setStatusBarMessage(`Git Bamboo: copied ${target.path}`, 3000);
+  });
+
   // Palette amend has no input box to source a message from, so it is
   // always the engine's `--amend --no-edit` path (empty message).
   registerCommand(context, 'gitBamboo.commitAmend', async () => {
@@ -312,6 +348,14 @@ function onNotification(
 function noGraphTargetWarning(): void {
   vscode.window.showWarningMessage(
     'Git Bamboo: no commit selected — right-click a commit row in the graph first.',
+  );
+}
+
+/** Commit-view counterpart of noGraphTargetWarning (Copy Path has no
+ *  session guard of its own, so this fires without a repo too). */
+function noCommitTargetWarning(): void {
+  vscode.window.showWarningMessage(
+    'Git Bamboo: no file selected — right-click a file in the Commit view first.',
   );
 }
 
