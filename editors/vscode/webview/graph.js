@@ -162,6 +162,7 @@
     el.appendChild(gap);
     if (!commit) {
       el.classList.remove('head-row');
+      el.removeAttribute('title');
       return; // placeholder skeleton row while data loads
     }
 
@@ -214,6 +215,8 @@
     meta.appendChild(author);
     meta.appendChild(time);
     el.appendChild(meta);
+    // Full author + timestamp on hover (Git Graph convention).
+    el.title = `${commit.author_name} ${formatTime(commit.author_time)}`;
   }
 
   function selectRow(row) {
@@ -226,7 +229,13 @@
 
   function formatTime(unixSeconds) {
     try {
-      return new Date(unixSeconds * 1000).toLocaleDateString();
+      return new Date(unixSeconds * 1000).toLocaleString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
     } catch {
       return '';
     }

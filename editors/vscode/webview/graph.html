@@ -120,9 +120,20 @@
       margin-left: 16px;
       padding-left: 16px;
       color: var(--vscode-descriptionForeground);
+      display: flex;
+      gap: 8px;
     }
+    /* Fixed-shape author + time columns so the time column's right edge
+     * lines up across rows; long authors ellipsize. */
     .row .meta .author {
-      margin-right: 8px;
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 14ch;
+    }
+    .row .meta .time {
+      flex: 0 0 auto;
+      text-align: right;
     }
     .row:hover {
       background: var(--vscode-list-hoverBackground);
