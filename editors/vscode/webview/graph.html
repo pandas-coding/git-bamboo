@@ -83,6 +83,23 @@
       background: var(--vscode-editorWidget-background, transparent);
       box-sizing: border-box;
     }
+    /* HEAD marker: bold pill with an accent border, plus a subtle row edge. */
+    .row .head-pill {
+      flex: 0 0 auto;
+      padding: 0 5px;
+      height: 16px;
+      line-height: 16px;
+      border: 1px solid var(--vscode-focusBorder, #007fd4);
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--vscode-badge-foreground, var(--vscode-foreground));
+      background: var(--vscode-badge-background, transparent);
+      box-sizing: border-box;
+    }
+    .row.head-row {
+      box-shadow: inset 2px 0 0 var(--vscode-focusBorder, #007fd4);
+    }
     .row .meta {
       flex: 0 0 auto;
       margin-left: 16px;

@@ -36,6 +36,8 @@
 
   /** Branch names by commit id (branch tips, from the extension's getRefs). */
   let branchTips = new Map();
+  /** HEAD commit id, for marking the HEAD row (null while unknown). */
+  let headSha = null;
 
   /** Virtual row index -> commit (trimmed to roughly the last 2 viewports). */
   const commits = new Map();
@@ -158,7 +160,10 @@
     const gap = document.createElement('span');
     gap.className = 'graph-gap';
     el.appendChild(gap);
-    if (!commit) return; // placeholder skeleton row while data loads
+    if (!commit) {
+      el.classList.remove('head-row');
+      return; // placeholder skeleton row while data loads
+    }
 
     const message = document.createElement('span');
     message.className = 'message';
@@ -166,15 +171,25 @@
     el.appendChild(message);
 
     const tips = branchTips.get(commit.id);
-    if (tips) {
+    const isHead = commit.id === headSha;
+    el.classList.toggle('head-row', isHead);
+    if (isHead || tips) {
       const tags = document.createElement('span');
       tags.className = 'branch-tags';
-      for (const name of tips) {
-        const tag = document.createElement('span');
-        tag.className = 'branch-tag';
-        tag.style.borderColor = tagColor(name);
-        tag.textContent = name; // textContent-only: ref names are untrusted
-        tags.appendChild(tag);
+      if (isHead) {
+        const headPill = document.createElement('span');
+        headPill.className = 'head-pill';
+        headPill.textContent = 'HEAD';
+        tags.appendChild(headPill);
+      }
+      if (tips) {
+        for (const name of tips) {
+          const tag = document.createElement('span');
+          tag.className = 'branch-tag';
+          tag.style.borderColor = tagColor(name);
+          tag.textContent = name; // textContent-only: ref names are untrusted
+          tags.appendChild(tag);
+        }
       }
       el.appendChild(tags);
     }
@@ -465,6 +480,7 @@
     for (const el of rowEls.values()) {
       el.textContent = '';
       el.dataset.commitId = '';
+      el.classList.remove('head-row');
     }
     applyWidth(); // auto mode: the lane count of the refetched data may differ
     renderRows(); // skeletons
@@ -486,6 +502,11 @@
       invalidate();
     } else if (message.type === 'refs' && Array.isArray(message.refs)) {
       applyRefs(message.refs);
+    } else if (message.type === 'head' && typeof message.sha === 'string') {
+      // Force re-fill of rendered rows so the HEAD marker moves.
+      headSha = message.sha;
+      for (const el of rowEls.values()) el.dataset.commitId = '';
+      renderRows();
     } else if (message.type === 'graphWidth') {
       // Host-persisted width from the initial 'ready' handshake (null = auto).
       manualWidth = typeof message.width === 'number' ? clampWidth(message.width) : null;

@@ -91,9 +91,11 @@ export class GraphSession implements vscode.Disposable {
         this.invalidate(epoch);
       }),
       client.onNotification('refsChanged', () => void this.sendRefs()),
+      client.onNotification('headChanged', () => void this.sendHead()),
       { dispose: onDispose },
     );
     void this.sendRefs();
+    void this.sendHead();
   }
 
   dispose(): void {
@@ -211,6 +213,17 @@ export class GraphSession implements vscode.Disposable {
       await this.webview.postMessage({ type: 'refs', refs });
     } catch (err) {
       console.error('[git-bamboo] refs fetch for graph failed:', err);
+    }
+  }
+
+  /** Pushes the current HEAD so the webview can mark the HEAD row. */
+  private async sendHead(): Promise<void> {
+    if (this.disposed) return;
+    try {
+      const { head, branch } = await this.client.getHead();
+      await this.webview.postMessage({ type: 'head', sha: head, branch });
+    } catch (err) {
+      console.error('[git-bamboo] getHead for graph failed:', err);
     }
   }
 }
