@@ -34,7 +34,7 @@
   const splitter = document.getElementById('splitter');
   const ctx = canvas.getContext('2d');
 
-  /** Branch names by commit id (branch tips, from the extension's getRefs). */
+  /** Refs by commit id (branch/tag/remote tips, from getRefs). */
   let branchTips = new Map();
   /** HEAD commit id, for marking the HEAD row (null while unknown). */
   let headSha = null;
@@ -183,12 +183,21 @@
         tags.appendChild(headPill);
       }
       if (tips) {
-        for (const name of tips) {
-          const tag = document.createElement('span');
-          tag.className = 'branch-tag';
-          tag.style.borderColor = tagColor(name);
-          tag.textContent = name; // textContent-only: ref names are untrusted
-          tags.appendChild(tag);
+        // Render order: local branches, tags, then remote-tracking branches.
+        const ordered = [...tips].sort((a, b) => REF_ORDER[a.kind] - REF_ORDER[b.kind]);
+        for (const ref of ordered) {
+          const pill = document.createElement('span');
+          pill.className =
+            ref.kind === 'tag'
+              ? 'branch-tag tag-pill'
+              : ref.kind === 'remote_branch'
+                ? 'branch-tag remote-pill'
+                : 'branch-tag';
+          if (ref.kind !== 'remote_branch') pill.style.borderColor = tagColor(ref.name);
+          if (ref.kind === 'tag') pill.appendChild(tagIcon());
+          // Text node, not innerHTML: ref names are untrusted.
+          pill.appendChild(document.createTextNode(ref.name));
+          tags.appendChild(pill);
         }
       }
       el.appendChild(tags);
@@ -223,13 +232,32 @@
     }
   }
 
-  /** Stable color per branch name (same palette as the lanes). */
+  /** Stable color per ref name (same palette as the lanes). */
   function tagColor(name) {
     let hash = 0;
     for (let i = 0; i < name.length; i++) {
       hash = (hash * 31 + name.charCodeAt(i)) | 0;
     }
     return LANE_COLORS[Math.abs(hash) % LANE_COLORS.length];
+  }
+
+  /** Pill render order by ref kind (branch → tag → remote). */
+  const REF_ORDER = { branch: 0, tag: 1, remote_branch: 2 };
+
+  /** Inline DOM SVG tag icon (CSP allows inline SVG; no markup injection). */
+  function tagIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('class', 'tag-icon');
+    svg.setAttribute('aria-hidden', 'true');
+    const shape = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    shape.setAttribute('fill-rule', 'evenodd');
+    shape.setAttribute(
+      'd',
+      'M1 1h6.6l7.4 7.4-6.6 6.6L1 7.6V1zm4 2.8a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z',
+    );
+    svg.appendChild(shape);
+    return svg;
   }
 
   // ------------------------------------------------------- lane-area width
@@ -514,14 +542,15 @@
     }
   });
 
-  /** Index branch tips by target commit id and re-render visible rows. */
+  /** Index ref tips (branch/tag/remote) by target commit id and re-render. */
   function applyRefs(refs) {
     branchTips = new Map();
     for (const ref of refs) {
-      if (!ref || ref.kind !== 'branch' || typeof ref.name !== 'string' || !ref.target) continue;
+      if (!ref || typeof ref.name !== 'string' || !ref.target) continue;
+      if (!(ref.kind in REF_ORDER)) continue; // branch | tag | remote_branch
       const list = branchTips.get(ref.target);
-      if (list) list.push(ref.name);
-      else branchTips.set(ref.target, [ref.name]);
+      if (list) list.push({ name: ref.name, kind: ref.kind });
+      else branchTips.set(ref.target, [{ name: ref.name, kind: ref.kind }]);
     }
     // Force re-fill of already-rendered rows so tags appear without a scroll.
     for (const el of rowEls.values()) el.dataset.commitId = '';

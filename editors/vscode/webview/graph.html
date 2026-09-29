@@ -82,6 +82,21 @@
       color: var(--vscode-descriptionForeground);
       background: var(--vscode-editorWidget-background, transparent);
       box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+    }
+    /* Tag pill: tag icon + colored border (set from JS per name). */
+    .row .branch-tag .tag-icon {
+      width: 11px;
+      height: 11px;
+      fill: currentColor;
+      flex: 0 0 auto;
+    }
+    /* Remote-tracking branch pill: italic, visually de-emphasized. */
+    .row .branch-tag.remote-pill {
+      font-style: italic;
+      border-color: var(--vscode-descriptionForeground);
     }
     /* HEAD marker: bold pill with an accent border, plus a subtle row edge. */
     .row .head-pill {
