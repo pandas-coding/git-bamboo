@@ -55,7 +55,7 @@ function attachSession(
 ): void {
   panel.webview.html = buildWebviewHtml(context.extensionUri, panel.webview, 'graph.html');
   activePanel = panel;
-  const session = new GraphSession(client, state, panel.webview, () => {
+  const session = new GraphSession(client, state, panel.webview, 'panel', context, () => {
     if (activePanel === panel) activePanel = undefined;
   });
   panel.onDidDispose(() => session.dispose());

@@ -31,6 +31,7 @@
   const spacer = document.getElementById('spacer');
   const rowsEl = document.getElementById('rows');
   const canvas = document.getElementById('overlay');
+  const splitter = document.getElementById('splitter');
   const ctx = canvas.getContext('2d');
 
   /** Branch names by commit id (branch tips, from the extension's getRefs). */
@@ -208,6 +209,108 @@
     needsRedraw = true; // canvas re-reads clientWidth on the next draw
   }
 
+  /** Upper clamp for manual widths: keep at least ~40% for the messages. */
+  function maxWidth() {
+    return Math.max(GRAPH_MIN_WIDTH, Math.floor(scroller.clientWidth * 0.6));
+  }
+
+  function clampWidth(width) {
+    return Math.min(maxWidth(), Math.max(GRAPH_MIN_WIDTH, Math.round(width)));
+  }
+
+  // ------------------------------------------------------------- splitter drag
+
+  const KEYBOARD_STEP = 8;
+  const KEYBOARD_STEP_LARGE = 32; // Shift+arrow
+
+  let dragging = false;
+
+  splitter.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    // No text selection and no synthesized dblclick during the drag.
+    e.preventDefault();
+    try {
+      splitter.setPointerCapture(e.pointerId);
+    } catch {
+      // The pointer vanished before capture (NotFoundError): abort the drag
+      // instead of leaving the splitter stuck in the dragging state.
+      return;
+    }
+    dragging = true;
+    splitter.classList.add('dragging');
+  });
+
+  splitter.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    manualWidth = clampWidth(e.clientX);
+    applyWidth();
+  });
+
+  /** Ends the drag and persists the final width (only here — persisting on
+   *  every pointermove would hammer globalState with a write storm). */
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove('dragging');
+    if (manualWidth !== null) {
+      vscode.postMessage({ type: 'graphWidthChanged', width: manualWidth });
+    }
+  }
+
+  splitter.addEventListener('pointerup', endDrag);
+  splitter.addEventListener('lostpointercapture', endDrag);
+
+  // The splitter sits outside #scroller (it must overlay the rows), so wheel
+  // events over it would not reach the scroller — forward them manually.
+  splitter.addEventListener(
+    'wheel',
+    (e) => {
+      scroller.scrollTop += e.deltaY;
+      e.preventDefault();
+    },
+    { passive: false },
+  );
+
+  splitter.addEventListener('dblclick', resetToAutoWidth);
+
+  splitter.addEventListener('keydown', (e) => {
+    const step = e.shiftKey ? KEYBOARD_STEP_LARGE : KEYBOARD_STEP;
+    let handled = true;
+    switch (e.key) {
+      case 'ArrowLeft':
+        setManualWidth((manualWidth ?? graphWidth) - step);
+        break;
+      case 'ArrowRight':
+        setManualWidth((manualWidth ?? graphWidth) + step);
+        break;
+      case 'Home':
+        setManualWidth(GRAPH_MIN_WIDTH);
+        break;
+      case 'End':
+        setManualWidth(maxWidth());
+        break;
+      case 'Enter':
+        resetToAutoWidth();
+        break;
+      default:
+        handled = false;
+    }
+    if (handled) e.preventDefault();
+  });
+
+  function setManualWidth(width) {
+    manualWidth = clampWidth(width);
+    applyWidth();
+    vscode.postMessage({ type: 'graphWidthChanged', width: manualWidth });
+  }
+
+  /** Drops the manual override and returns to lane-count-based auto width. */
+  function resetToAutoWidth() {
+    manualWidth = null;
+    applyWidth();
+    vscode.postMessage({ type: 'graphWidthChanged', width: null });
+  }
+
   // ------------------------------------------------------------------- canvas
 
   function laneX(lane) {
@@ -354,6 +457,10 @@
       invalidate();
     } else if (message.type === 'refs' && Array.isArray(message.refs)) {
       applyRefs(message.refs);
+    } else if (message.type === 'graphWidth') {
+      // Host-persisted width from the initial 'ready' handshake (null = auto).
+      manualWidth = typeof message.width === 'number' ? clampWidth(message.width) : null;
+      applyWidth();
     }
   });
 
@@ -371,8 +478,10 @@
     renderRows();
   }
 
-  // Initial load.
+  // Initial load. The 'ready' message triggers the host to send back the
+  // persisted graph width (see the 'graphWidth' handler above).
   renderRows();
   applyWidth();
   requestViewport();
+  vscode.postMessage({ type: 'ready' });
 })();

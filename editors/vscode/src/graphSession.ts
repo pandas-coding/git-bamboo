@@ -22,6 +22,17 @@ interface GraphViewMessage {
   offset?: number;
   limit?: number;
   anchorCommit?: string | null;
+  /** graphWidthChanged payload: the new manual width, or null to clear the
+   *  override and return to auto width. */
+  width?: number | null;
+}
+
+/** Which webview host owns a graph session — widths are persisted per host. */
+export type GraphHost = 'sidebar' | 'panel';
+
+/** globalState key for the manual lane-area width of a given host. */
+function widthKey(host: GraphHost): string {
+  return `gitBamboo.graphWidth.${host}`;
 }
 
 export class GraphSession implements vscode.Disposable {
@@ -37,6 +48,10 @@ export class GraphSession implements vscode.Disposable {
     private readonly client: EngineClient,
     private readonly state: RepoState,
     private readonly webview: vscode.Webview,
+    /** Which host this session serves — width persistence is per-host. */
+    private readonly host: GraphHost,
+    /** Used for globalState-backed width persistence. */
+    private readonly context: vscode.ExtensionContext,
     /** Fired by the host when its view/panel goes away (unbind + cleanup). */
     onDispose: () => void,
   ) {
@@ -99,6 +114,15 @@ export class GraphSession implements vscode.Disposable {
       const anchor = message.anchorCommit ?? null;
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
       this.debounceTimer = setTimeout(() => void this.requestGraph(offset, limit, anchor), VIEWPORT_DEBOUNCE_MS);
+    } else if (message?.type === 'ready') {
+      // Webview finished initializing: hand it the persisted width. By the
+      // time the webview can send this, the message channel is up.
+      const width = this.context.globalState.get<number | null>(widthKey(this.host), null);
+      void this.webview.postMessage({ type: 'graphWidth', width });
+    } else if (message?.type === 'graphWidthChanged') {
+      // null clears the override (back to auto width); update() with
+      // undefined removes the key from globalState.
+      void this.context.globalState.update(widthKey(this.host), message.width ?? undefined);
     }
   }
 

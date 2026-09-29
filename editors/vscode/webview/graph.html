@@ -99,6 +99,35 @@
       background: var(--vscode-list-activeSelectionBackground);
       color: var(--vscode-list-activeSelectionForeground);
     }
+    /* Drag handle at the lane-area / message-column boundary. The visible
+     * bar is 4px; the hit area is 10px (centered on the boundary) so it is
+     * easy to grab. Position/width track the --graph-width variable. */
+    #splitter {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: var(--graph-width, 240px);
+      width: 10px;
+      transform: translateX(-5px);
+      cursor: col-resize;
+      z-index: 10;
+      background: transparent;
+      outline: none;
+    }
+    #splitter::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 3px;
+      width: 4px;
+      background: transparent;
+    }
+    #splitter:hover::after,
+    #splitter:focus-visible::after,
+    #splitter.dragging::after {
+      background: var(--vscode-focusBorder, #007fd4);
+    }
     /* Canvas overlay sits above the rows (branch curves), never intercepts input. */
     #overlay {
       position: absolute;
@@ -117,6 +146,7 @@
       <div id="rows"></div>
     </div>
     <canvas id="overlay"></canvas>
+    <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Commit graph lane area width" tabindex="0"></div>
   </div>
   <script type="module" src="./graph.js"></script>
 </body>
