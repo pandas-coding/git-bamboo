@@ -118,4 +118,10 @@ F5 复验通过（2026-09-30）：右键菜单按桶显隐（regex when）、键
 - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 - .ai-workflow/plans/20260929-vscode-ux-polish-round1-phase-1.md（同组 Phase 1）
 - .ai-workflow/plans/20260927-independent-panel-ui.md（前置）
+- 实施回顾（2026-09-30）：
+  - .ai-workflow/learnings/20260930-second-consumer-triggers-shared-extraction.md
+  - .ai-workflow/learnings/20260930-hover-reveal-buttons-need-opacity-not-display-none.md
+  - .ai-workflow/learnings/20260930-codicon-style-inline-svg-webview-icons.md
+  - .ai-workflow/learnings/20260930-validate-context-targets-at-consumption.md
+  - .ai-workflow/learnings/20260930-webview-context-menu-regex-when-clauses.md
 - （B 期待建：引擎写操作 RPC（含 discard/reset/checkout）+ commit 详情视图计划）

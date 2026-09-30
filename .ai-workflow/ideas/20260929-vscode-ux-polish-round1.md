@@ -51,3 +51,9 @@ tags: [git, vscode-extension, ui]
   - `.ai-workflow/learnings/20260930-empty-string-refill-sentinel-collides-with-skeleton.md`
   - `.ai-workflow/learnings/20260930-webview-host-two-way-trust-boundary.md`
   - `.ai-workflow/learnings/20260930-precise-line-number-research-zero-rework.md`
+- 实施回顾（A2，2026-09-30）：
+  - `.ai-workflow/learnings/20260930-second-consumer-triggers-shared-extraction.md`
+  - `.ai-workflow/learnings/20260930-hover-reveal-buttons-need-opacity-not-display-none.md`
+  - `.ai-workflow/learnings/20260930-codicon-style-inline-svg-webview-icons.md`
+  - `.ai-workflow/learnings/20260930-validate-context-targets-at-consumption.md`
+  - `.ai-workflow/learnings/20260930-webview-context-menu-regex-when-clauses.md`
