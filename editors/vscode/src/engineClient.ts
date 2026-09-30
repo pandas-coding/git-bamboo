@@ -152,6 +152,15 @@ export class EngineClient {
     return Array.isArray(result) ? (result as Ref[]) : [];
   }
 
+  /**
+   * Engine RPC `discard`: restore tracked paths from the index and delete
+   * untracked-only paths. Irreversible by design — callers must show the
+   * IRREVERSIBLE confirmation dialog before invoking this.
+   */
+  discard(paths: string[]): Promise<void> {
+    return this.request<void>('discard', { paths });
+  }
+
   /** Graceful shutdown request (best-effort, 2s cap), then kill the child. */
   async dispose(): Promise<void> {
     // Guard against double-dispose (deactivate + context disposal).

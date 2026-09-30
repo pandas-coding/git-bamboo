@@ -2,12 +2,14 @@
  * Webview view provider for the Commit view (view id: gitBamboo.commit):
  * commit message + staged/changes/untracked file list + commit/amend in a
  * single JetBrains-style panel. Serves the built bundle (out/webview/
- * commit.html) and relays stage/unstage/commit/openResource messages to
- * the engine; right-clicked file rows park a context target consumed by
+ * commit.html) and relays stage/unstage/discard/commit/openResource
+ * messages to the engine; right-clicked file rows park a context target
+ * consumed by
  * the webview/context menu commands. Status pushes are debounced (50ms)
  * and coalesce concurrent refreshes, mirroring the old scmProvider's
  * refresh pattern.
  */
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
 import { createContextTargetSlot } from './contextTargetSlot';
@@ -131,6 +133,12 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       case 'unstage':
         void this.changePaths(message.type, Array.isArray(message.paths) ? message.paths : []);
         break;
+      case 'discard':
+        void this.discardPaths(
+          Array.isArray(message.paths) ? message.paths : [],
+          typeof message.path === 'string' ? message.path : '',
+        );
+        break;
       case 'openResource':
         if (typeof message.path === 'string') {
           void this.openResource(message.path, message.status ?? '');
@@ -195,6 +203,46 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     }
   }
 
+  /** Discards worktree changes for `paths` after the irreversible
+   *  confirmation dialog (VS Code/GitLens convention: modal + IRREVERSIBLE
+   *  detail). `labelPath` names the file in the single-file message. The
+   *  engine re-classifies the paths at execution time, so a stale view
+   *  snapshot can never drive a wrong discard. */
+  private async discardPaths(paths: string[], labelPath: string): Promise<void> {
+    // Same trust boundary as changePaths: only repo-relative paths are
+    // forwarded to the engine write RPC.
+    const safePaths = paths.filter((p) => isValidRepoPath(p));
+    if (safePaths.length === 0) return;
+    if (!(await this.confirmDiscard(safePaths.length, labelPath))) return;
+    try {
+      await this.client.discard(safePaths);
+      await this.doRefresh();
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Bamboo: discard failed — ${errorMessage(err)}`);
+    }
+  }
+
+  /** Modal confirmation for the destructive discard flow. Returns true only
+   *  when the explicit destructive button was picked (modal dialogs treat
+   *  ESC/close as cancel). */
+  private async confirmDiscard(count: number, labelPath: string): Promise<boolean> {
+    const message =
+      count === 1
+        ? `Are you sure you want to discard changes in '${path.posix.basename(labelPath)}'?`
+        : `Are you sure you want to discard changes in ${count} files?`;
+    const action =
+      count === 1 ? 'Discard Changes' : `Discard All ${count} Files`;
+    const confirmed = await vscode.window.showWarningMessage(
+      message,
+      {
+        modal: true,
+        detail: 'This is IRREVERSIBLE! Your current working set will be FOREVER LOST.',
+      },
+      action,
+    );
+    return confirmed === action;
+  }
+
   private async openResource(relativePath: string, status: string): Promise<void> {
     try {
       await openResource(this.root, relativePath, status);
@@ -219,19 +267,40 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
    *  when no current target is parked (safety net for programmatic
    *  invocation of the palette-hidden commands). Stage/unstage go through
    *  changePaths (path validation + refresh); open delegates to the shared
-   *  openResource helper. */
-  async runContextCommand(action: 'openChanges' | 'stageFile' | 'unstageFile'): Promise<boolean> {
+   *  openResource helper; discard goes through the confirmation flow. */
+  async runContextCommand(
+    action: 'openChanges' | 'stageFile' | 'unstageFile' | 'discardFile',
+  ): Promise<boolean> {
     const target = this.takeContextTarget();
     if (!target) return false;
     // Bucket cross-check, mirroring the menus' when clauses: stageFile only
     //  for unstaged buckets, unstageFile only for staged.
     if (action === 'stageFile' && target.bucket === 'staged') return false;
     if (action === 'unstageFile' && target.bucket !== 'staged') return false;
+    // Discard restores the worktree from the index, which for a staged file
+    //  would silently rewrite it to its pre-stage content — the staged
+    //  bucket deliberately offers no discard (mirrors the menu when clause).
+    if (action === 'discardFile' && target.bucket === 'staged') return false;
     if (action === 'openChanges') {
       await this.openResource(target.path, target.status);
+    } else if (action === 'discardFile') {
+      await this.discardPaths([target.path], target.path);
     } else {
       await this.changePaths(action === 'stageFile' ? 'stage' : 'unstage', [target.path]);
     }
+    return true;
+  }
+
+  /** View-title "Discard All" for one bucket: every path currently listed
+   *  in that bucket, one IRREVERSIBLE confirmation, one engine discard RPC.
+   *  Returns false when the bucket is empty (nothing to discard). The
+   *  staged bucket is deliberately not supported (see runContextCommand). */
+  async discardBucket(bucket: 'changes' | 'untracked'): Promise<boolean> {
+    const paths = this.lastItems
+      .filter((item) => bucketOf(item) === bucket)
+      .map((item) => item.path);
+    if (paths.length === 0) return false;
+    await this.discardPaths(paths, '');
     return true;
   }
 

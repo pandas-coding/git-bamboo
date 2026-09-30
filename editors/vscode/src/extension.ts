@@ -83,6 +83,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerCommand(context, 'gitBamboo.refreshChanges', () =>
     activeCommitView ? activeCommitView.refresh() : noSessionWarning());
 
+  // View title "Discard All {bucket}" — acts on the Commit view's current
+  // status items; the IRREVERSIBLE modal confirmation lives in the provider.
+  const discardAll = (bucket: 'changes' | 'untracked', label: string) => async () => {
+    if (!activeCommitView) {
+      noSessionWarning();
+      return;
+    }
+    if (!(await activeCommitView.discardBucket(bucket))) {
+      vscode.window.showInformationMessage(`Git Bamboo: no ${label} to discard`);
+    }
+  };
+  registerCommand(
+    context,
+    'gitBamboo.commitView.discardAllChanges',
+    discardAll('changes', 'changes'),
+  );
+  registerCommand(
+    context,
+    'gitBamboo.commitView.discardAllUntracked',
+    discardAll('untracked', 'untracked files'),
+  );
+
   // Commit-row context menu (native webview/context menus): the webview
   // reports the right-clicked commit right before the menu opens, and
   // takeGraphContextTarget() hands it (plus its engine client) to whichever
@@ -172,6 +194,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!(await activeCommitView.runContextCommand(action))) noCommitTargetWarning();
     });
   }
+  // Discard is registered separately from the loop above: its handler leads
+  // into the IRREVERSIBLE confirmation flow before any write reaches the
+  // engine. Same safety nets as the loop actions.
+  registerCommand(context, 'gitBamboo.commitView.discardFile', async () => {
+    if (!activeCommitView) {
+      noSessionWarning();
+      return;
+    }
+    if (!(await activeCommitView.runContextCommand('discardFile'))) noCommitTargetWarning();
+  });
   registerCommand(context, 'gitBamboo.commitView.copyPath', async () => {
     if (!activeCommitView) {
       noSessionWarning();

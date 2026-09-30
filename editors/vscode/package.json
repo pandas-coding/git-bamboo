@@ -120,12 +120,39 @@
         "command": "gitBamboo.commitView.copyPath",
         "title": "Copy Path",
         "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.discardFile",
+        "title": "Discard Changes",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.discardAllChanges",
+        "title": "Discard All Changes",
+        "category": "Git Bamboo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "gitBamboo.commitView.discardAllUntracked",
+        "title": "Discard All Untracked Files",
+        "category": "Git Bamboo",
+        "icon": "$(discard)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "gitBamboo.refreshChanges",
+          "when": "view == gitBamboo.commit",
+          "group": "navigation"
+        },
+        {
+          "command": "gitBamboo.commitView.discardAllChanges",
+          "when": "view == gitBamboo.commit",
+          "group": "navigation"
+        },
+        {
+          "command": "gitBamboo.commitView.discardAllUntracked",
           "when": "view == gitBamboo.commit",
           "group": "navigation"
         },
@@ -188,6 +215,10 @@
         {
           "command": "gitBamboo.commitView.copyPath",
           "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.discardFile",
+          "when": "false"
         }
       ],
       "webview/context": [
@@ -225,6 +256,11 @@
           "command": "gitBamboo.commitView.openChanges",
           "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked)$/",
           "group": "2_open"
+        },
+        {
+          "command": "gitBamboo.commitView.discardFile",
+          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(changes|untracked)$/",
+          "group": "3_discard"
         },
         {
           "command": "gitBamboo.commitView.copyPath",
