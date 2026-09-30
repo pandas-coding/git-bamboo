@@ -90,12 +90,10 @@ independent-panel-ui 落地后的反馈与用户决策（2026-09-29）：A 期�
 - [x] `tsc --noEmit` 零错误；`npm run compile` 成功 ✅（静态可验）
 - [x] `package.json` 顶层 `"icon": "media/icon.png"` 存在，PNG 为 128×128 ✅（静态可验，vsix 打包含图标）
 - [x] `viewsContainers` 图标指向 `media/bamboo.svg`（24×24 单色规范）✅（静态可验，单色已程序化验证）
-- [ ] 三节 Stage All / Unstage All 可用、空节禁用、不误触折叠 ◐（需 F5 冒烟）
-- [ ] 文件行右键菜单按桶显隐正确，Open/Stage/Unstage/Copy Path 全可用 ◐（需 F5 冒烟）
-- [ ] 活动栏竹子图标在深浅主题下正确显示且与内置 git 区分 ◐（需 F5 冒烟）
-- [ ] 既有单文件 stage/unstage/commit/amend/diff 流程无回归 ◐（需 F5 冒烟）
-
-（◐ = 需 VS Code F5 冒烟，agent 环境无 GUI。）
+- [x] 三节 Stage All / Unstage All 可用、空节禁用、不误触折叠 ✅（F5 冒烟通过，2026-09-30）
+- [x] 文件行右键菜单按桶显隐正确，Open/Stage/Unstage/Copy Path 全可用 ✅（F5 冒烟通过）
+- [x] 活动栏竹子图标在深浅主题下正确显示且与内置 git 区分 ✅（F5 冒烟通过）
+- [x] 既有单文件 stage/unstage/commit/amend/diff 流程无回归 ✅（F5 冒烟通过）
 
 ## Dependencies
 
