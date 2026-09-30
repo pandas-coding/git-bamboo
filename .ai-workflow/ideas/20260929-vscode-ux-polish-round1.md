@@ -57,3 +57,7 @@ tags: [git, vscode-extension, ui]
   - `.ai-workflow/learnings/20260930-codicon-style-inline-svg-webview-icons.md`
   - `.ai-workflow/learnings/20260930-validate-context-targets-at-consumption.md`
   - `.ai-workflow/learnings/20260930-webview-context-menu-regex-when-clauses.md`
+- B 期计划（2026-09-30，用户已确认分期与 discard 方案 A）:
+  - `.ai-workflow/plans/20260930-vscode-ux-polish-round1-phase-3.md`（B1：引擎 discard RPC + IRREVERSIBLE modal 确认流）
+  - `.ai-workflow/plans/20260930-vscode-ux-polish-round1-phase-4.md`（B2：commit 详情与 diff 视图，与 B1 无依赖可并行）
+  - B3 待建：detached checkout / reset / cherry-pick / revert 写 RPC + 确认流（含可能的 ODB 撤销增强，作为独立计划再立项）
