@@ -1,7 +1,7 @@
 ---
 title: UX Polish Round 1 — Phase 2（A2）：Commit 视图批量操作与竹子主题品牌图标
 date: 2026-09-29
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 group: vscode-ux-polish-round1
@@ -87,13 +87,13 @@ independent-panel-ui 落地后的反馈与用户决策（2026-09-29）：A 期�
 
 ## Acceptance Criteria
 
-- [ ] `tsc --noEmit` 零错误；`npm run compile` 成功 ✅
-- [ ] `package.json` 顶层 `"icon": "media/icon.png"` 存在，PNG 为 128×128 ✅（静态可验）
-- [ ] `viewsContainers` 图标指向 `media/bamboo.svg`（24×24 单色规范）✅（静态可验）
-- [ ] 三节 Stage All / Unstage All 可用、空节禁用、不误触折叠 ◐
-- [ ] 文件行右键菜单按桶显隐正确，Open/Stage/Unstage/Copy Path 全可用 ◐
-- [ ] 活动栏竹子图标在深浅主题下正确显示且与内置 git 区分 ◐
-- [ ] 既有单文件 stage/unstage/commit/amend/diff 流程无回归 ◐
+- [x] `tsc --noEmit` 零错误；`npm run compile` 成功 ✅（静态可验）
+- [x] `package.json` 顶层 `"icon": "media/icon.png"` 存在，PNG 为 128×128 ✅（静态可验，vsix 打包含图标）
+- [x] `viewsContainers` 图标指向 `media/bamboo.svg`（24×24 单色规范）✅（静态可验，单色已程序化验证）
+- [ ] 三节 Stage All / Unstage All 可用、空节禁用、不误触折叠 ◐（需 F5 冒烟）
+- [ ] 文件行右键菜单按桶显隐正确，Open/Stage/Unstage/Copy Path 全可用 ◐（需 F5 冒烟）
+- [ ] 活动栏竹子图标在深浅主题下正确显示且与内置 git 区分 ◐（需 F5 冒烟）
+- [ ] 既有单文件 stage/unstage/commit/amend/diff 流程无回归 ◐（需 F5 冒烟）
 
 （◐ = 需 VS Code F5 冒烟，agent 环境无 GUI。）
 
