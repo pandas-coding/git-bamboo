@@ -164,6 +164,11 @@ pub struct Unstage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Discard {
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitMsg {
     pub message: String,
     #[serde(default)]

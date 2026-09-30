@@ -12,6 +12,11 @@ use crate::undo::{UndoError, UndoOutcome, UndoSummary, UndoErrorKind};
 pub enum WriteCommand {
     Stage(Vec<String>),
     Unstage(Vec<String>),
+    /// Discard worktree changes: tracked paths are restored from the index
+    /// (`git checkout --`), untracked-only paths are deleted (`git clean -f`).
+    /// Deliberately IRREVERSIBLE (user-confirmed upstream); does not create
+    /// an undo transaction (see `run_write`).
+    Discard { paths: Vec<String> },
     Commit { message: String, amend: bool },
     CreateBranch { name: String, base: Option<String> },
     DeleteBranch { name: String, force: bool },
@@ -32,6 +37,7 @@ impl WriteCommand {
         match self {
             WriteCommand::Stage(paths) => format!("Stage({} paths)", paths.len()),
             WriteCommand::Unstage(paths) => format!("Unstage({} paths)", paths.len()),
+            WriteCommand::Discard { .. } => "Discard changes".to_string(),
             WriteCommand::Commit { amend, .. } => {
                 if *amend {
                     "Commit(amend)".to_string()
@@ -198,6 +204,22 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
     let epoch = session.current_epoch();
     let desc = cmd.op_summary();
 
+    if matches!(cmd, WriteCommand::Discard { .. }) {
+        // Discard bypasses the undo journal entirely: it only touches
+        // worktree file contents, which the undo snapshot does not capture
+        // (it compares HEAD/refs/index, see undo.rs `Snapshot`), so it can
+        // neither be undone nor block a pre-existing transaction's undo.
+        // It still runs serialized on this queue, bumps the epoch on
+        // success, and is audit-logged — only the tx begin/commit is
+        // skipped. This is the architectural landing point of "option A"
+        // (irreversible discard, confirmed upstream).
+        let result = execute_command(session, cmd).await;
+        return match result {
+            Ok(output) => (WriteResult::Ok(output), 0),
+            Err(e) => (WriteResult::Err(format!("{e}")), 0),
+        };
+    }
+
     // Allocate the undo transaction (pre-write snapshot).
     let tx_id = match session.undo.begin(&desc, epoch) {
         Ok(id) => id,
@@ -256,6 +278,12 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
     // SwitchBranch is a multi-step flow (auto-stash), handled separately.
     if let WriteCommand::SwitchBranch { name, auto_stash } = cmd {
         return switch_branch(session, name, *auto_stash).await;
+    }
+
+    // Discard is a multi-step flow (fresh classification → checkout/clean),
+    // handled separately.
+    if let WriteCommand::Discard { paths } = cmd {
+        return discard_changes(session, paths).await;
     }
 
     let repo_path = &session.repo_path;
@@ -319,6 +347,9 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         WriteCommand::SwitchBranch { .. } => {
             unreachable!("switchBranch is handled by switch_branch")
         }
+        WriteCommand::Discard { .. } => {
+            unreachable!("discard is handled by discard_changes")
+        }
         WriteCommand::Fetch { remote } => {
             let mut c = Command::new("git");
             c.arg("fetch").current_dir(repo_path);
@@ -370,6 +401,136 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         anyhow::bail!("git command failed: {stderr}");
     }
 
+    Ok(format!("{stdout}{stderr}").trim().to_string())
+}
+
+/// Discard worktree changes for the given paths: tracked paths are
+/// restored from the index (staged content survives), untracked-only
+/// paths are deleted. Classification happens fresh at execution time so a
+/// stale UI snapshot can never drive the wrong git subcommand — this is
+/// stronger than re-reading status host-side.
+async fn discard_changes(session: &Session, paths: &[String]) -> anyhow::Result<String> {
+    for p in paths {
+        validate_path_arg(p)?;
+    }
+
+    let (tracked, untracked) = classify_discard_paths(session, paths).await?;
+
+    if !tracked.is_empty() {
+        run_git_paths(&session.repo_path, &["checkout"], &tracked).await?;
+    }
+    if !untracked.is_empty() {
+        run_git_paths(&session.repo_path, &["clean", "-f"], &untracked).await?;
+    }
+
+    Ok(format!(
+        "discarded {} tracked and {} untracked path(s)",
+        tracked.len(),
+        untracked.len()
+    ))
+}
+
+/// Classify `paths` for discard using `git status --porcelain -z`.
+/// Returns (tracked, untracked) lists; paths with no reported change are
+/// dropped from both (nothing to discard). Unmerged (conflict) states are
+/// rejected — restoring one side blindly would destroy the other side's
+/// changes, which B1 does not attempt.
+async fn classify_discard_paths(
+    session: &Session,
+    paths: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut c = Command::new("git");
+    c.arg("status")
+        .arg("--porcelain")
+        .arg("-z")
+        .arg("--")
+        .args(paths)
+        .current_dir(&session.repo_path);
+    let result = c
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !result.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+    }
+
+    // -z records are NUL-terminated and unquoted; a rename/copy entry
+    // carries the original path as an extra trailing field that must be
+    // consumed, never parsed as an entry itself.
+    let out = String::from_utf8_lossy(&result.stdout);
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut fields = out.split('\0');
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        if field.len() < 3 {
+            continue;
+        }
+        let xy = &field[..2];
+        let path = field[3..].to_string();
+        entries.push((xy.to_string(), path));
+        if xy.starts_with('R') || xy.starts_with('C') {
+            // Consume the rename/copy source path field.
+            let _ = fields.next();
+        }
+    }
+
+    // Unmerged index states (both sides diverge); `AA`/`DD` also only
+    // arise from unmerged index entries.
+    const CONFLICT_CODES: [&str; 7] = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
+    if let Some((_, path)) = entries
+        .iter()
+        .find(|(xy, _)| CONFLICT_CODES.contains(&xy.as_str()))
+    {
+        anyhow::bail!(
+            "cannot discard {path:?}: the file has merge conflicts \
+             (resolve them first; discarding conflicted files is not supported)"
+        );
+    }
+
+    let mut tracked = Vec::new();
+    let mut untracked = Vec::new();
+    for p in paths {
+        match entries.iter().find(|(_, path)| path == p) {
+            // "??" = untracked (worktree only, not in the index).
+            Some((xy, _)) if xy == "??" => untracked.push(p.clone()),
+            // Any other status line (modified, deleted, added, staged,
+            // renamed, ...) means the path is tracked: `checkout --`
+            // restores the worktree copy from the index.
+            Some((_, _)) => tracked.push(p.clone()),
+            // Not reported by status → nothing to discard for this path.
+            None => {}
+        }
+    }
+
+    Ok((tracked, untracked))
+}
+
+/// Run one git subcommand with a `--`-separated path list. Mirrors the
+/// argument hygiene of the single-command arms (paths can never be read
+/// as flags).
+async fn run_git_paths(
+    repo_path: &std::path::Path,
+    args: &[&str],
+    paths: &[String],
+) -> anyhow::Result<String> {
+    let mut c = Command::new("git");
+    c.args(args).arg("--").args(paths).current_dir(repo_path);
+    let result = c
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    if !result.status.success() {
+        anyhow::bail!("git {:?} failed: {}", args, stderr.trim());
+    }
     Ok(format!("{stdout}{stderr}").trim().to_string())
 }
 

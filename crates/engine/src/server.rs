@@ -8,10 +8,10 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
-    Capabilities, CommitMsg, CreateBranch, DeleteBranch, Fetch, GetBlob, GetGraph, GetHeadResult,
-    GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
-    OutputResult, Pull, Push, RefsChanged, Stage, StatusItem, SwitchBranch, Unstage, Undo,
-    UndoResponse, BambooError, WorktreeChanged,
+    Capabilities, CommitMsg, CreateBranch, DeleteBranch, Discard, Fetch, GetBlob, GetGraph,
+    GetHeadResult, GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult,
+    ListUndoStack, OutputResult, Pull, Push, RefsChanged, Stage, StatusItem, SwitchBranch, Unstage,
+    Undo, UndoResponse, BambooError, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session};
@@ -437,6 +437,14 @@ impl BambooServer {
                 let req: Unstage = parse_params("unstage", params)?;
                 session
                     .enqueue_write(WriteCommand::Unstage(req.paths))
+                    .await
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                Ok(Value::Null)
+            }
+            "discard" => {
+                let req: Discard = parse_params("discard", params)?;
+                session
+                    .enqueue_write(WriteCommand::Discard { paths: req.paths })
                     .await
                     .map_err(|e| BambooError::git_error(e.to_string()))?;
                 Ok(Value::Null)

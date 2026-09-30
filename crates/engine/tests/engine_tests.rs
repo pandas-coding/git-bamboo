@@ -704,6 +704,222 @@ async fn blob_read_from_head_and_missing_path() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Discard (worktree-only, irreversible, no undo transaction)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn discard_tracked_restores_from_index_staged_content_survives() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Stage a new version of a.txt, then dirty the worktree further:
+    // index = "staged", worktree = "dirty", HEAD = "a".
+    std::fs::write(dir.path().join("a.txt"), "staged\n")?;
+    let out = Command::new("git")
+        .args(["add", "--", "a.txt"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    std::fs::write(dir.path().join("a.txt"), "worktree-dirty\n")?;
+
+    let epoch_before = session.current_epoch();
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["a.txt".to_string()],
+        })
+        .await?;
+
+    // Restored from the INDEX, not from HEAD: staged content survives.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt"))?,
+        "staged\n"
+    );
+    // Epoch bumped by the write queue (plus any watcher bumps).
+    assert!(session.current_epoch() >= epoch_before + 1);
+
+    settle().await;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    // Only the staged (index vs HEAD) change remains; no worktree change.
+    assert!(
+        items
+            .iter()
+            .any(|i| i.path == "a.txt" && i.staged && i.status == bamboo_protocol::StatusCode::Modified),
+        "expected staged-only a.txt, got {:?}",
+        items
+    );
+    assert!(
+        items.iter().all(|i| !(i.path == "a.txt" && !i.staged)),
+        "expected no worktree change for a.txt, got {:?}",
+        items
+    );
+
+    // Discard deliberately creates no undo transaction...
+    assert!(session.undo.list_transactions(10)?.is_empty());
+    // ...but is still audit-logged (redacted: no paths).
+    let audit = std::fs::read_to_string(
+        dir.path().join(".git").join("bamboo").join("audit.log"),
+    )?;
+    assert!(audit.contains("\"operation\":\"Discard changes\""));
+    assert!(!audit.contains("a.txt"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_removes_untracked_files() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    std::fs::write(dir.path().join("untracked.txt"), "u\n")?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["untracked.txt".to_string()],
+        })
+        .await?;
+
+    // Untracked-only paths are deleted, not restored.
+    assert!(!dir.path().join("untracked.txt").exists());
+
+    settle().await;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(
+        items.iter().all(|i| i.path != "untracked.txt"),
+        "expected untracked.txt gone, got {:?}",
+        items
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_mixed_paths_in_single_call() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    std::fs::write(dir.path().join("a.txt"), "dirty\n")?; // tracked modification
+    std::fs::write(dir.path().join("new.txt"), "untracked\n")?; // untracked
+
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["a.txt".to_string(), "new.txt".to_string()],
+        })
+        .await?;
+
+    // Tracked restored (index == HEAD here → original content), untracked gone.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "a\n");
+    assert!(!dir.path().join("new.txt").exists());
+
+    settle().await;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(
+        items.iter().all(|i| i.path != "a.txt" && i.path != "new.txt"),
+        "expected both paths clean, got {:?}",
+        items
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_rejects_conflicted_files() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Build a real conflict: divergent branches both touching a.txt.
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    };
+    git(&["checkout", "-q", "-b", "side"])?;
+    std::fs::write(dir.path().join("a.txt"), "side\n")?;
+    git(&["add", "--", "a.txt"])?;
+    git(&["commit", "-q", "-m", "side"])?;
+    git(&["checkout", "-q", "main"])?;
+    std::fs::write(dir.path().join("a.txt"), "main\n")?;
+    git(&["add", "--", "a.txt"])?;
+    git(&["commit", "-q", "-m", "main"])?;
+    let merge = Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(!merge.status.success(), "expected merge to conflict");
+
+    // Discard of a conflicted path is refused, with the file named.
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["a.txt".to_string()],
+        })
+        .await
+        .expect_err("discard of a conflicted file must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("a.txt"), "error should name the file: {msg}");
+    assert!(msg.to_lowercase().contains("conflict"), "error should mention conflicts: {msg}");
+
+    // The conflicted worktree content is untouched (still has markers).
+    assert!(std::fs::read_to_string(dir.path().join("a.txt"))?.contains("<<<<<<<"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_after_tx_does_not_block_prior_undo() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // 1. Create a real undoable transaction: stage a new file.
+    std::fs::write(dir.path().join("new.txt"), "new\n")?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
+            "new.txt".to_string(),
+        ]))
+        .await?;
+    let entries = session.undo.list_transactions(10)?;
+    assert_eq!(entries.len(), 1);
+    let stage_tx = entries[0].id;
+
+    // 2. Discard an unrelated worktree change.
+    std::fs::write(dir.path().join("a.txt"), "dirty\n")?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["a.txt".to_string()],
+        })
+        .await?;
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "a\n");
+
+    // Still exactly one transaction (discard adds none).
+    let entries = session.undo.list_transactions(10)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, stage_tx);
+
+    // 3. The pre-discard transaction is still undoable: the snapshot is
+    //    unaffected by worktree-only changes.
+    let outcome = session.undo.undo(stage_tx)?;
+    assert!(matches!(
+        outcome,
+        bamboo_engine::undo::UndoOutcome::Restored { .. }
+    ));
+
+    settle().await;
+    // The stage was rolled back: new.txt is untracked again.
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    let untracked = items
+        .iter()
+        .any(|i| i.path == "new.txt" && i.status == bamboo_protocol::StatusCode::Untracked && !i.staged);
+    assert!(untracked, "expected untracked new.txt after undo, got {:?}", items);
+    Ok(())
+}
+
 #[tokio::test]
 async fn head_read_reports_branch_and_commit() -> anyhow::Result<()> {
     let dir = test_repo()?;
