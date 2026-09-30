@@ -12,6 +12,7 @@
     "url": "https://github.com/pandas-coding/git-bamboo"
   },
   "categories": ["Other"],
+  "icon": "media/icon.png",
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -278,7 +279,7 @@
         {
           "id": "gitBamboo",
           "title": "Git Bamboo",
-          "icon": "$(git-branch)"
+          "icon": "media/bamboo.svg"
         }
       ]
     }

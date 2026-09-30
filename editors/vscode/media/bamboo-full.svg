@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Full-color marketplace icon source (media/icon.png is rasterized
+       from this at 128x128; the PNG is committed, builds do not regenerate
+       it). Same composition as bamboo.svg but with brand colors — the
+       marketplace is not constrained to the activity bar's monochrome
+       rule. Rasterize with: rsvg-convert -w 128 -h 128 media/bamboo-full.svg
+       -o media/icon.png -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E7D32"/>
+      <stop offset="1" stop-color="#14501F"/>
+    </linearGradient>
+  </defs>
+  <rect width="24" height="24" rx="4.5" fill="url(#bg)"/>
+  <g transform="translate(2.4 2.4) scale(0.8)">
+    <g fill="none" stroke="#E8F5E9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5.5 21.5 V10.5" stroke-width="2.2"/>
+      <path d="M12 21.5 V4.5" stroke-width="2.2"/>
+      <path d="M18.5 21.5 V13.5" stroke-width="2.2"/>
+      <path d="M5.5 10.5 C5.5 15.5 8 17.5 12 17.5" stroke-width="2"/>
+      <path d="M9.9 9.5 h4.2" stroke-width="1.8"/>
+      <path d="M9.9 14.5 h4.2" stroke-width="1.8"/>
+    </g>
+    <circle cx="12" cy="4.5" r="2" fill="#FFCA28"/>
+    <circle cx="18.5" cy="13.5" r="2" fill="#FFCA28"/>
+  </g>
+</svg>

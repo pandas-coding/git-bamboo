@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Git Bamboo activity bar icon: a bamboo grove read as commit lanes —
+       three jointed stalks, the left one merging into the tallest middle
+       lane (a git merge line), commit dots on the free tips. 24x24, single
+       solid color, no baked opacity: VS Code recolors it per theme and
+       applies its own default/hover/active opacity states. -->
+  <g fill="none" stroke="#C8C8C8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5.5 21.5 V10.5" stroke-width="2.2"/>
+    <path d="M12 21.5 V4.5" stroke-width="2.2"/>
+    <path d="M18.5 21.5 V13.5" stroke-width="2.2"/>
+    <path d="M5.5 10.5 C5.5 15.5 8 17.5 12 17.5" stroke-width="2"/>
+    <path d="M9.9 9.5 h4.2" stroke-width="1.8"/>
+    <path d="M9.9 14.5 h4.2" stroke-width="1.8"/>
+  </g>
+  <circle cx="12" cy="4.5" r="2" fill="#C8C8C8"/>
+  <circle cx="18.5" cy="13.5" r="2" fill="#C8C8C8"/>
+</svg>
