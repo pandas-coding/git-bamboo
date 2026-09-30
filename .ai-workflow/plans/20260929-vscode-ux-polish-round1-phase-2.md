@@ -1,7 +1,8 @@
 ---
 title: UX Polish Round 1 — Phase 2（A2）：Commit 视图批量操作与竹子主题品牌图标
 date: 2026-09-29
-status: in-progress
+status: done
+completion: 2026-09-30
 ideas:
   - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 group: vscode-ux-polish-round1
@@ -94,6 +95,17 @@ independent-panel-ui 落地后的反馈与用户决策（2026-09-29）：A 期�
 - [x] 文件行右键菜单按桶显隐正确，Open/Stage/Unstage/Copy Path 全可用 ✅（F5 冒烟通过）
 - [x] 活动栏竹子图标在深浅主题下正确显示且与内置 git 区分 ✅（F5 冒烟通过）
 - [x] 既有单文件 stage/unstage/commit/amend/diff 流程无回归 ✅（F5 冒烟通过）
+
+## Post-Review Fixes（2026-09-30）
+
+pan-review（security / code-quality / simplicity）无 Critical 发现；2 条 Warning + 10 条 Suggestion 全部修复于 commit `74e4ee8`：
+- context-target park/take/clear 抽取为共享模块 `src/contextTargetSlot.ts`（graphSession 与 commitView 复用）；消费时按 lastItems 校验新鲜度、action↔bucket 交叉校验、畸形 payload 清除旧目标
+- 菜单 when 子句改用 `=~` regex（`file-<bucket>` section），9 条 → 4 条
+- 批量按钮路径改为点击时从 DOM 派生（删 bucketPaths 并行状态）；命令注册循环化；CSS 去重
+- 按钮改为 opacity + `:focus-visible`/`:focus-within` 显隐，键盘可达
+- 行内 `+`/`−`/`⇄` 与 `▾` 文本符号替换为 codicon 风格内联 SVG（随主题变色）
+
+F5 复验通过（2026-09-30）：右键菜单按桶显隐（regex when）、键盘可达性、SVG 图标深浅主题显示均正常。
 
 ## Dependencies
 
