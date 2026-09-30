@@ -74,11 +74,11 @@
     }
     .section-header .arrow {
       margin-right: 4px;
-      font-size: 10px;
       transition: transform 0.1s;
-      display: inline-block;
+      display: inline-flex;
+      align-items: center;
       width: 12px;
-      text-align: center;
+      justify-content: center;
     }
     .section-header.collapsed .arrow {
       transform: rotate(-90deg);
@@ -144,14 +144,18 @@
     }
     .file-row .actions {
       flex: 0 0 auto;
-      display: none;
+      display: flex;
       gap: 2px;
       margin-left: 4px;
+      opacity: 0;
+      pointer-events: none;
     }
-    .file-row:hover .actions {
-      display: flex;
+    .file-row:hover .actions,
+    .file-row:focus-within .actions {
+      opacity: 1;
+      pointer-events: auto;
     }
-    .file-row .action-btn {
+    .action-btn {
       width: 18px;
       height: 18px;
       display: flex;
@@ -162,42 +166,28 @@
       color: var(--vscode-foreground);
       cursor: pointer;
       border-radius: 3px;
-      font-size: 12px;
-      line-height: 1;
       padding: 0;
     }
-    .file-row .action-btn:hover {
+    .action-btn:not(:disabled):hover {
       background: var(--vscode-toolbar-hoverBackground);
     }
-    /* Section-header bulk action (Stage All / Unstage All): same visual
-       language as the row buttons, right-aligned in the header and revealed
-       on header hover. Clicks must not toggle the section's collapse (the
-       handlers stopPropagation), and an empty section disables the button. */
+    .action-btn:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+    /* Section-header bulk action (Stage All / Unstage All): right-aligned
+       in the header, revealed on header hover or its own keyboard focus.
+       Clicks must not toggle the section's collapse (the handlers
+       stopPropagation); an empty section disables (and hides) the button. */
     .section-header .action-btn {
       margin-left: auto;
-      width: 18px;
-      height: 18px;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      border: none;
-      background: transparent;
-      color: var(--vscode-foreground);
-      cursor: pointer;
-      border-radius: 3px;
-      font-size: 12px;
-      line-height: 1;
-      padding: 0;
+      opacity: 0;
+      pointer-events: none;
     }
-    .section-header:hover .action-btn {
-      display: flex;
-    }
-    .section-header .action-btn:disabled {
-      opacity: 0.4;
-      cursor: default;
-    }
-    .section-header .action-btn:not(:disabled):hover {
-      background: var(--vscode-toolbar-hoverBackground);
+    .section-header:hover .action-btn,
+    .section-header .action-btn:focus-visible {
+      opacity: 1;
+      pointer-events: auto;
     }
     /* Bottom bar */
     #bottom-bar {
@@ -256,28 +246,34 @@
     <div id="empty-state" class="visible">No changes</div>
     <div id="staged-section" class="section" style="display:none;">
       <div class="section-header" data-section="staged">
-        <span class="arrow">▾</span>
+        <span class="arrow"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.25 4.5 6 7.25 8.75 4.5"/></svg></span>
         <span>Staged</span>
         <span class="count" id="staged-count">0</span>
-        <button id="staged-bulk" class="action-btn" title="Unstage All Changes">−</button>
+        <button id="staged-bulk" class="action-btn" title="Unstage All Changes" aria-label="Unstage All Changes">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.25 8h9.5"/></svg>
+        </button>
       </div>
       <div class="section-body" id="staged-body"></div>
     </div>
     <div id="changes-section" class="section" style="display:none;">
       <div class="section-header" data-section="changes">
-        <span class="arrow">▾</span>
+        <span class="arrow"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.25 4.5 6 7.25 8.75 4.5"/></svg></span>
         <span>Changes</span>
         <span class="count" id="changes-count">0</span>
-        <button id="changes-bulk" class="action-btn" title="Stage All Changes">+</button>
+        <button id="changes-bulk" class="action-btn" title="Stage All Changes" aria-label="Stage All Changes">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3.25v9.5M3.25 8h9.5"/></svg>
+        </button>
       </div>
       <div class="section-body" id="changes-body"></div>
     </div>
     <div id="untracked-section" class="section" style="display:none;">
       <div class="section-header" data-section="untracked">
-        <span class="arrow">▾</span>
+        <span class="arrow"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.25 4.5 6 7.25 8.75 4.5"/></svg></span>
         <span>Untracked</span>
         <span class="count" id="untracked-count">0</span>
-        <button id="untracked-bulk" class="action-btn" title="Stage All Untracked Files">+</button>
+        <button id="untracked-bulk" class="action-btn" title="Stage All Untracked Files" aria-label="Stage All Untracked Files">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3.25v9.5M3.25 8h9.5"/></svg>
+        </button>
       </div>
       <div class="section-body" id="untracked-body"></div>
     </div>

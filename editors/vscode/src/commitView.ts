@@ -10,6 +10,7 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
+import { createContextTargetSlot } from './contextTargetSlot';
 import { isValidRepoPath, openResource } from './headContent';
 import type { StatusItem } from './types';
 import { errorMessage } from './util';
@@ -17,13 +18,6 @@ import { buildWebviewHtml } from './webviewHtml';
 
 /** Debounce for status refreshes (the engine coalesces fs events at 50ms). */
 const REFRESH_DEBOUNCE_MS = 50;
-
-/** How long a parked context-menu target stays usable: the native menu
- *  opens (and is either acted on or dismissed) immediately, so anything
- *  not consumed within this window is stale — this guards against
- *  programmatic invocation of the hidden palette commands long after the
- *  menu was dismissed. Mirrors graphSession's CONTEXT_TARGET_TTL_MS. */
-const CONTEXT_TARGET_TTL_MS = 30_000;
 
 /** Valid context-menu buckets (mirror of the webview's BUCKETS). */
 const CONTEXT_BUCKETS = new Set(['staged', 'changes', 'untracked']);
@@ -47,6 +41,13 @@ export interface CommitContextTarget {
   bucket: 'staged' | 'changes' | 'untracked';
 }
 
+/** Bucketing rule mirrored from the webview (commit.js bucketOf). */
+function bucketOf(item: StatusItem): 'staged' | 'changes' | 'untracked' {
+  if (item.staged) return 'staged';
+  if (item.status === 'untracked') return 'untracked';
+  return 'changes';
+}
+
 export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   static readonly viewId = 'gitBamboo.commit';
 
@@ -56,10 +57,13 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   private refreshing = false;
   private committing = false;
   private disposed = false;
+  /** Last status items pushed to the webview — context targets are
+   *  validated against this at consumption so a parked target always
+   *  refers to a file currently listed in the view. */
+  private lastItems: StatusItem[] = [];
   /** Parked context-menu target (right-clicked file row), consumed by the
    *  webview/context menu commands in extension.ts. */
-  private contextTarget: CommitContextTarget | undefined;
-  private contextTargetTimer: NodeJS.Timeout | undefined;
+  private readonly contextSlot = createContextTargetSlot<CommitContextTarget>();
   /** Per-view subscriptions, torn down on re-resolution so listeners
    *  never double up (mirrors GraphWebviewProvider.teardownSession). */
   private viewDisposables: vscode.Disposable[] = [];
@@ -100,7 +104,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   private teardownView(): void {
     for (const disposable of this.viewDisposables) disposable.dispose();
     this.viewDisposables.length = 0;
-    this.clearContextTarget();
+    this.contextSlot.clear();
   }
 
   /** Debounced refresh entry point — engine notification hooks call this. */
@@ -140,10 +144,12 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
         break;
       case 'contextTarget':
         // Right-click on a file row (fires before the native menu opens);
-        // null (non-row click) clears the parked target. Webview data is a
-        // trust boundary: only a well-formed repo-relative path is parked.
+        // anything but a well-formed payload (null non-row click or
+        // malformed data) clears the parked target so it can't outlive
+        // its gesture. Webview data is a trust boundary: only a
+        // well-formed repo-relative path is parked.
         if (message.file === null) {
-          this.clearContextTarget();
+          this.contextSlot.clear();
         } else if (message.file) {
           this.parkContextTarget(message.file);
         }
@@ -160,9 +166,10 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     try {
       const items = await this.client.request<StatusItem[]>('getStatus', {});
       if (this.disposed) return;
+      this.lastItems = Array.isArray(items) ? items : [];
       await this.view?.webview.postMessage({
         type: 'status',
-        items: Array.isArray(items) ? items : [],
+        items: this.lastItems,
       });
     } catch (err) {
       vscode.window.showErrorMessage(`Git Bamboo: status refresh failed — ${errorMessage(err)}`);
@@ -197,23 +204,29 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   }
 
   /** Returns (and clears) the file targeted by the Commit view's context
-   *  menu, if any. Called by the context-menu command handlers in
-   *  extension.ts (Copy Path reads the target directly). */
+   *  menu, if any — but only when the file is still listed in the current
+   *  status under the same bucket (a refresh may have moved or removed it
+   *  since the right-click). Called by the context-menu command handlers
+   *  in extension.ts (Copy Path reads the target directly). */
   takeContextTarget(): CommitContextTarget | undefined {
-    if (this.contextTargetTimer) clearTimeout(this.contextTargetTimer);
-    this.contextTargetTimer = undefined;
-    const target = this.contextTarget;
-    this.contextTarget = undefined;
-    return target;
+    const target = this.contextSlot.take();
+    if (!target) return undefined;
+    const current = this.lastItems.find((item) => item.path === target.path);
+    return current !== undefined && bucketOf(current) === target.bucket ? target : undefined;
   }
 
   /** Runs a context-menu action against the parked target. Returns false
-   *  when no target is parked (safety net for programmatic invocation).
-   *  Stage/unstage go through changePaths (path validation + refresh);
-   *  open delegates to the shared openResource helper. */
+   *  when no current target is parked (safety net for programmatic
+   *  invocation of the palette-hidden commands). Stage/unstage go through
+   *  changePaths (path validation + refresh); open delegates to the shared
+   *  openResource helper. */
   async runContextCommand(action: 'openChanges' | 'stageFile' | 'unstageFile'): Promise<boolean> {
     const target = this.takeContextTarget();
     if (!target) return false;
+    // Bucket cross-check, mirroring the menus' when clauses: stageFile only
+    //  for unstaged buckets, unstageFile only for staged.
+    if (action === 'stageFile' && target.bucket === 'staged') return false;
+    if (action === 'unstageFile' && target.bucket !== 'staged') return false;
     if (action === 'openChanges') {
       await this.openResource(target.path, target.status);
     } else {
@@ -231,20 +244,10 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       typeof bucket !== 'string' ||
       !CONTEXT_BUCKETS.has(bucket)
     ) {
-      return; // malformed payload: park nothing, keep any prior target
+      this.contextSlot.clear(); // malformed payload: clear, don't keep stale
+      return;
     }
-    this.contextTarget = { path, status, bucket: bucket as CommitContextTarget['bucket'] };
-    if (this.contextTargetTimer) clearTimeout(this.contextTargetTimer);
-    this.contextTargetTimer = setTimeout(() => {
-      this.contextTarget = undefined;
-      this.contextTargetTimer = undefined;
-    }, CONTEXT_TARGET_TTL_MS);
-  }
-
-  private clearContextTarget(): void {
-    if (this.contextTargetTimer) clearTimeout(this.contextTargetTimer);
-    this.contextTargetTimer = undefined;
-    this.contextTarget = undefined;
+    this.contextSlot.park({ path, status, bucket: bucket as CommitContextTarget['bucket'] });
   }
 
   /**

@@ -8,6 +8,7 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient, RpcError } from './engineClient';
+import { createContextTargetSlot } from './contextTargetSlot';
 import type { GraphPage, RepoState } from './types';
 import { errorMessage } from './util';
 
@@ -21,13 +22,6 @@ const VIEWPORT_DEBOUNCE_MS = 16;
  *  can validate webview-supplied widths before persisting them. */
 const GRAPH_MIN_WIDTH = 44;
 const GRAPH_MAX_WIDTH = 240;
-
-/** How long a parked context-menu target stays usable: the native menu
- *  opens (and is either acted on or dismissed) immediately, so anything
- *  not consumed within this window is stale — this guards against
- *  programmatic invocation of the hidden palette commands long after the
- *  menu was dismissed. */
-const CONTEXT_TARGET_TTL_MS = 30_000;
 
 /** Full commit ids as the engine reports them (SHA-1: 40 hex, SHA-256: 64). */
 const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/i;
@@ -69,37 +63,14 @@ interface GraphContextTarget {
 }
 
 /** The pending webview context-menu target (weak single-slot registry). */
-let graphContextTarget: GraphContextTarget | undefined;
-let graphContextTargetTimer: NodeJS.Timeout | undefined;
-
-function clearGraphContextTargetTimer(): void {
-  if (graphContextTargetTimer) clearTimeout(graphContextTargetTimer);
-  graphContextTargetTimer = undefined;
-}
-
-function clearGraphContextTarget(owner: GraphSession): void {
-  if (graphContextTarget?.owner === owner) {
-    graphContextTarget = undefined;
-    clearGraphContextTargetTimer();
-  }
-}
-
-function parkGraphContextTarget(target: GraphContextTarget): void {
-  graphContextTarget = target;
-  clearGraphContextTargetTimer();
-  graphContextTargetTimer = setTimeout(() => {
-    graphContextTarget = undefined;
-    graphContextTargetTimer = undefined;
-  }, CONTEXT_TARGET_TTL_MS);
-}
+const graphContextSlot = createContextTargetSlot<GraphContextTarget>();
 
 /** Returns (and clears) the commit targeted by the graph context menu, if
  *  any. Called by the context-menu command handlers in extension.ts. */
-export function takeGraphContextTarget(): { client: EngineClient; commit: GraphContextCommit } | undefined {
-  clearGraphContextTargetTimer();
-  const target = graphContextTarget;
-  graphContextTarget = undefined;
-  return target;
+export function takeGraphContextTarget():
+  | { client: EngineClient; commit: GraphContextCommit }
+  | undefined {
+  return graphContextSlot.take();
 }
 
 export class GraphSession implements vscode.Disposable {
@@ -139,7 +110,7 @@ export class GraphSession implements vscode.Disposable {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    clearGraphContextTarget(this);
+    graphContextSlot.clearIf((target) => target.owner === this);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.invalidateTimer) clearTimeout(this.invalidateTimer);
     // Unsubscribe engine notification listeners and webview subscriptions.
@@ -215,20 +186,22 @@ export class GraphSession implements vscode.Disposable {
       }
     } else if (message?.type === 'contextTarget') {
       // Right-click on a commit row (fires before the native menu opens);
-      // null (non-commit row) clears this session's parked target.
+      // anything but a well-formed commit (null non-row click or a malformed
+      // payload) clears the parked target so it can't outlive its gesture.
       const commit = message.commit;
-      if (commit === null) {
-        clearGraphContextTarget(this);
-      } else if (
+      if (
+        commit !== null &&
         typeof commit?.id === 'string' &&
         COMMIT_ID_RE.test(commit.id) &&
         typeof commit.message === 'string'
       ) {
-        parkGraphContextTarget({
+        graphContextSlot.park({
           client: this.client,
           commit: { id: commit.id, message: commit.message },
           owner: this,
         });
+      } else {
+        graphContextSlot.clear();
       }
     }
   }

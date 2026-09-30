@@ -34,6 +34,26 @@ const STATUS_LETTER = {
   conflict: 'U',
 };
 
+/** Inline SVG icon bodies (16x16 viewBox, stroke = currentColor) —
+ *  codicon-style replacements for the old text symbols (+, −, ⇄).
+ *  Fully static markup, so safe under the webview CSP. */
+const ICONS = {
+  stage: '<path d="M8 3.25v9.5M3.25 8h9.5"/>',
+  unstage: '<path d="M3.25 8h9.5"/>',
+  openChanges:
+    '<path d="M2.75 5.25h9.5M9.75 3l2.5 2.25-2.5 2.25"/>' +
+    '<path d="M13.25 10.75h-9.5M6.25 8.5l-2.5 2.25 2.5 2.25"/>',
+};
+
+/** Wraps an ICONS body in the shared 16x16 stroke SVG element markup. */
+function iconSvg(name) {
+  return (
+    `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" ` +
+    `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
+    `stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`
+  );
+}
+
 const els = {
   message: document.getElementById('commit-message'),
   empty: document.getElementById('empty-state'),
@@ -63,11 +83,6 @@ const els = {
   stats: document.getElementById('stats'),
 };
 
-/** Current paths per bucket, maintained by render() — the bulk buttons
- *  read them so "Stage All" is just the existing single-path stage message
- *  with every path of the section. */
-const bucketPaths = { staged: [], changes: [], untracked: [] };
-
 function bucketOf(item) {
   if (item.staged) return 'staged';
   if (item.status === 'untracked') return 'untracked';
@@ -82,11 +97,12 @@ function splitPath(p) {
   return { filename: p.slice(slash + 1), dirname: p.slice(0, slash) };
 }
 
-function createButton(label, title, onClick) {
+function createButton(icon, title, onClick) {
   const btn = document.createElement('button');
   btn.className = 'action-btn';
-  btn.textContent = label;
+  btn.innerHTML = iconSvg(icon);
   btn.title = title;
+  btn.setAttribute('aria-label', title);
   btn.addEventListener('click', (event) => {
     event.stopPropagation();
     onClick();
@@ -102,11 +118,13 @@ function createFileRow(item) {
   row.dataset.status = item.status;
   row.dataset.bucket = bucket;
   // Native webview/context menu targeting: the section decides which menu
-  // entries apply (stage vs unstage). Static JSON, not markup.
+  // entries apply (stage vs unstage). Static JSON, not markup. The
+  // 'file-<bucket>' prefix matches the webviewSection regex when clauses
+  // in package.json.
   row.setAttribute(
     'data-vscode-context',
     JSON.stringify({
-      webviewSection: 'file' + bucket.charAt(0).toUpperCase() + bucket.slice(1),
+      webviewSection: `file-${bucket}`,
       preventDefaultContextMenuItems: true,
     }),
   );
@@ -134,17 +152,17 @@ function createFileRow(item) {
   const actions = document.createElement('span');
   actions.className = 'actions';
   if (bucket === 'staged') {
-    actions.appendChild(createButton('−', 'Unstage Changes', () => {
+    actions.appendChild(createButton('unstage', 'Unstage Changes', () => {
       vscode.postMessage({ type: 'unstage', paths: [item.path] });
     }));
-    actions.appendChild(createButton('⇄', 'Open Changes', () => {
+    actions.appendChild(createButton('openChanges', 'Open Changes', () => {
       vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
     }));
   } else {
-    actions.appendChild(createButton('+', 'Stage Changes', () => {
+    actions.appendChild(createButton('stage', 'Stage Changes', () => {
       vscode.postMessage({ type: 'stage', paths: [item.path] });
     }));
-    actions.appendChild(createButton('⇄', item.status === 'untracked' ? 'Open File' : 'Open Changes', () => {
+    actions.appendChild(createButton('openChanges', item.status === 'untracked' ? 'Open File' : 'Open Changes', () => {
       vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
     }));
   }
@@ -181,7 +199,6 @@ function render(items) {
     body.replaceChildren(...list.map(createFileRow));
     els.counts[key].textContent = String(list.length);
     section.style.display = list.length > 0 ? '' : 'none';
-    bucketPaths[key] = list.map((item) => item.path);
     els.bulk[key].disabled = list.length === 0;
     applyCollapsed(key);
   }
@@ -219,14 +236,17 @@ for (const key of BUCKETS) {
 }
 
 // Section-level bulk actions: reuse the stage/unstage message with every
-// path of the bucket (host side needs no changes). stopPropagation keeps
-// the header's collapse toggle out of it, mirroring createButton().
+// path of the bucket (host side needs no changes). The paths are derived
+// from the rendered rows at click time (no parallel state to drift), and
+// stopPropagation keeps the header's collapse toggle out of it.
 for (const key of BUCKETS) {
   els.bulk[key].addEventListener('click', (event) => {
     event.stopPropagation();
-    const paths = bucketPaths[key];
-    if (paths.length === 0) return;
-    vscode.postMessage({ type: key === 'staged' ? 'unstage' : 'stage', paths: [...paths] });
+    const paths = Array.from(
+      els.bodies[key].querySelectorAll('.file-row'),
+      (row) => row.dataset.path,
+    );
+    vscode.postMessage({ type: key === 'staged' ? 'unstage' : 'stage', paths });
   });
 }
 

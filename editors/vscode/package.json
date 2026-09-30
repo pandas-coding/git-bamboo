@@ -213,47 +213,22 @@
         },
         {
           "command": "gitBamboo.commitView.stageFile",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileChanges",
-          "group": "1_stage"
-        },
-        {
-          "command": "gitBamboo.commitView.stageFile",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileUntracked",
+          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(changes|untracked)$/",
           "group": "1_stage"
         },
         {
           "command": "gitBamboo.commitView.unstageFile",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileStaged",
+          "when": "webviewId == gitBamboo.commit && webviewSection == file-staged",
           "group": "1_stage"
         },
         {
           "command": "gitBamboo.commitView.openChanges",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileChanges",
-          "group": "2_open"
-        },
-        {
-          "command": "gitBamboo.commitView.openChanges",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileUntracked",
-          "group": "2_open"
-        },
-        {
-          "command": "gitBamboo.commitView.openChanges",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileStaged",
+          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked)$/",
           "group": "2_open"
         },
         {
           "command": "gitBamboo.commitView.copyPath",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileChanges",
-          "group": "9_clipboard"
-        },
-        {
-          "command": "gitBamboo.commitView.copyPath",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileUntracked",
-          "group": "9_clipboard"
-        },
-        {
-          "command": "gitBamboo.commitView.copyPath",
-          "when": "webviewId == gitBamboo.commit && webviewSection == fileStaged",
+          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked)$/",
           "group": "9_clipboard"
         }
       ]
