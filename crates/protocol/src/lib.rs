@@ -144,6 +144,48 @@ pub struct GetBlob {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetCommitDetail {
+    pub id: String,
+}
+
+/// Full commit metadata for the commit detail view (graph rows only carry
+/// the summary line). `message` is the complete raw message (multi-line,
+/// trailing newline included).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub id: String,
+    pub message: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_time: i64,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committer_time: i64,
+    /// Full parent ids in order; the first parent is the diff baseline
+    /// (empty for root commits).
+    pub parent_ids: Vec<String>,
+    /// Files changed vs. the first parent (or the empty tree for root
+    /// commits). Merge commits are NOT combined-diff: they diff against
+    /// the first parent only.
+    pub files: Vec<CommitFile>,
+}
+
+/// One changed file in a `CommitDetail`, parsed from
+/// `git diff-tree --numstat --name-status -r -M -z` (run twice, one output
+/// format per invocation, paired by path).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitFile {
+    pub path: String,
+    /// Pre-rename path when `status` is R/C, else `None`.
+    pub old_path: Option<String>,
+    /// Single letter: A, D, M, R, C (rename score stripped) or T
+    /// (type-change, passed through verbatim).
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
 /// Result of `getHead`: current HEAD and branch (worktree-safe; replaces
 /// clients parsing `.git/HEAD` directly).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

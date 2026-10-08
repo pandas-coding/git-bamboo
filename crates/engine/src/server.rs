@@ -8,10 +8,10 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
-    Capabilities, CommitMsg, CreateBranch, DeleteBranch, Discard, Fetch, GetBlob, GetGraph,
-    GetHeadResult, GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult,
-    ListUndoStack, OutputResult, Pull, Push, RefsChanged, Stage, StatusItem, SwitchBranch, Unstage,
-    Undo, UndoResponse, BambooError, WorktreeChanged,
+    BambooError, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch, Discard, Fetch,
+    GetBlob, GetCommitDetail, GetGraph, GetHeadResult, GetStatus, GraphPage, HeadChanged,
+    IndexChanged, Initialize, InitializeResult, ListUndoStack, OutputResult, Pull, Push,
+    RefsChanged, Stage, StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session};
@@ -238,12 +238,9 @@ impl BambooServer {
         // The reader may still be blocked reading stdin (client sent
         // `shutdown` without closing stdin); give it a brief grace period,
         // then exit regardless — awaiting it forever would hang shutdown.
-        let reader_done = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            reader_loop,
-        )
-        .await
-        .is_ok();
+        let reader_done = tokio::time::timeout(std::time::Duration::from_millis(250), reader_loop)
+            .await
+            .is_ok();
         info!(reader_done, "server loop exited");
     }
 
@@ -284,7 +281,8 @@ impl BambooServer {
             _ => {
                 let session = self.get_any_session().await?;
                 self.dispatch_with_session(session, method, params).await
-            }        }
+            }
+        }
     }
 
     async fn handle_initialize(&self, params: Value) -> Result<Value, BambooError> {
@@ -377,11 +375,10 @@ impl BambooServer {
     ) -> Result<Value, BambooError> {
         match method {
             "getRefs" => {
-                let refs = spawn_blocking_read(session, |session| {
-                    crate::gix_read::read_refs(session)
-                })
-                .await
-                .map_err(|e| BambooError::git_error(e.to_string()))?;
+                let refs =
+                    spawn_blocking_read(session, |session| crate::gix_read::read_refs(session))
+                        .await
+                        .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&refs)
             }
             "getBlob" => {
@@ -393,11 +390,24 @@ impl BambooServer {
                 .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&content)
             }
+            "getCommitDetail" => {
+                let req: GetCommitDetail = parse_params("getCommitDetail", params)?;
+                let detail: CommitDetail = spawn_blocking_read(session, move |s| {
+                    crate::gix_read::read_commit_detail(s, &req.id)
+                })
+                .await
+                .map_err(|e| {
+                    // Preserve structured errors (INVALID_ARGUMENT for
+                    // malformed ids).
+                    e.downcast::<BambooError>()
+                        .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
+                })?;
+                to_json_value(&detail)
+            }
             "getHead" => {
-                let head: GetHeadResult =
-                    spawn_blocking_read(session, crate::gix_read::read_head)
-                        .await
-                        .map_err(|e| BambooError::git_error(e.to_string()))?;
+                let head: GetHeadResult = spawn_blocking_read(session, crate::gix_read::read_head)
+                    .await
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&head)
             }
             "getGraph" => {
@@ -417,12 +427,11 @@ impl BambooServer {
             }
             "getStatus" => {
                 let req: GetStatus = parse_params("getStatus", params)?;
-                let items: Vec<StatusItem> =
-                    spawn_blocking_read(session, move |s| {
-                        crate::gix_read::read_status(s, req.paths.as_deref())
-                    })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                let items: Vec<StatusItem> = spawn_blocking_read(session, move |s| {
+                    crate::gix_read::read_status(s, req.paths.as_deref())
+                })
+                .await
+                .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&items)
             }
             "stage" => {
@@ -579,18 +588,23 @@ impl BambooServer {
 
     fn engine_event_to_notification(&self, event: EngineEvent) -> Value {
         let (method, params): (&str, Result<Value, serde_json::Error>) = match event {
-            EngineEvent::RefsChanged { changed_refs, epoch } => (
+            EngineEvent::RefsChanged {
+                changed_refs,
+                epoch,
+            } => (
                 "refsChanged",
-                serde_json::to_value(RefsChanged { changed_refs, epoch }),
+                serde_json::to_value(RefsChanged {
+                    changed_refs,
+                    epoch,
+                }),
             ),
             EngineEvent::WorktreeChanged { paths } => (
                 "worktreeChanged",
                 serde_json::to_value(WorktreeChanged { paths }),
             ),
-            EngineEvent::IndexChanged { epoch } => (
-                "indexChanged",
-                serde_json::to_value(IndexChanged { epoch }),
-            ),
+            EngineEvent::IndexChanged { epoch } => {
+                ("indexChanged", serde_json::to_value(IndexChanged { epoch }))
+            }
             EngineEvent::HeadChanged { new_head, epoch } => (
                 "headChanged",
                 serde_json::to_value(HeadChanged { new_head, epoch }),
@@ -655,7 +669,9 @@ pub fn read_message(
         let mut line = String::new();
         // Bounded read: a single header line without a newline can never
         // grow the buffer past the line cap.
-        let n = reader.take((MAX_HEADER_LINE + 1) as u64).read_line(&mut line)?;
+        let n = reader
+            .take((MAX_HEADER_LINE + 1) as u64)
+            .read_line(&mut line)?;
         if n == 0 {
             return Ok(None); // EOF (clean whether or not headers started)
         }

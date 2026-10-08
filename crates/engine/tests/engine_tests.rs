@@ -13,7 +13,11 @@ fn test_repo() -> anyhow::Result<tempfile::TempDir> {
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .output()?;
         if !out.status.success() {
-            anyhow::bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     };
@@ -34,7 +38,11 @@ fn test_repo() -> anyhow::Result<tempfile::TempDir> {
             .env("GIT_AUTHOR_DATE", date)
             .env("GIT_COMMITTER_DATE", date)
             .output()?;
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         Ok(())
     };
     std::fs::write(dir.path().join("a.txt"), "a\n")?;
@@ -113,8 +121,8 @@ async fn graph_page_epoch_mismatch() -> anyhow::Result<()> {
         anchor_commit: None,
         epoch: 999, // stale
     };
-    let err = bamboo_engine::gix_read::read_graph_page(&session, &viewport)
-        .expect_err("should fail");
+    let err =
+        bamboo_engine::gix_read::read_graph_page(&session, &viewport).expect_err("should fail");
     let wb_err = err
         .downcast_ref::<bamboo_protocol::BambooError>()
         .expect("should be BambooError");
@@ -195,10 +203,7 @@ async fn undo_snapshot_and_list() -> anyhow::Result<()> {
     assert_eq!(entries[0].epoch_at_creation, 1);
 
     // Transactions are persisted across engine restarts.
-    let undo2 = bamboo_engine::undo::UndoEngine::new(
-        dir.path(),
-        &dir.path().join(".git"),
-    )?;
+    let undo2 = bamboo_engine::undo::UndoEngine::new(dir.path(), &dir.path().join(".git"))?;
     let entries2 = undo2.list_transactions(10)?;
     assert_eq!(entries2.len(), 1);
     Ok(())
@@ -231,17 +236,13 @@ async fn write_queue_stage_and_epoch_bump() -> anyhow::Result<()> {
         .any(|i| i.path == "new.txt" && i.status == bamboo_protocol::StatusCode::Added && i.staged);
     assert!(staged, "expected staged new.txt, got {:?}", items);
     // Worktree changes must be flagged as unstaged.
-    let unstaged = items
-        .iter()
-        .any(|i| i.path == "a.txt" && !i.staged);
+    let unstaged = items.iter().any(|i| i.path == "a.txt" && !i.staged);
     assert!(unstaged, "expected unstaged a.txt, got {:?}", items);
 
     // An undo snapshot and audit entry should exist.
     let entries = session.undo.list_transactions(10)?;
     assert_eq!(entries.len(), 1);
-    let audit = std::fs::read_to_string(
-        dir.path().join(".git").join("bamboo").join("audit.log"),
-    )?;
+    let audit = std::fs::read_to_string(dir.path().join(".git").join("bamboo").join("audit.log"))?;
     assert!(audit.contains("\"status\":\"ok\""));
     Ok(())
 }
@@ -338,7 +339,10 @@ async fn undo_restores_refs_after_commit() -> anyhow::Result<()> {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].id, stage_tx);
     let outcome = session.undo.undo(stage_tx)?;
-    assert!(matches!(outcome, bamboo_engine::undo::UndoOutcome::Restored { .. }));
+    assert!(matches!(
+        outcome,
+        bamboo_engine::undo::UndoOutcome::Restored { .. }
+    ));
     assert!(session.undo.list_transactions(10)?.is_empty());
     Ok(())
 }
@@ -380,10 +384,7 @@ async fn undo_blocked_on_external_change() -> anyhow::Result<()> {
     let commit_tx = entries[0].id;
     let result = session.undo.undo(commit_tx);
     assert!(
-        matches!(
-            result,
-            Err(bamboo_engine::undo::UndoError::Blocked { .. })
-        ),
+        matches!(result, Err(bamboo_engine::undo::UndoError::Blocked { .. })),
         "expected Blocked, got {:?}",
         result
     );
@@ -449,7 +450,9 @@ fn framing_rejects_overlong_header_line() {
 #[test]
 fn framing_eof_mid_header_returns_none() {
     // Clean EOF: no error, no message.
-    assert!(read_message(b"Content-Length: 5\r\n".to_vec()).unwrap().is_none());
+    assert!(read_message(b"Content-Length: 5\r\n".to_vec())
+        .unwrap()
+        .is_none());
     assert!(read_message(Vec::new()).unwrap().is_none());
 }
 
@@ -583,10 +586,7 @@ async fn status_path_filter_is_component_aware() -> anyhow::Result<()> {
     std::fs::write(dir.path().join("dir").join("x.txt"), "x\n")?;
     std::fs::write(dir.path().join("dirx.txt"), "y\n")?;
 
-    let items = bamboo_engine::gix_read::read_status(
-        &session,
-        Some(&["dir".to_string()]),
-    )?;
+    let items = bamboo_engine::gix_read::read_status(&session, Some(&["dir".to_string()]))?;
     // "dir" matches the untracked directory entry (gix may collapse it to
     // "dir" or report "dir/x.txt"), but NOT the sibling "dirx.txt".
     assert!(!items.is_empty());
@@ -595,18 +595,12 @@ async fn status_path_filter_is_component_aware() -> anyhow::Result<()> {
         .all(|i| i.path == "dir" || i.path.starts_with("dir/")));
 
     // Exact file matches still work (use a non-directory sibling).
-    let items = bamboo_engine::gix_read::read_status(
-        &session,
-        Some(&["dirx.txt".to_string()]),
-    )?;
+    let items = bamboo_engine::gix_read::read_status(&session, Some(&["dirx.txt".to_string()]))?;
     assert!(!items.is_empty());
     assert!(items.iter().all(|i| i.path == "dirx.txt"));
 
     // A prefix that is not a component boundary must not match.
-    let items = bamboo_engine::gix_read::read_status(
-        &session,
-        Some(&["dirx".to_string()]),
-    )?;
+    let items = bamboo_engine::gix_read::read_status(&session, Some(&["dirx".to_string()]))?;
     assert!(items.is_empty());
     Ok(())
 }
@@ -688,19 +682,15 @@ async fn blob_read_from_head_and_missing_path() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    let content =
-        bamboo_engine::gix_read::read_blob(&session, "HEAD", "a.txt")?;
+    let content = bamboo_engine::gix_read::read_blob(&session, "HEAD", "a.txt")?;
     assert_eq!(content.trim(), "a");
 
     // Missing path resolves to empty content, not an error.
-    let missing =
-        bamboo_engine::gix_read::read_blob(&session, "HEAD", "no/such/file.txt")?;
+    let missing = bamboo_engine::gix_read::read_blob(&session, "HEAD", "no/such/file.txt")?;
     assert_eq!(missing, "");
 
     // Option-like revisions are rejected defensively (no shell involved).
-    assert!(
-        bamboo_engine::gix_read::read_blob(&session, "--upload-pack=x", "a.txt").is_err()
-    );
+    assert!(bamboo_engine::gix_read::read_blob(&session, "--upload-pack=x", "a.txt").is_err());
     Ok(())
 }
 
@@ -720,7 +710,11 @@ async fn discard_tracked_restores_from_index_staged_content_survives() -> anyhow
         .args(["add", "--", "a.txt"])
         .current_dir(dir.path())
         .output()?;
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     std::fs::write(dir.path().join("a.txt"), "worktree-dirty\n")?;
 
     let epoch_before = session.current_epoch();
@@ -742,9 +736,9 @@ async fn discard_tracked_restores_from_index_staged_content_survives() -> anyhow
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
     // Only the staged (index vs HEAD) change remains; no worktree change.
     assert!(
-        items
-            .iter()
-            .any(|i| i.path == "a.txt" && i.staged && i.status == bamboo_protocol::StatusCode::Modified),
+        items.iter().any(|i| i.path == "a.txt"
+            && i.staged
+            && i.status == bamboo_protocol::StatusCode::Modified),
         "expected staged-only a.txt, got {:?}",
         items
     );
@@ -757,9 +751,7 @@ async fn discard_tracked_restores_from_index_staged_content_survives() -> anyhow
     // Discard deliberately creates no undo transaction...
     assert!(session.undo.list_transactions(10)?.is_empty());
     // ...but is still audit-logged (redacted: no paths).
-    let audit = std::fs::read_to_string(
-        dir.path().join(".git").join("bamboo").join("audit.log"),
-    )?;
+    let audit = std::fs::read_to_string(dir.path().join(".git").join("bamboo").join("audit.log"))?;
     assert!(audit.contains("\"operation\":\"Discard changes\""));
     assert!(!audit.contains("a.txt"));
     Ok(())
@@ -811,7 +803,9 @@ async fn discard_mixed_paths_in_single_call() -> anyhow::Result<()> {
     settle().await;
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
     assert!(
-        items.iter().all(|i| i.path != "a.txt" && i.path != "new.txt"),
+        items
+            .iter()
+            .all(|i| i.path != "a.txt" && i.path != "new.txt"),
         "expected both paths clean, got {:?}",
         items
     );
@@ -865,7 +859,10 @@ async fn discard_rejects_conflicted_files() -> anyhow::Result<()> {
         .expect_err("discard of a conflicted file must fail");
     let msg = format!("{err}");
     assert!(msg.contains("a.txt"), "error should name the file: {msg}");
-    assert!(msg.to_lowercase().contains("conflict"), "error should mention conflicts: {msg}");
+    assert!(
+        msg.to_lowercase().contains("conflict"),
+        "error should mention conflicts: {msg}"
+    );
 
     // The conflicted worktree content is untouched (still has markers).
     assert!(std::fs::read_to_string(dir.path().join("a.txt"))?.contains("<<<<<<<"));
@@ -914,7 +911,11 @@ async fn discard_deletes_intent_to_add_file() -> anyhow::Result<()> {
         .args(["add", "-N", "--", "ita.txt"])
         .current_dir(dir.path())
         .output()?;
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     session
         .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
@@ -1037,10 +1038,14 @@ async fn discard_after_tx_does_not_block_prior_undo() -> anyhow::Result<()> {
     settle().await;
     // The stage was rolled back: new.txt is untracked again.
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
-    let untracked = items
-        .iter()
-        .any(|i| i.path == "new.txt" && i.status == bamboo_protocol::StatusCode::Untracked && !i.staged);
-    assert!(untracked, "expected untracked new.txt after undo, got {:?}", items);
+    let untracked = items.iter().any(|i| {
+        i.path == "new.txt" && i.status == bamboo_protocol::StatusCode::Untracked && !i.staged
+    });
+    assert!(
+        untracked,
+        "expected untracked new.txt after undo, got {:?}",
+        items
+    );
     Ok(())
 }
 
@@ -1051,7 +1056,12 @@ async fn head_read_reports_branch_and_commit() -> anyhow::Result<()> {
 
     let head = bamboo_engine::gix_read::read_head(&session)?;
     assert_eq!(head.branch.as_deref(), Some("main"));
-    assert_eq!(head.head.len(), 40, "expected a full sha, got {:?}", head.head);
+    assert_eq!(
+        head.head.len(),
+        40,
+        "expected a full sha, got {:?}",
+        head.head
+    );
 
     // Detached HEAD: branch is None, sha still present.
     let git = |args: &[&str]| {
@@ -1067,5 +1077,233 @@ async fn head_read_reports_branch_and_commit() -> anyhow::Result<()> {
     let detached = bamboo_engine::gix_read::read_head(&session)?;
     assert_eq!(detached.branch, None);
     assert_eq!(detached.head, sha);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Commit detail (read-only RPC for the commit detail view)
+// ---------------------------------------------------------------------------
+
+/// Build a commit and return its sha.
+fn gc(dir: &tempfile::TempDir, msg: &str) -> String {
+    let out = Command::new("git")
+        .arg("commit")
+        .arg("-q")
+        .arg("--allow-empty")
+        .arg("-m")
+        .arg(msg)
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Committer")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+        .env("GIT_COMMITTER_DATE", "2026-02-01T00:00:00Z")
+        .output()
+        .expect("git commit");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("rev-parse")
+            .arg("HEAD")
+            .current_dir(dir.path())
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .trim()
+    .to_string()
+}
+
+#[tokio::test]
+async fn commit_detail_multiline_message_and_committer() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    let sha = gc(
+        &dir,
+        "subject line\n\nbody paragraph one\nbody paragraph two",
+    );
+    let detail = bamboo_engine::gix_read::read_commit_detail(&session, &sha)?;
+
+    assert_eq!(detail.id, sha);
+    // Full multi-line message preserved verbatim, newline included.
+    assert_eq!(
+        detail.message,
+        "subject line\n\nbody paragraph one\nbody paragraph two\n"
+    );
+    assert_eq!(detail.author_name, "Test");
+    assert_eq!(detail.author_email, "test@example.com");
+    assert_eq!(detail.committer_name, "Committer");
+    assert_eq!(detail.committer_email, "committer@example.com");
+    assert_eq!(detail.committer_time, 1769904000); // 2026-02-01T00:00:00Z
+                                                   // Not a root commit: at least one parent.
+    assert!(!detail.parent_ids.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_detail_root_commit_uses_empty_tree_baseline() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    let root = String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("rev-list")
+            .arg("--max-parents=0")
+            .arg("HEAD")
+            .current_dir(dir.path())
+            .output()?
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let detail = bamboo_engine::gix_read::read_commit_detail(&session, &root)?;
+    assert!(detail.parent_ids.is_empty());
+    // The root commit of test_repo() adds a.txt, b.txt, c.txt (via three
+    // sequential commits only the FIRST adds a.txt; root adds just a.txt).
+    let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt"]);
+    assert_eq!(detail.files[0].status, "A");
+    assert_eq!(detail.files[0].additions, 1); // "a\n" = one line
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_detail_merge_commit_first_parent_diff() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // feature branched after "second" (a.txt, b.txt). Add a file there,
+    // then merge it into main (which by then has "third" => c.txt).
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["checkout", "-q", "feature"]);
+    std::fs::write(dir.path().join("feat.txt"), "feature\n")?;
+    git(&["add", "."]);
+    let feature_sha = gc(&dir, "feature work");
+    git(&["checkout", "-q", "main"]);
+    let merge_sha = {
+        let out = Command::new("git")
+            .arg("merge")
+            .arg("-q")
+            .arg("--no-ff")
+            .arg("-m")
+            .arg("merge feature")
+            .arg("feature")
+            .current_dir(dir.path())
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .arg("rev-parse")
+                .arg("HEAD")
+                .current_dir(dir.path())
+                .output()?
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    };
+    assert_eq!(feature_sha.len(), 40);
+
+    let detail = bamboo_engine::gix_read::read_commit_detail(&session, &merge_sha)?;
+    assert_eq!(detail.parent_ids.len(), 2, "merge commit has two parents");
+    // Diff is against the FIRST parent (main side): the merge brings in
+    // feat.txt as an addition; c.txt (added on main before the merge) is
+    // unchanged vs. the first parent and must not appear.
+    let paths: Vec<&str> = detail.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["feat.txt"]);
+    assert_eq!(detail.files[0].status, "A");
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_detail_rename_and_modify_counts() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Pure rename: R status with old_path.
+    git_rename_helper(&dir)?;
+    let sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("rev-parse")
+            .arg("HEAD")
+            .current_dir(dir.path())
+            .output()?
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let detail = bamboo_engine::gix_read::read_commit_detail(&session, &sha)?;
+    assert_eq!(detail.files.len(), 1);
+    let f = &detail.files[0];
+    assert_eq!(f.status, "R");
+    assert_eq!(f.old_path.as_deref(), Some("a.txt"));
+    assert_eq!(f.path, "b-renamed.txt");
+    assert_eq!(f.additions, 0);
+    assert_eq!(f.deletions, 0);
+    Ok(())
+}
+
+fn git_rename_helper(dir: &tempfile::TempDir) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("mv")
+        .arg("a.txt")
+        .arg("b-renamed.txt")
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["commit", "-q", "-m", "rename a.txt"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_detail_rejects_invalid_and_unknown_sha() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Malformed ids (wrong length, uppercase, option-like) are rejected.
+    for bad in ["short", "1234", &"A".repeat(40), "--upload-pack=x", "HEAD"] {
+        assert!(
+            bamboo_engine::gix_read::read_commit_detail(&session, bad).is_err(),
+            "expected error for {bad:?}"
+        );
+    }
+
+    // Well-formed but unknown sha.
+    let unknown = "0".repeat(40);
+    assert!(bamboo_engine::gix_read::read_commit_detail(&session, &unknown).is_err());
     Ok(())
 }

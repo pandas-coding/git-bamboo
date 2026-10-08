@@ -3,36 +3,25 @@ use std::collections::HashMap;
 
 use tracing::{debug, info, warn};
 
-use bamboo_protocol::{Commit, GraphPage, GraphViewport, Ref, RefKind, StatusCode, StatusItem, BambooError};
+use bamboo_protocol::{
+    BambooError, Commit, GraphPage, GraphViewport, Ref, RefKind, StatusCode, StatusItem,
+};
 
 use crate::cache::CachedCommit;
 use crate::session::Session;
 
 const PRELOAD_MARGIN: u32 = 500;
 
-pub fn read_graph_page(
-    session: &Session,
-    viewport: &GraphViewport,
-) -> anyhow::Result<GraphPage> {
+pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::Result<GraphPage> {
     let current_epoch = session.current_epoch();
     if viewport.epoch != 0 && viewport.epoch != current_epoch {
-        return Err(BambooError::epoch_mismatch(
-            current_epoch,
-            viewport.epoch,
-        )
-        .into());
+        return Err(BambooError::epoch_mismatch(current_epoch, viewport.epoch).into());
     }
 
     // Poison-tolerant lock recovery: a panicked request handler must not
     // take down the whole connection.
-    let repo = session
-        .gix_repo
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let cache = session
-        .cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
 
     // Invalidate lane cache if epoch changed.
     let _ = cache.invalidate_on_epoch_change(current_epoch)?;
@@ -88,11 +77,7 @@ pub fn read_graph_page(
     // the epoch mid-read (refs moved), stale data must neither be returned
     // nor cached under the new epoch.
     if session.current_epoch() != current_epoch {
-        return Err(BambooError::epoch_mismatch(
-            session.current_epoch(),
-            current_epoch,
-        )
-        .into());
+        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
     }
 
     // Resolve commit metadata: serve hits from the COMMIT_META cache
@@ -126,10 +111,7 @@ pub fn read_graph_page(
         let author_name = String::from_utf8_lossy(author.name.as_ref()).to_string();
         let author_email = String::from_utf8_lossy(author.email.as_ref()).to_string();
         let author_time = author.time().map(|t| t.seconds).unwrap_or(0);
-        let parent_ids: Vec<String> = commit_ref
-            .parents()
-            .map(|id| id.to_string())
-            .collect();
+        let parent_ids: Vec<String> = commit_ref.parents().map(|id| id.to_string()).collect();
 
         misses.push((
             id.clone(),
@@ -252,10 +234,8 @@ pub fn read_graph_page(
     }
 
     // Persist lanes + the epoch they are valid for in ONE redb transaction.
-    let lane_entries: Vec<(String, u16)> = all_commits
-        .iter()
-        .map(|c| (c.id.clone(), c.lane))
-        .collect();
+    let lane_entries: Vec<(String, u16)> =
+        all_commits.iter().map(|c| (c.id.clone(), c.lane)).collect();
     if let Err(e) = cache.put_lanes_with_epoch(&lane_entries, current_epoch) {
         warn!(error = %e, "failed to cache lanes");
     }
@@ -283,11 +263,7 @@ pub fn read_graph_page(
     // Final epoch guard: never serve (nor acknowledge) a page whose epoch
     // is no longer current by the time we finish.
     if session.current_epoch() != current_epoch {
-        return Err(BambooError::epoch_mismatch(
-            session.current_epoch(),
-            current_epoch,
-        )
-        .into());
+        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
     }
 
     info!(
@@ -306,15 +282,9 @@ pub fn read_graph_page(
     })
 }
 
-pub fn read_status(
-    session: &Session,
-    paths: Option<&[String]>,
-) -> anyhow::Result<Vec<StatusItem>> {
+pub fn read_status(session: &Session, paths: Option<&[String]>) -> anyhow::Result<Vec<StatusItem>> {
     let current_epoch = session.current_epoch();
-    let repo = session
-        .gix_repo
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
 
     let platform = repo.status(gix::progress::Discard)?;
 
@@ -327,12 +297,10 @@ pub fn read_status(
         let entry = entry.map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let item = match entry {
-            gix::status::Item::TreeIndex(change) => {
-                map_tree_index_change(change).map(|mut i| {
-                    i.staged = true;
-                    i
-                })
-            }
+            gix::status::Item::TreeIndex(change) => map_tree_index_change(change).map(|mut i| {
+                i.staged = true;
+                i
+            }),
             gix::status::Item::IndexWorktree(iw) => map_index_worktree_item(iw),
         };
 
@@ -353,11 +321,7 @@ pub fn read_status(
     // Epoch TOCTOU guard: if the repo was mutated mid-read, report the
     // mismatch so the client refreshes instead of trusting stale status.
     if session.current_epoch() != current_epoch {
-        return Err(BambooError::epoch_mismatch(
-            session.current_epoch(),
-            current_epoch,
-        )
-        .into());
+        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
     }
 
     debug!(count = items.len(), "status read");
@@ -481,10 +445,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
 }
 
 pub fn read_refs(session: &Session) -> anyhow::Result<Vec<Ref>> {
-    let repo = session
-        .gix_repo
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
     let mut refs = Vec::new();
 
     for reference in repo.references()?.all()? {
@@ -530,10 +491,7 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
         anyhow::bail!("invalid path: {path:?}");
     }
 
-    let repo = session
-        .gix_repo
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
 
     let id = repo
         .rev_parse_single(revision.as_bytes())
@@ -568,10 +526,7 @@ pub fn read_head(session: &Session) -> anyhow::Result<bamboo_protocol::GetHeadRe
     let raw = raw.trim().to_string();
     let branch = raw.strip_prefix("ref: refs/heads/").map(str::to_string);
 
-    let repo = session
-        .gix_repo
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
     // Unborn HEAD (fresh repo): no commit yet, but the branch name is valid.
     let head = repo
         .head_commit()
@@ -579,4 +534,181 @@ pub fn read_head(session: &Session) -> anyhow::Result<bamboo_protocol::GetHeadRe
         .unwrap_or_default();
 
     Ok(bamboo_protocol::GetHeadResult { head, branch })
+}
+
+/// The empty tree object id: the diff baseline for root commits
+/// (`git diff-tree <empty-tree> <root>` lists the root commit's files as
+/// additions).
+const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Strict commit-id validation, mirroring the extension's graph-side rule
+/// (`^[0-9a-f]{40,64}$`): 40–64 lowercase hex chars, nothing else. Host and
+/// engine both check so neither side trusts the other's input.
+fn is_valid_commit_id(id: &str) -> bool {
+    (40..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Read full commit metadata for the detail view: complete message,
+/// author/committer identities and timestamps, parent ids, and the file
+/// list with per-file line counts. Files are diffed against the first
+/// parent (or the empty tree for root commits) via
+/// `git diff-tree -r -M -z` — one invocation per output format
+/// (`--name-status`, `--numstat`), paired by path; combined flags would
+/// print only one of the two formats.
+pub fn read_commit_detail(
+    session: &Session,
+    id: &str,
+) -> anyhow::Result<bamboo_protocol::CommitDetail> {
+    if !is_valid_commit_id(id) {
+        return Err(BambooError::invalid_argument(format!(
+            "getCommitDetail: invalid commit id {id:?}"
+        ))
+        .into());
+    }
+
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+
+    let oid = repo
+        .rev_parse_single(id.as_bytes())
+        .map_err(|e| anyhow::anyhow!("commit {id} not found: {e}"))?;
+    let commit = oid
+        .object()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .peel_to_commit()
+        .map_err(|e| anyhow::anyhow!("{id} is not a commit: {e}"))?;
+    let commit_ref = commit.decode()?;
+
+    let message = String::from_utf8_lossy(commit_ref.message).into_owned();
+    let author = commit_ref.author()?;
+    let committer = commit_ref.committer()?;
+    let parent_ids: Vec<String> = commit_ref.parents().map(|p| p.to_string()).collect();
+    let detail_id = commit.id.to_string();
+    drop(commit_ref);
+
+    // First parent (or the empty tree for root commits) is the diff
+    // baseline. Both args are host/engine-validated hex oids, and argv is
+    // passed without a shell, so they can never be read as options.
+    let base = parent_ids
+        .first()
+        .cloned()
+        .unwrap_or_else(|| EMPTY_TREE_OID.to_string());
+    let files = diff_tree_files(&session.repo_path, &base, &detail_id)?;
+
+    Ok(bamboo_protocol::CommitDetail {
+        id: detail_id,
+        message,
+        author_name: String::from_utf8_lossy(author.name.as_ref()).into_owned(),
+        author_email: String::from_utf8_lossy(author.email.as_ref()).into_owned(),
+        author_time: author.time().map(|t| t.seconds).unwrap_or(0),
+        committer_name: String::from_utf8_lossy(committer.name.as_ref()).into_owned(),
+        committer_email: String::from_utf8_lossy(committer.email.as_ref()).into_owned(),
+        committer_time: committer.time().map(|t| t.seconds).unwrap_or(0),
+        parent_ids,
+        files,
+    })
+}
+
+/// Run `git diff-tree` twice against `base..id` (once for `--name-status`,
+/// once for `--numstat`) and pair the NUL-separated records by path into
+/// `CommitFile`s. In `-z` mode a rename/copy record carries two paths
+/// (`<old>\0<new>`) in both formats; `--numstat` line counts are
+/// `added\tdeleted` (binary files report `-\t-`, mapped to 0/0).
+fn diff_tree_files(
+    repo_path: &std::path::Path,
+    base: &str,
+    id: &str,
+) -> anyhow::Result<Vec<bamboo_protocol::CommitFile>> {
+    let run = |format_flag: &str| -> anyhow::Result<Vec<String>> {
+        let out = std::process::Command::new("git")
+            .arg("diff-tree")
+            .arg("--no-commit-id")
+            .arg("-r")
+            .arg("-M")
+            .arg("-z")
+            .arg(format_flag)
+            .arg(base)
+            .arg(id)
+            .current_dir(repo_path)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git diff-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect())
+    };
+
+    // name-status records: status token, then one path (or two for R/C).
+    let status_tokens = run("--name-status")?;
+    // numstat records: "added\tdeleted[\tpath]" token, then one path (or
+    // two for renames — the embedded path slot is empty in that case).
+    let numstat_tokens = run("--numstat")?;
+
+    // Pair numstat counts by new path (for R/C) / sole path otherwise.
+    let mut counts: HashMap<String, (u32, u32)> = HashMap::new();
+    let mut i = 0;
+    while i < numstat_tokens.len() {
+        let token = &numstat_tokens[i];
+        let mut parts = token.splitn(3, '\t');
+        let additions = parse_numstat_count(parts.next().unwrap_or("-"));
+        let deletions = parse_numstat_count(parts.next().unwrap_or("-"));
+        let path_slot = parts.next().unwrap_or("");
+        let path = if path_slot.is_empty() {
+            // Rename: old and new paths follow as separate tokens.
+            i += 2;
+            numstat_tokens.get(i).cloned().unwrap_or_default()
+        } else {
+            path_slot.to_string()
+        };
+        counts.insert(path, (additions, deletions));
+        i += 1;
+    }
+
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < status_tokens.len() {
+        let status_raw = status_tokens[i].clone();
+        // Keep only the letter ("R100" -> "R"); unknown statuses pass
+        // through verbatim rather than being guessed at.
+        let status = status_raw
+            .chars()
+            .next()
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        let (path, old_path) = if status == "R" || status == "C" {
+            i += 1;
+            let old = status_tokens.get(i).cloned().unwrap_or_default();
+            i += 1;
+            let new = status_tokens.get(i).cloned().unwrap_or_default();
+            (new, if old.is_empty() { None } else { Some(old) })
+        } else {
+            i += 1;
+            let path = status_tokens.get(i).cloned().unwrap_or_default();
+            (path, None)
+        };
+        let (additions, deletions) = counts.get(&path).cloned().unwrap_or((0, 0));
+        files.push(bamboo_protocol::CommitFile {
+            path,
+            old_path,
+            status,
+            additions,
+            deletions,
+        });
+        i += 1;
+    }
+    Ok(files)
+}
+
+/// numstat counts are decimal; `-` marks a binary file (no line counts
+/// available) and is reported as 0/0.
+fn parse_numstat_count(s: &str) -> u32 {
+    s.parse().unwrap_or(0)
 }
