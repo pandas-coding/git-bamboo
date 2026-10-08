@@ -131,7 +131,17 @@
         el = document.createElement('div');
         el.className = 'row';
         el.style.top = `${row * ROW_HEIGHT}px`;
-        el.addEventListener('click', () => selectRow(row));
+        // Single click opens the commit detail panel — the chosen UX over
+        // select-then-double-click (inspection stays one gesture away) — and
+        // also moves the selection highlight. The detail message is only
+        // posted for real commits: skeleton rows have no commit to show,
+        // and the host re-validates the id anyway (webview → host is a
+        // trust boundary).
+        el.addEventListener('click', () => {
+          const commit = commits.get(row);
+          if (commit) vscode.postMessage({ type: 'openCommitDetail', id: commit.id });
+          selectRow(row);
+        });
         // Row index for the delegated contextmenu handler (element -> row).
         el.dataset.row = String(row);
         rowsEl.appendChild(el);

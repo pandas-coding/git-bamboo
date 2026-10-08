@@ -102,6 +102,12 @@
         "category": "Git Bamboo"
       },
       {
+        "command": "gitBamboo.graphView.openCommitDetail",
+        "title": "Open Commit Details",
+        "category": "Git Bamboo",
+        "icon": "$(eye)"
+      },
+      {
         "command": "gitBamboo.commitView.openChanges",
         "title": "Open Changes",
         "category": "Git Bamboo"
@@ -201,6 +207,10 @@
           "when": "false"
         },
         {
+          "command": "gitBamboo.graphView.openCommitDetail",
+          "when": "false"
+        },
+        {
           "command": "gitBamboo.commitView.openChanges",
           "when": "false"
         },
@@ -230,6 +240,11 @@
         }
       ],
       "webview/context": [
+        {
+          "command": "gitBamboo.graphView.openCommitDetail",
+          "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "0_details"
+        },
         {
           "command": "gitBamboo.graph.checkoutNewBranch",
           "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",

@@ -8,6 +8,7 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient, RpcError } from './engineClient';
+import { openCommitDetailPanel } from './commitDetail';
 import { createContextTargetSlot } from './contextTargetSlot';
 import type { GraphPage, RepoState } from './types';
 import { errorMessage } from './util';
@@ -37,6 +38,8 @@ interface GraphViewMessage {
   /** contextTarget payload: the commit under the webview's context menu
    *  (null = right-click landed on a non-commit row; clears any target). */
   commit?: { id?: unknown; message?: unknown } | null;
+  /** openCommitDetail payload: the full id of the single-clicked commit. */
+  id?: unknown;
 }
 
 /** Which webview host owns a graph session — widths are persisted per host. */
@@ -202,6 +205,18 @@ export class GraphSession implements vscode.Disposable {
         });
       } else {
         graphContextSlot.clear();
+      }
+    } else if (message?.type === 'openCommitDetail') {
+      // Single-click on a commit row opens the detail panel — the chosen UX
+      // over select-then-double-click (inspection stays one gesture away).
+      // The webview never fires this for skeleton rows, but it is still a
+      // trust boundary: a malformed payload (missing/non-string id, or an
+      // id that is not a full commit sha) is ignored, mirroring the
+      // contextTarget validation above — ids from the webview are
+      // validated host-side before any use.
+      const id = message.id;
+      if (typeof id === 'string' && COMMIT_ID_RE.test(id)) {
+        openCommitDetailPanel(this.context, this.client, this.state.root, id);
       }
     }
   }

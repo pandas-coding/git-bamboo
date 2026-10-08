@@ -14,6 +14,7 @@ import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
 import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
+import { openCommitDetailPanel } from './commitDetail';
 import { takeGraphContextTarget, type GraphContextCommit } from './graphSession';
 import { HeadContentProvider } from './headContent';
 import type { InitializeResult, RepoState } from './types';
@@ -174,6 +175,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
     }));
+  // Context-menu "Open Commit Details": reuses the parked right-click
+  // target (the panel host re-targets an existing panel, so consecutive
+  // opens never stack). The commit id was already validated against the
+  // full-sha pattern when the target was parked, so it is safe to hand to
+  // the detail panel as-is.
+  registerCommand(context, 'gitBamboo.graphView.openCommitDetail', () =>
+    withGraphTarget(async ({ client, commit }) => {
+      // activeState carries the repo root the panel resolves paths against;
+      // without a session there is no graph to have right-clicked in the
+      // first place, so this guard is a safety net.
+      if (!activeState) {
+        noSessionWarning();
+        return;
+      }
+      openCommitDetailPanel(context, client, activeState.root, commit.id);
+    }));
 
   // Commit-view file-row context menu (native webview/context menus): the
   // webview reports the right-clicked file right before the menu opens, and
@@ -254,6 +271,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const state: RepoState = {
     epoch: init.epoch,
     currentBranch: undefined,
+    // Repo root the graph's commit detail panel (and future consumers)
+    // resolve webview-supplied paths against.
+    root: folder.uri,
   };
   activeState = state;
 
