@@ -2,7 +2,7 @@
  * Webview view provider for the Commit view (view id: gitBamboo.commit):
  * commit message + staged/changes/untracked file list + commit/amend in a
  * single JetBrains-style panel. Serves the built bundle (out/webview/
- * commit.html) and relays stage/unstage/discard/commit/openResource
+ * commit.html) and relays stage/unstage/commit/openResource
  * messages to the engine; right-clicked file rows park a context target
  * consumed by
  * the webview/context menu commands. Status pushes are debounced (50ms)
@@ -133,12 +133,6 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       case 'unstage':
         void this.changePaths(message.type, Array.isArray(message.paths) ? message.paths : []);
         break;
-      case 'discard':
-        void this.discardPaths(
-          Array.isArray(message.paths) ? message.paths : [],
-          typeof message.path === 'string' ? message.path : '',
-        );
-        break;
       case 'openResource':
         if (typeof message.path === 'string') {
           void this.openResource(message.path, message.status ?? '');
@@ -205,20 +199,56 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
 
   /** Discards worktree changes for `paths` after the irreversible
    *  confirmation dialog (VS Code/GitLens convention: modal + IRREVERSIBLE
-   *  detail). `labelPath` names the file in the single-file message. The
-   *  engine re-classifies the paths at execution time, so a stale view
-   *  snapshot can never drive a wrong discard. */
-  private async discardPaths(paths: string[], labelPath: string): Promise<void> {
+   *  detail). `labelPath` names the file in the single-file message (the
+   *  single path by default). After the modal, status is re-fetched and
+   *  every path re-checked — the dialog was answered against a snapshot,
+   *  and an irreversible write must not act on paths whose state changed
+   *  underneath it. The engine re-classifies again at execution time. */
+  private async discardPaths(
+    paths: string[],
+    labelPath = paths.length === 1 ? paths[0] : '',
+  ): Promise<void> {
     // Same trust boundary as changePaths: only repo-relative paths are
     // forwarded to the engine write RPC.
     const safePaths = paths.filter((p) => isValidRepoPath(p));
     if (safePaths.length === 0) return;
     if (!(await this.confirmDiscard(safePaths.length, labelPath))) return;
+    if (!(await this.verifyStillDiscardable(safePaths))) return;
     try {
       await this.client.discard(safePaths);
       await this.doRefresh();
     } catch (err) {
       vscode.window.showErrorMessage(`Git Bamboo: discard failed — ${errorMessage(err)}`);
+    }
+  }
+
+  /** Post-confirmation freshness check (TOCTOU guard): re-reads status and
+   *  requires every path to still be listed in a discardable (non-staged)
+   *  bucket, mirroring takeContextTarget's bucket cross-check. Aborts with
+   *  a warning — nothing is discarded — when the file list changed since
+   *  the dialog was answered. */
+  private async verifyStillDiscardable(paths: string[]): Promise<boolean> {
+    try {
+      const items = await this.client.request<StatusItem[]>('getStatus', {});
+      const current = Array.isArray(items) ? items : [];
+      this.lastItems = current; // keep the cache fresh either way
+      const changed = paths.some((p) => {
+        const item = current.find((i) => i.path === p);
+        return item === undefined || bucketOf(item) === 'staged';
+      });
+      if (changed) {
+        vscode.window.showWarningMessage(
+          'Git Bamboo: the file list changed since the confirmation — ' +
+            'nothing was discarded. Please retry.',
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        `Git Bamboo: discard pre-check failed — ${errorMessage(err)}`,
+      );
+      return false;
     }
   }
 
@@ -284,7 +314,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     if (action === 'openChanges') {
       await this.openResource(target.path, target.status);
     } else if (action === 'discardFile') {
-      await this.discardPaths([target.path], target.path);
+      await this.discardPaths([target.path]);
     } else {
       await this.changePaths(action === 'stageFile' ? 'stage' : 'unstage', [target.path]);
     }
@@ -300,7 +330,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       .filter((item) => bucketOf(item) === bucket)
       .map((item) => item.path);
     if (paths.length === 0) return false;
-    await this.discardPaths(paths, '');
+    await this.discardPaths(paths);
     return true;
   }
 

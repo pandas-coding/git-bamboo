@@ -1,7 +1,7 @@
 ---
 title: UX Polish Round 1 — Phase 3（B1）：引擎 discard RPC 与 Commit 视图丢弃确认流
 date: 2026-09-30
-status: ready
+status: done
 ideas:
   - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 group: vscode-ux-polish-round1
@@ -87,12 +87,12 @@ A 期（phase 2）明确砍掉 discard 归 B 期：引擎无对应 RPC，host �
 
 ## Acceptance Criteria
 
-- [ ] `cargo test` 引擎 discard 测试全绿（tracked/untracked/混合/conflict 拒绝/discard 后 undo 仍可用）
-- [ ] `tsc --noEmit` 与 `npm run compile` 零错误
-- [ ] 右键菜单按桶显隐正确（changes/untracked 有、staged 无），确认弹窗为 modal 且含 IRREVERSIBLE 文案
-- [ ] tracked discard 恢复 index 版本（staged 内容幸存）、untracked 被删除
-- [ ] discard 全程经引擎写队列（host 无 shell git），串行 + epoch bump，不写 undo tx
-- [ ] discard 后既有 undo 流程无回归（F5 冒烟）
+- [x] `cargo test` 引擎 discard 测试全绿（tracked/untracked/混合/conflict 拒绝/discard 后 undo 仍可用；review 后新增：untracked 目录、intent-to-add、glob 字面路径、无改动/目录形拒绝）
+- [x] `tsc --noEmit` 与 `npm run compile` 零错误
+- [x] 右键菜单按桶显隐正确（changes/untracked 有、staged 无），确认弹窗为 modal 且含 IRREVERSIBLE 文案
+- [x] tracked discard 恢复 index 版本（staged 内容幸存）、untracked 被删除（含 ITA 文件删除、untracked 目录整体删除）
+- [x] discard 全程经引擎写队列（host 无 shell git），串行 + epoch bump，不写 undo tx
+- [x] discard 后既有 undo 流程无回归（F5 冒烟）
 
 ## Dependencies
 

@@ -184,6 +184,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ['openChanges', 'openChanges'],
     ['stageFile', 'stageFile'],
     ['unstageFile', 'unstageFile'],
+    // discardFile's IRREVERSIBLE confirmation flow lives inside
+    // CommitViewProvider.runContextCommand — the handler shape is the same.
+    ['discardFile', 'discardFile'],
   ] as const;
   for (const [action, command] of commitViewContextActions) {
     registerCommand(context, `gitBamboo.commitView.${command}`, async () => {
@@ -194,16 +197,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!(await activeCommitView.runContextCommand(action))) noCommitTargetWarning();
     });
   }
-  // Discard is registered separately from the loop above: its handler leads
-  // into the IRREVERSIBLE confirmation flow before any write reaches the
-  // engine. Same safety nets as the loop actions.
-  registerCommand(context, 'gitBamboo.commitView.discardFile', async () => {
-    if (!activeCommitView) {
-      noSessionWarning();
-      return;
-    }
-    if (!(await activeCommitView.runContextCommand('discardFile'))) noCommitTargetWarning();
-  });
   registerCommand(context, 'gitBamboo.commitView.copyPath', async () => {
     if (!activeCommitView) {
       noSessionWarning();

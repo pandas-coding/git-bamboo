@@ -15,7 +15,8 @@ pub enum WriteCommand {
     /// Discard worktree changes: tracked paths are restored from the index
     /// (`git checkout --`), untracked-only paths are deleted (`git clean -f`).
     /// Deliberately IRREVERSIBLE (user-confirmed upstream); does not create
-    /// an undo transaction (see `run_write`).
+    /// an undo transaction (routed directly in `run_write_queue`, see
+    /// there).
     Discard { paths: Vec<String> },
     Commit { message: String, amend: bool },
     CreateBranch { name: String, base: Option<String> },
@@ -166,6 +167,21 @@ pub async fn run_write_queue(
             WriteCommand::Undo { transaction_id } => {
                 run_undo(Arc::clone(&session), *transaction_id).await
             }
+            // Discard bypasses the undo journal entirely: it only touches
+            // worktree file contents, which the undo snapshot does not
+            // capture (it compares HEAD/refs/index, see undo.rs `Snapshot`),
+            // so it can neither be undone nor block a pre-existing
+            // transaction's undo. It still runs serialized on this queue,
+            // bumps the epoch on success, and is audit-logged — only the
+            // tx begin/commit is skipped. This is the architectural landing
+            // point of "option A" (irreversible discard, confirmed upstream).
+            WriteCommand::Discard { paths } => {
+                let result = discard_changes(&session, paths).await;
+                match result {
+                    Ok(output) => (WriteResult::Ok(output), 0),
+                    Err(e) => (WriteResult::Err(format!("{e}")), 0),
+                }
+            }
             _ => run_write(&session, &cmd).await,
         };
 
@@ -203,22 +219,6 @@ pub async fn run_write_queue(
 async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) {
     let epoch = session.current_epoch();
     let desc = cmd.op_summary();
-
-    if matches!(cmd, WriteCommand::Discard { .. }) {
-        // Discard bypasses the undo journal entirely: it only touches
-        // worktree file contents, which the undo snapshot does not capture
-        // (it compares HEAD/refs/index, see undo.rs `Snapshot`), so it can
-        // neither be undone nor block a pre-existing transaction's undo.
-        // It still runs serialized on this queue, bumps the epoch on
-        // success, and is audit-logged — only the tx begin/commit is
-        // skipped. This is the architectural landing point of "option A"
-        // (irreversible discard, confirmed upstream).
-        let result = execute_command(session, cmd).await;
-        return match result {
-            Ok(output) => (WriteResult::Ok(output), 0),
-            Err(e) => (WriteResult::Err(format!("{e}")), 0),
-        };
-    }
 
     // Allocate the undo transaction (pre-write snapshot).
     let tx_id = match session.undo.begin(&desc, epoch) {
@@ -280,12 +280,6 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         return switch_branch(session, name, *auto_stash).await;
     }
 
-    // Discard is a multi-step flow (fresh classification → checkout/clean),
-    // handled separately.
-    if let WriteCommand::Discard { paths } = cmd {
-        return discard_changes(session, paths).await;
-    }
-
     let repo_path = &session.repo_path;
     let mut output = match cmd {
         WriteCommand::Stage(paths) => {
@@ -293,8 +287,13 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
                 validate_path_arg(p)?;
             }
             let mut c = Command::new("git");
-            // `--` terminates option parsing: paths can never be read as flags.
-            c.arg("add").arg("--").args(paths).current_dir(repo_path);
+            // `--` terminates option parsing (paths can never be read as
+            // flags) and `:(literal)` keeps each path a literal pathspec
+            // even when it contains glob metacharacters or a `:` prefix.
+            c.arg("add")
+                .arg("--")
+                .args(literal_pathspecs(paths))
+                .current_dir(repo_path);
             c
         }
         WriteCommand::Unstage(paths) => {
@@ -302,7 +301,11 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
                 validate_path_arg(p)?;
             }
             let mut c = Command::new("git");
-            c.arg("reset").arg("HEAD").arg("--").args(paths).current_dir(repo_path);
+            c.arg("reset")
+                .arg("HEAD")
+                .arg("--")
+                .args(literal_pathspecs(paths))
+                .current_dir(repo_path);
             c
         }
         WriteCommand::Commit { message, amend } => {
@@ -348,7 +351,7 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
             unreachable!("switchBranch is handled by switch_branch")
         }
         WriteCommand::Discard { .. } => {
-            unreachable!("discard is handled by discard_changes")
+            unreachable!("discard is routed in run_write_queue")
         }
         WriteCommand::Fetch { remote } => {
             let mut c = Command::new("git");
@@ -404,64 +407,85 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
     Ok(format!("{stdout}{stderr}").trim().to_string())
 }
 
+// Render paths as `:(literal)` pathspecs so a path that happens to
+// contain glob metacharacters (`*?[]!`) or a magic prefix (`:`) is passed
+// with literal semantics — git would otherwise re-interpret such a path
+// as a glob/magic pathspec, letting a write act on files other than the
+// ones that were classified and confirmed. Always combined with a `--`
+// separator so paths can never be read as flags.
+fn literal_pathspecs(paths: &[String]) -> Vec<String> {
+    paths.iter().map(|p| format!(":(literal){p}")).collect()
+}
+
 /// Discard worktree changes for the given paths: tracked paths are
 /// restored from the index (staged content survives), untracked-only
-/// paths are deleted. Classification happens fresh at execution time so a
-/// stale UI snapshot can never drive the wrong git subcommand — this is
-/// stronger than re-reading status host-side.
+/// paths are deleted, intent-to-add paths (`git add -N`, index entry is
+/// the empty blob) are removed from index and worktree. Classification
+/// happens fresh at execution time so a stale UI snapshot can never drive
+/// the wrong git subcommand — this is stronger than re-reading status
+/// host-side.
 async fn discard_changes(session: &Session, paths: &[String]) -> anyhow::Result<String> {
     for p in paths {
         validate_path_arg(p)?;
+        // A trailing slash is a directory-shaped pathspec that could expand
+        // to every file under the directory — beyond what was confirmed.
+        // Untracked directories are addressed by their collapsed name
+        // (e.g. "newdir", not "newdir/").
+        if p.ends_with('/') {
+            anyhow::bail!("discard paths must name files, not directories: {p:?}");
+        }
     }
 
-    let (tracked, untracked) = classify_discard_paths(session, paths).await?;
+    let (tracked, untracked, intent_to_add) = classify_discard_paths(session, paths).await?;
 
     if !tracked.is_empty() {
-        run_git_paths(&session.repo_path, &["checkout"], &tracked).await?;
+        run_git_checked(&session.repo_path, &["checkout"], &tracked).await?;
     }
     if !untracked.is_empty() {
-        run_git_paths(&session.repo_path, &["clean", "-f"], &untracked).await?;
+        run_git_checked(&session.repo_path, &["clean", "-f"], &untracked).await?;
+    }
+    if !intent_to_add.is_empty() {
+        // `git clean` skips index-tracked files, so intent-to-add entries
+        // need `git rm -f` (removes the empty-blob index entry and the
+        // worktree file); a plain `checkout --` would truncate the file to
+        // the empty index blob instead of deleting it.
+        run_git_checked(&session.repo_path, &["rm", "-f"], &intent_to_add).await?;
     }
 
     Ok(format!(
         "discarded {} tracked and {} untracked path(s)",
         tracked.len(),
-        untracked.len()
+        untracked.len() + intent_to_add.len()
     ))
 }
 
 /// Classify `paths` for discard using `git status --porcelain -z`.
-/// Returns (tracked, untracked) lists; paths with no reported change are
-/// dropped from both (nothing to discard). Unmerged (conflict) states are
-/// rejected — restoring one side blindly would destroy the other side's
-/// changes, which B1 does not attempt.
+/// Returns (tracked, untracked, intent-to-add) lists; a path with no
+/// reported change is an error (a destructive RPC must never silently
+/// no-op — the caller confirmed real changes). Unmerged (conflict) states
+/// are rejected — restoring one side blindly would destroy the other
+/// side's changes, which B1 does not attempt.
+///
+/// Known narrow race: an external process can mutate the worktree between
+/// this classification and the checkout/clean/rm invocations, so the git
+/// commands may act on a state newer than the classification. The queue
+/// serializes only the engine's own writes; shrinking this window further
+/// would require locking the worktree, which the CLI-based write path
+/// does not attempt.
 async fn classify_discard_paths(
     session: &Session,
     paths: &[String],
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let mut c = Command::new("git");
-    c.arg("status")
-        .arg("--porcelain")
-        .arg("-z")
-        .arg("--")
-        .args(paths)
-        .current_dir(&session.repo_path);
-    let result = c
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !result.status.success() {
-        anyhow::bail!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
-        );
-    }
+) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    let out = run_git_checked(
+        &session.repo_path,
+        &["status", "--porcelain", "-z"],
+        paths,
+    )
+    .await?;
 
     // -z records are NUL-terminated and unquoted; a rename/copy entry
     // carries the original path as an extra trailing field that must be
     // consumed, never parsed as an entry itself.
-    let out = String::from_utf8_lossy(&result.stdout);
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut fields = out.split('\0');
     while let Some(field) = fields.next() {
@@ -495,32 +519,48 @@ async fn classify_discard_paths(
 
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
+    let mut intent_to_add = Vec::new();
     for p in paths {
-        match entries.iter().find(|(_, path)| path == p) {
+        // Untracked directories are reported with a trailing slash
+        // ("?? newdir/") while callers address them by their collapsed
+        // name ("newdir"), so compare after stripping it.
+        let entry = entries.iter().find(|(_, path)| {
+            path.as_str() == p.as_str() || path.strip_suffix('/') == Some(p.as_str())
+        });
+        match entry {
             // "??" = untracked (worktree only, not in the index).
             Some((xy, _)) if xy == "??" => untracked.push(p.clone()),
+            // " A" / " AM" = intent-to-add (empty-blob index entry): the
+            // worktree copy is the only real content, so discarding means
+            // deletion, not an index restore.
+            Some((xy, _)) if xy == " A" || xy == " AM" => intent_to_add.push(p.clone()),
             // Any other status line (modified, deleted, added, staged,
             // renamed, ...) means the path is tracked: `checkout --`
             // restores the worktree copy from the index.
             Some((_, _)) => tracked.push(p.clone()),
-            // Not reported by status → nothing to discard for this path.
-            None => {}
+            // No reported change → refuse instead of silently no-oping a
+            // destructive RPC the caller believes did something.
+            None => anyhow::bail!("no changes to discard for {p:?}"),
         }
     }
 
-    Ok((tracked, untracked))
+    Ok((tracked, untracked, intent_to_add))
 }
 
-/// Run one git subcommand with a `--`-separated path list. Mirrors the
-/// argument hygiene of the single-command arms (paths can never be read
-/// as flags).
-async fn run_git_paths(
+/// Run one git subcommand, optionally with a `--`-separated path list
+/// (rendered as `:(literal)` pathspecs, see `literal_pathspecs`). Returns
+/// combined stdout+stderr on success and an error carrying stderr on
+/// failure.
+async fn run_git_checked(
     repo_path: &std::path::Path,
     args: &[&str],
     paths: &[String],
 ) -> anyhow::Result<String> {
     let mut c = Command::new("git");
-    c.args(args).arg("--").args(paths).current_dir(repo_path);
+    c.args(args).current_dir(repo_path);
+    if !paths.is_empty() {
+        c.arg("--").args(literal_pathspecs(paths));
+    }
     let result = c
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -531,25 +571,10 @@ async fn run_git_paths(
     if !result.status.success() {
         anyhow::bail!("git {:?} failed: {}", args, stderr.trim());
     }
-    Ok(format!("{stdout}{stderr}").trim().to_string())
-}
-
-/// Run one git subcommand, returning combined stdout+stderr on success and
-/// an error carrying stderr on failure.
-async fn run_git_checked(repo_path: &std::path::Path, args: &[&str]) -> anyhow::Result<String> {
-    let result = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    if !result.status.success() {
-        anyhow::bail!("git {:?} failed: {}", args, stderr.trim());
-    }
-    Ok(format!("{stdout}{stderr}").trim().to_string())
+    // NOT trimmed: porcelain `-z` records are NUL-terminated and may carry
+    // significant leading whitespace (" M path") — callers that want a
+    // display string trim themselves.
+    Ok(format!("{stdout}{stderr}"))
 }
 
 /// Switch branches with real auto-stash semantics:
@@ -570,9 +595,9 @@ async fn switch_branch(
     let mut stashed = false;
 
     if auto_stash {
-        let dirty = run_git_checked(&repo_path, &["status", "--porcelain"]).await?;
+        let dirty = run_git_checked(&repo_path, &["status", "--porcelain"], &[]).await?;
         if !dirty.trim().is_empty() {
-            run_git_checked(&repo_path, &["stash", "push", "--include-untracked"])
+            run_git_checked(&repo_path, &["stash", "push", "--include-untracked"], &[])
                 .await
                 .map_err(|e| anyhow::anyhow!("auto-stash failed; switch aborted: {e}"))?;
             stashed = true;
@@ -580,7 +605,7 @@ async fn switch_branch(
         }
     }
 
-    match run_git_checked(&repo_path, &["switch", name]).await {
+    match run_git_checked(&repo_path, &["switch", name], &[]).await {
         Ok(out) => {
             if !out.is_empty() {
                 output.push_str(&out);
@@ -590,7 +615,7 @@ async fn switch_branch(
             // The switch failed; put the stash back so the user's changes
             // are not stranded (best-effort).
             if stashed {
-                if let Err(pop_err) = run_git_checked(&repo_path, &["stash", "pop"]).await {
+                if let Err(pop_err) = run_git_checked(&repo_path, &["stash", "pop"], &[]).await {
                     warn!(error = %pop_err, "failed to restore stash after failed switch");
                 }
             }
@@ -599,7 +624,7 @@ async fn switch_branch(
     }
 
     if stashed {
-        match run_git_checked(&repo_path, &["stash", "pop"]).await {
+        match run_git_checked(&repo_path, &["stash", "pop"], &[]).await {
             Ok(out) => {
                 if !out.is_empty() {
                     output.push('\n');

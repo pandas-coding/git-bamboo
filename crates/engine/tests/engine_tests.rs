@@ -736,7 +736,7 @@ async fn discard_tracked_restores_from_index_staged_content_survives() -> anyhow
         "staged\n"
     );
     // Epoch bumped by the write queue (plus any watcher bumps).
-    assert!(session.current_epoch() >= epoch_before + 1);
+    assert!(session.current_epoch() > epoch_before);
 
     settle().await;
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
@@ -869,6 +869,130 @@ async fn discard_rejects_conflicted_files() -> anyhow::Result<()> {
 
     // The conflicted worktree content is untouched (still has markers).
     assert!(std::fs::read_to_string(dir.path().join("a.txt"))?.contains("<<<<<<<"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_removes_collapsed_untracked_directory() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // The Commit view lists a collapsed untracked directory by its name
+    // ("newdir"), while `git status --porcelain` reports it as "newdir/".
+    std::fs::create_dir_all(dir.path().join("newdir"))?;
+    std::fs::write(dir.path().join("newdir").join("x.txt"), "x\n")?;
+
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["newdir".to_string()],
+        })
+        .await?;
+
+    // The whole collapsed directory is removed (not a silent no-op).
+    assert!(!dir.path().join("newdir").exists());
+
+    settle().await;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(
+        items.iter().all(|i| !i.path.starts_with("newdir")),
+        "expected newdir gone, got {:?}",
+        items
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_deletes_intent_to_add_file() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // `git add -N`: the index holds an empty-blob placeholder, so the file
+    // must be DELETED (index entry + worktree), not restored from the
+    // index (which would truncate it to zero bytes).
+    std::fs::write(dir.path().join("ita.txt"), "content\n")?;
+    let out = Command::new("git")
+        .args(["add", "-N", "--", "ita.txt"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["ita.txt".to_string()],
+        })
+        .await?;
+
+    assert!(!dir.path().join("ita.txt").exists());
+
+    settle().await;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(
+        items.iter().all(|i| i.path != "ita.txt"),
+        "expected ita.txt fully gone (index and worktree), got {:?}",
+        items
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_treats_glob_named_paths_literally() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // A file literally named with a glob metacharacter must be discarded
+    // as that exact file — never re-interpreted as a glob matching the
+    // sibling.
+    std::fs::write(dir.path().join("g*.txt"), "star\n")?;
+    std::fs::write(dir.path().join("g1.txt"), "one\n")?;
+
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["g*.txt".to_string()],
+        })
+        .await?;
+
+    assert!(!dir.path().join("g*.txt").exists());
+    assert!(dir.path().join("g1.txt").exists(), "sibling must survive");
+    Ok(())
+}
+
+#[tokio::test]
+async fn discard_rejects_unchanged_and_directory_shaped_paths() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    // A path with no reported change is an explicit error — a destructive
+    // RPC must never silently no-op.
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["a.txt".to_string()], // clean, no change to discard
+        })
+        .await
+        .expect_err("discarding an unchanged path must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no changes to discard"),
+        "error should say what happened: {msg}"
+    );
+    assert!(msg.contains("a.txt"), "error should name the path: {msg}");
+    // The clean file is untouched.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "a\n");
+
+    // Directory-shaped pathspecs (trailing slash) are rejected: they could
+    // expand to every file under the directory, beyond what was confirmed.
+    std::fs::create_dir_all(dir.path().join("somedir"))?;
+    std::fs::write(dir.path().join("somedir").join("f.txt"), "f\n")?;
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
+            paths: vec!["somedir/".to_string()],
+        })
+        .await
+        .expect_err("directory-shaped discard path must fail");
+    assert!(
+        format!("{err}").contains("not directories"),
+        "error should reject the directory shape: {err}"
+    );
+    assert!(dir.path().join("somedir").join("f.txt").exists());
     Ok(())
 }
 

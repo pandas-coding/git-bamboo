@@ -219,6 +219,14 @@
         {
           "command": "gitBamboo.commitView.discardFile",
           "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.discardAllChanges",
+          "when": "git-bamboo:active"
+        },
+        {
+          "command": "gitBamboo.commitView.discardAllUntracked",
+          "when": "git-bamboo:active"
         }
       ],
       "webview/context": [
