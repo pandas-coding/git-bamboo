@@ -1,5 +1,10 @@
 /** Small helpers shared across extension host modules. */
 
+/** Full commit ids as the engine reports them (SHA-1: 40 hex, SHA-256: 64).
+ *  Shared by host modules that validate commit ids before use — webview-
+ *  supplied ids are untrusted. */
+export const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/i;
+
 export function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);

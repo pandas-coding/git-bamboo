@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Replaced at runtime by the extension host with a CSP pinned to this webview. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git Bamboo — Commit Detail</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size, 13px);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      display: flex;
+      flex-direction: column;
+    }
+    /* Header: author avatar placeholder + identity lines */
+    #header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px 8px;
+      border-bottom: 1px solid var(--vscode-panel-border, transparent);
+      flex-shrink: 0;
+    }
+    #avatar {
+      flex: 0 0 auto;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      font-size: 12px;
+      font-weight: 600;
+      user-select: none;
+    }
+    .ident {
+      flex: 1 1 auto;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+    .line {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+    }
+    .line .name {
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    .line .time {
+      flex: 0 0 auto;
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
+    }
+    /* Committer line only appears when the committer differs from the
+       author (name or time). */
+    #committer-line {
+      display: none;
+    }
+    #committer-line.visible {
+      display: flex;
+    }
+    #committer-line .name {
+      font-weight: 400;
+      font-size: 11px;
+    }
+    /* Full commit message */
+    #message {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--vscode-panel-border, transparent);
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      max-height: 40vh;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }
+    /* File list */
+    #files-section {
+      flex-shrink: 0;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--vscode-foreground);
+      user-select: none;
+    }
+    .section-header .count {
+      padding: 0 5px;
+      border-radius: 8px;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      font-size: 10px;
+      line-height: 14px;
+      min-width: 14px;
+      text-align: center;
+    }
+    #file-list {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 0 0 8px;
+    }
+    .file-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 12px;
+      height: 22px;
+      box-sizing: border-box;
+      cursor: pointer;
+    }
+    .file-row:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .status-icon {
+      flex: 0 0 auto;
+      width: 16px;
+      height: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .status-icon.added {
+      color: var(--vscode-gitDecoration-addedResourceForeground, #73c991);
+    }
+    .status-icon.deleted {
+      color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+    }
+    .status-icon.modified,
+    .status-icon.renamed,
+    .status-icon.copied {
+      color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d);
+    }
+    .status-icon.typechanged {
+      color: var(--vscode-gitDecoration-untrackedResourceForeground, #73c991);
+    }
+    /* Repo paths are always LTR even in RTL locales. */
+    .path {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      direction: ltr;
+      text-align: left;
+    }
+    .path .old-path {
+      color: var(--vscode-descriptionForeground);
+    }
+    .path .rename-arrow {
+      display: inline-flex;
+      align-items: center;
+      margin: 0 3px;
+      color: var(--vscode-descriptionForeground);
+      vertical-align: middle;
+    }
+    .path .filename {
+      /* spans get textContent, but keep ellipsis working inside the row */
+      display: inline;
+    }
+    .stats {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 6px;
+      margin-left: 8px;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .stats .additions {
+      color: var(--vscode-gitDecoration-addedResourceForeground, #73c991);
+    }
+    .stats .deletions {
+      color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+    }
+    /* Hover-revealed row action: opacity (never display:none — the button
+       must stay in the tab order), revealed on row hover, :focus-within
+       (keyboard) and its own :focus-visible keeps the outline visible. */
+    .file-row .actions {
+      flex: 0 0 auto;
+      display: flex;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .file-row:hover .actions,
+    .file-row:focus-within .actions {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .action-btn {
+      width: 18px;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      background: transparent;
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      border-radius: 3px;
+      padding: 0;
+    }
+    .action-btn:not(:disabled):hover {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    .action-btn:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: -1px;
+    }
+    /* Empty / error / loading states */
+    .state {
+      display: none;
+      padding: 24px 12px;
+      text-align: center;
+      color: var(--vscode-descriptionForeground);
+      font-style: italic;
+    }
+    .state.visible {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <span id="avatar"></span>
+    <div class="ident">
+      <div class="line" id="author-line">
+        <span id="author-name" class="name"></span>
+        <span id="author-time" class="time"></span>
+      </div>
+      <div class="line" id="committer-line">
+        <span id="committer-name" class="name"></span>
+        <span id="committer-time" class="time"></span>
+      </div>
+    </div>
+  </div>
+  <div id="message"></div>
+  <div id="files-section">
+    <div class="section-header">
+      <span>Files</span>
+      <span class="count" id="files-count">0</span>
+    </div>
+  </div>
+  <div id="file-list">
+    <div id="rows"></div>
+    <div id="empty-state" class="state visible">Loading…</div>
+    <div id="error-state" class="state">Commit details are unavailable for this commit.</div>
+  </div>
+  <script type="module" src="./commitDetail.js"></script>
+</body>
+</html>

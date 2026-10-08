@@ -1,5 +1,6 @@
 /**
- * Webview build: webview/{graph,commit}.html (+ JS) -> out/webview/.
+ * Webview build: webview/{graph,commit,commitDetail}.html (+ JS) ->
+ * out/webview/.
  * assetsInlineLimit: 0 is critical — VS Code webview CSP forbids inlined
  * scripts, so JS must stay an external file referenced by src.
  */
@@ -24,6 +25,7 @@ export default defineConfig({
       input: {
         graph: path.join(webviewRoot, 'graph.html'),
         commit: path.join(webviewRoot, 'commit.html'),
+        commitDetail: path.join(webviewRoot, 'commitDetail.html'),
       },
     },
   },
