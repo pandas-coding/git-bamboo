@@ -79,8 +79,8 @@ idea 将 commit 详情视图明确归 B 期。phase 2 已把 graph 右键菜单�
 
 - [x] 引擎 `getCommitDetail` 测试全绿（多行 message、merge、root、rename、非法 SHA）
 - [x] `tsc --noEmit` 与 `npm run compile` 零错误
-- [x] graph 单击提交打开详情 panel（ready 握手后一次性数据推送）—已实现，待 F5 冒烟确认
-- [x] 文件行 Open Changes 产生正确 diff（含 root/add/rename 边界、无 FileNotFound 报错）—已实现，待 F5 冒烟确认
+- [x] graph 单击提交打开详情 panel（ready 握手后一次性数据推送）
+- [x] 文件行 Open Changes 产生正确 diff（含 root/add/rename 边界、无 FileNotFound 报错）
 - [x] ref 注入 diff Uri 前经 host 校验，webview 无法伪造 revision（入站只传 path，SHA 由 host 持有）
 - [x] webview panel 宿主代码无 >10 行复制粘贴（共享抽取完成：buildWebviewHtml 直接复用、COMMIT_ID_RE 抽至 util.ts）
 
