@@ -7,7 +7,7 @@
  * (notification). Pure Node — no vscode dependency, easy to unit test.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { GetHeadResult, Ref } from './types';
+import type { CommitDetail, CommitFile, GetHeadResult, Ref } from './types';
 
 /** Error carrying the engine's JSON-RPC error code (e.g. -32007 UNDO_BLOCKED). */
 export class RpcError extends Error {
@@ -153,6 +153,22 @@ export class EngineClient {
   }
 
   /**
+   * Engine RPC `getCommitDetail`: full metadata plus per-file stat for one
+   * commit. Resolves null when the response is malformed or references a
+   * missing/invalid commit, so callers can show an error surface instead of
+   * a half-populated commit view.
+   */
+  async getCommitDetail(id: string): Promise<CommitDetail | null> {
+    let result: unknown;
+    try {
+      result = await this.request<unknown>('getCommitDetail', { id }, 15_000);
+    } catch {
+      return null; // engine error (e.g. unknown commit): treat as unavailable
+    }
+    return isValidCommitDetail(result) ? result : null;
+  }
+
+  /**
    * Engine RPC `discard`: restore tracked paths from the index and delete
    * untracked-only paths. Irreversible by design — callers must show the
    * IRREVERSIBLE confirmation dialog before invoking this.
@@ -261,3 +277,39 @@ export class EngineClient {
     this.pending.clear();
   }
 }
+
+/** Field-by-field guard for the `getCommitDetail` result: one wrong type
+ *  (e.g. `files` not an array) makes the whole commit view unreliable, so
+ *  callers get null rather than a partially valid object. */
+function isValidCommitDetail(value: unknown): value is CommitDetail {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.id === 'string' &&
+    typeof v.message === 'string' &&
+    typeof v.author_name === 'string' &&
+    typeof v.author_email === 'string' &&
+    typeof v.author_time === 'number' &&
+    typeof v.committer_name === 'string' &&
+    typeof v.committer_email === 'string' &&
+    typeof v.committer_time === 'number' &&
+    Array.isArray(v.parent_ids) &&
+    v.parent_ids.every((p) => typeof p === 'string') &&
+    Array.isArray(v.files) &&
+    v.files.every(isValidCommitFile)
+  );
+}
+
+function isValidCommitFile(value: unknown): value is CommitFile {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  const status = v.status;
+  return (
+    typeof v.path === 'string' &&
+    (typeof v.old_path === 'string' || v.old_path === null) &&
+    (status === 'A' || status === 'D' || status === 'M' || status === 'R' || status === 'C' || status === 'T') &&
+    typeof v.additions === 'number' &&
+    typeof v.deletions === 'number'
+  );
+}
+

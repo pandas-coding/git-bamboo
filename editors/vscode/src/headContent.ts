@@ -1,8 +1,9 @@
 /**
- * HEAD-revision diff infrastructure (extracted from the old scmProvider):
- * the ENGINE_SCHEME TextDocumentContentProvider that serves blob content
- * at HEAD for vscode.diff side-by-sides, plus openResource and repo-path
- * validation helpers.
+ * Revision-content diff infrastructure (extracted from the old scmProvider):
+ * the ENGINE_SCHEME TextDocumentContentProvider that serves blob content at
+ * any validated revision (HEAD, a full commit sha, or the synthetic empty
+ * revision) for vscode.diff side-by-sides, plus openResource, commitRevisionUri
+ * and repo-path validation helpers.
  */
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -10,13 +11,20 @@ import { EngineClient } from './engineClient';
 
 export const ENGINE_SCHEME = 'git-bamboo';
 
+/** Sentinel revision for the empty left side of a diff (added files, root
+ *  commits): the provider resolves '' for it without an engine call. Distinct
+ *  from any real git revision, so it can never collide with a sha or 'HEAD'. */
+export const EMPTY_REVISION = 'empty';
+
+const FULL_SHA_RE = /^[0-9a-f]{40,64}$/;
+
 export class HeadContentProvider implements vscode.Disposable {
   private readonly registration: vscode.Disposable;
 
   constructor(private readonly client: EngineClient, private readonly root: vscode.Uri) {
-    // HEAD revision content for diffs: "git-bamboo:/abs/path" URIs.
+    // Revision content for diffs: "git-bamboo:/abs/path?ref" URIs.
     const contentProvider: vscode.TextDocumentContentProvider = {
-      provideTextDocumentContent: (uri) => this.readHeadRevision(uri),
+      provideTextDocumentContent: (uri) => this.readRevisionContent(uri),
     };
     this.registration = vscode.workspace.registerTextDocumentContentProvider(ENGINE_SCHEME, contentProvider);
   }
@@ -25,16 +33,53 @@ export class HeadContentProvider implements vscode.Disposable {
     this.registration.dispose();
   }
 
-  /** Engine `getBlob` RPC: HEAD-revision content for diff side-by-sides. */
-  private async readHeadRevision(uri: vscode.Uri): Promise<string> {
+  /** Engine `getBlob` RPC: blob content at the revision named by the URI's
+   *  query, for diff side-by-sides. */
+  private async readRevisionContent(uri: vscode.Uri): Promise<string> {
     const relativePath = toRelativePath(this.root, uri);
+    const revision = parseRevisionQuery(uri.query);
+    // Both the synthetic empty revision and untrusted queries resolve to the
+    // empty diff side — the former by design, the latter without an engine call.
+    if (revision === null || revision === '') return '';
     try {
-      return await this.client.getBlob('HEAD', relativePath);
+      return await this.client.getBlob(revision, relativePath);
     } catch (err) {
-      console.error(`[git-bamboo] getBlob HEAD:${relativePath} failed:`, err);
+      console.error(`[git-bamboo] getBlob ${revision}:${relativePath} failed:`, err);
       return ''; // empty diff side, like the old git-CLI fallback
     }
   }
+}
+
+/**
+ * Validate the revision in a git-bamboo: URI's query. The provider is a
+ * trust boundary — a user can open a crafted git-bamboo: URI, so anything
+ * that isn't a known token or a full commit sha is rejected rather than
+ * forwarded to the engine.
+ *
+ * Returns the revision string to fetch: 'HEAD' (empty query keeps the
+ * old "git-bamboo:/abs/path?HEAD" URIs working, and 'HEAD' itself is
+ * allowed), '' for EMPTY_REVISION (caller serves empty content without an
+ * engine call), or a full commit sha. Returns null when the query is
+ * untrusted — the caller resolves '' rather than calling the engine.
+ */
+function parseRevisionQuery(query: string): string | null {
+  if (query === '') return 'HEAD'; // backward compat with query-less URIs
+  if (query === 'HEAD') return 'HEAD';
+  if (query === EMPTY_REVISION) return '';
+  if (FULL_SHA_RE.test(query)) return query;
+  console.error(`[git-bamboo] refusing untrusted revision in URI query: ${query}`);
+  return null;
+}
+
+/**
+ * Build a git-bamboo: URI serving `relativePath` at `ref` (a full commit sha,
+ * 'HEAD', or EMPTY_REVISION) for diff side-by-sides. The path is validated
+ * the same way openResource does, because callers reach this with data
+ * originating from webview postMessages.
+ */
+export function commitRevisionUri(root: vscode.Uri, relativePath: string, ref: string): vscode.Uri {
+  const uri = resolveRepoPath(root, relativePath);
+  return uri.with({ scheme: ENGINE_SCHEME, query: ref });
 }
 
 /**
