@@ -12,6 +12,8 @@
  *             { type: 'committed' }      — clear the message box
  */
 
+import { iconSvg } from './icons.js';
+
 const vscode = acquireVsCodeApi();
 
 /** @typedef {{ path: string, status: string, old_path?: string, staged: boolean }} StatusItem */
@@ -33,26 +35,6 @@ const STATUS_LETTER = {
   deleted: 'D',
   conflict: 'U',
 };
-
-/** Inline SVG icon bodies (16x16 viewBox, stroke = currentColor) —
- *  codicon-style replacements for the old text symbols (+, −, ⇄).
- *  Fully static markup, so safe under the webview CSP. */
-const ICONS = {
-  stage: '<path d="M8 3.25v9.5M3.25 8h9.5"/>',
-  unstage: '<path d="M3.25 8h9.5"/>',
-  openChanges:
-    '<path d="M2.75 5.25h9.5M9.75 3l2.5 2.25-2.5 2.25"/>' +
-    '<path d="M13.25 10.75h-9.5M6.25 8.5l-2.5 2.25 2.5 2.25"/>',
-};
-
-/** Wraps an ICONS body in the shared 16x16 stroke SVG element markup. */
-function iconSvg(name) {
-  return (
-    `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" ` +
-    `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
-    `stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`
-  );
-}
 
 const els = {
   message: document.getElementById('commit-message'),

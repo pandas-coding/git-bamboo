@@ -8,6 +8,7 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
+import { COMMIT_ID_RE } from './util';
 
 export const ENGINE_SCHEME = 'git-bamboo';
 
@@ -15,8 +16,6 @@ export const ENGINE_SCHEME = 'git-bamboo';
  *  commits): the provider resolves '' for it without an engine call. Distinct
  *  from any real git revision, so it can never collide with a sha or 'HEAD'. */
 export const EMPTY_REVISION = 'empty';
-
-const FULL_SHA_RE = /^[0-9a-f]{40,64}$/;
 
 export class HeadContentProvider implements vscode.Disposable {
   private readonly registration: vscode.Disposable;
@@ -37,6 +36,13 @@ export class HeadContentProvider implements vscode.Disposable {
    *  query, for diff side-by-sides. */
   private async readRevisionContent(uri: vscode.Uri): Promise<string> {
     const relativePath = toRelativePath(this.root, uri);
+    // The provider is a trust boundary in both directions: like the
+    // build side (commitRevisionUri), inbound paths that could escape the
+    // repository are refused before reaching the engine.
+    if (!isValidRepoPath(relativePath)) {
+      console.error(`[git-bamboo] refusing untrusted path in URI: ${uri.toString(true)}`);
+      return '';
+    }
     const revision = parseRevisionQuery(uri.query);
     // Both the synthetic empty revision and untrusted queries resolve to the
     // empty diff side — the former by design, the latter without an engine call.
@@ -56,17 +62,15 @@ export class HeadContentProvider implements vscode.Disposable {
  * that isn't a known token or a full commit sha is rejected rather than
  * forwarded to the engine.
  *
- * Returns the revision string to fetch: 'HEAD' (empty query keeps the
- * old "git-bamboo:/abs/path?HEAD" URIs working, and 'HEAD' itself is
- * allowed), '' for EMPTY_REVISION (caller serves empty content without an
- * engine call), or a full commit sha. Returns null when the query is
- * untrusted — the caller resolves '' rather than calling the engine.
+ * Returns the revision string to fetch: 'HEAD', '' for EMPTY_REVISION
+ * (caller serves empty content without an engine call), or a full commit
+ * sha. Returns null when the query is untrusted — the caller resolves ''
+ * rather than calling the engine.
  */
 function parseRevisionQuery(query: string): string | null {
-  if (query === '') return 'HEAD'; // backward compat with query-less URIs
   if (query === 'HEAD') return 'HEAD';
   if (query === EMPTY_REVISION) return '';
-  if (FULL_SHA_RE.test(query)) return query;
+  if (COMMIT_ID_RE.test(query)) return query;
   console.error(`[git-bamboo] refusing untrusted revision in URI query: ${query}`);
   return null;
 }

@@ -569,24 +569,36 @@ pub fn read_commit_detail(
         .into());
     }
 
-    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+    // Repo data is extracted under a scoped lock: the guard is released
+    // before the `git diff-tree` subprocesses below run, so concurrent
+    // readers (getGraph/getStatus/getRefs) are not serialized behind
+    // process spawns.
+    let (message, author, committer, parent_ids, detail_id) = {
+        let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
 
-    let oid = repo
-        .rev_parse_single(id.as_bytes())
-        .map_err(|e| anyhow::anyhow!("commit {id} not found: {e}"))?;
-    let commit = oid
-        .object()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .peel_to_commit()
-        .map_err(|e| anyhow::anyhow!("{id} is not a commit: {e}"))?;
-    let commit_ref = commit.decode()?;
+        let oid = repo
+            .rev_parse_single(id.as_bytes())
+            .map_err(|_| BambooError::git_error(format!("commit {id} not found")))?;
+        let commit = oid
+            .object()
+            .map_err(|_| BambooError::git_error(format!("commit {id} not found")))?
+            .peel_to_commit()
+            .map_err(|_| BambooError::git_error(format!("{id} is not a commit")))?;
+        let commit_ref = commit.decode()?;
 
-    let message = String::from_utf8_lossy(commit_ref.message).into_owned();
-    let author = commit_ref.author()?;
-    let committer = commit_ref.committer()?;
-    let parent_ids: Vec<String> = commit_ref.parents().map(|p| p.to_string()).collect();
-    let detail_id = commit.id.to_string();
-    drop(commit_ref);
+        // Owned copies: the borrowed signature refs die with the lock
+        // guard above.
+        (
+            String::from_utf8_lossy(commit_ref.message).into_owned(),
+            owned_signature(commit_ref.author()?),
+            owned_signature(commit_ref.committer()?),
+            commit_ref
+                .parents()
+                .map(|p| p.to_string())
+                .collect::<Vec<String>>(),
+            commit.id.to_string(),
+        )
+    };
 
     // First parent (or the empty tree for root commits) is the diff
     // baseline. Both args are host/engine-validated hex oids, and argv is
@@ -600,15 +612,24 @@ pub fn read_commit_detail(
     Ok(bamboo_protocol::CommitDetail {
         id: detail_id,
         message,
-        author_name: String::from_utf8_lossy(author.name.as_ref()).into_owned(),
-        author_email: String::from_utf8_lossy(author.email.as_ref()).into_owned(),
-        author_time: author.time().map(|t| t.seconds).unwrap_or(0),
-        committer_name: String::from_utf8_lossy(committer.name.as_ref()).into_owned(),
-        committer_email: String::from_utf8_lossy(committer.email.as_ref()).into_owned(),
-        committer_time: committer.time().map(|t| t.seconds).unwrap_or(0),
+        author_name: author.0,
+        author_email: author.1,
+        author_time: author.2,
+        committer_name: committer.0,
+        committer_email: committer.1,
+        committer_time: committer.2,
         parent_ids,
         files,
     })
+}
+
+/// Owned (name, email, unix-seconds) copy of a decoded git signature.
+fn owned_signature(sig: gix::actor::SignatureRef<'_>) -> (String, String, i64) {
+    (
+        String::from_utf8_lossy(sig.name.as_ref()).into_owned(),
+        String::from_utf8_lossy(sig.email.as_ref()).into_owned(),
+        sig.time().map(|t| t.seconds).unwrap_or(0),
+    )
 }
 
 /// Run `git diff-tree` twice against `base..id` (once for `--name-status`,
@@ -634,10 +655,16 @@ fn diff_tree_files(
             .current_dir(repo_path)
             .output()?;
         if !out.status.success() {
-            anyhow::bail!(
-                "git diff-tree failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+            // Raw git diagnostics stay engine-side (log only): the client
+            // gets a generic error, so subprocess stderr never reaches the
+            // RPC error surface.
+            warn!(
+                base,
+                id,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "git diff-tree failed"
             );
+            return Err(BambooError::git_error("commit diff unavailable").into());
         }
         Ok(String::from_utf8_lossy(&out.stdout)
             .split('\0')

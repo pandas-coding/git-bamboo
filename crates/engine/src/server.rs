@@ -375,10 +375,9 @@ impl BambooServer {
     ) -> Result<Value, BambooError> {
         match method {
             "getRefs" => {
-                let refs =
-                    spawn_blocking_read(session, |session| crate::gix_read::read_refs(session))
-                        .await
-                        .map_err(|e| BambooError::git_error(e.to_string()))?;
+                let refs = spawn_blocking_read(session, crate::gix_read::read_refs)
+                    .await
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&refs)
             }
             "getBlob" => {

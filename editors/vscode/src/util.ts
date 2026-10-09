@@ -2,8 +2,9 @@
 
 /** Full commit ids as the engine reports them (SHA-1: 40 hex, SHA-256: 64).
  *  Shared by host modules that validate commit ids before use — webview-
- *  supplied ids are untrusted. */
-export const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/i;
+ *  supplied ids are untrusted. Lowercase hex only, mirroring the engine's
+ *  `is_valid_commit_id` (the engine never reports uppercase ids). */
+export const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/;
 
 export function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;

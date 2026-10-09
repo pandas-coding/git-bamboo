@@ -11,7 +11,7 @@ import { EngineClient, RpcError } from './engineClient';
 import { openCommitDetailPanel } from './commitDetail';
 import { createContextTargetSlot } from './contextTargetSlot';
 import type { GraphPage, RepoState } from './types';
-import { errorMessage } from './util';
+import { COMMIT_ID_RE, errorMessage } from './util';
 
 /** JSON-RPC error code the engine returns when the client's epoch is stale. */
 const EPOCH_MISMATCH = -32004;
@@ -23,9 +23,6 @@ const VIEWPORT_DEBOUNCE_MS = 16;
  *  can validate webview-supplied widths before persisting them. */
 const GRAPH_MIN_WIDTH = 44;
 const GRAPH_MAX_WIDTH = 240;
-
-/** Full commit ids as the engine reports them (SHA-1: 40 hex, SHA-256: 64). */
-const COMMIT_ID_RE = /^[0-9a-f]{40,64}$/i;
 
 interface GraphViewMessage {
   type?: string;

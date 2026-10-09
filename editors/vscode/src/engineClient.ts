@@ -162,7 +162,8 @@ export class EngineClient {
     let result: unknown;
     try {
       result = await this.request<unknown>('getCommitDetail', { id }, 15_000);
-    } catch {
+    } catch (err) {
+      console.error(`[git-bamboo] getCommitDetail ${id} failed:`, err);
       return null; // engine error (e.g. unknown commit): treat as unavailable
     }
     return isValidCommitDetail(result) ? result : null;

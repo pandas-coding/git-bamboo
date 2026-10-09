@@ -1,3 +1,5 @@
+import type { Uri } from 'vscode';
+
 /**
  * Shared protocol types mirroring crates/protocol (JSON-RPC 2.0 over stdio).
  * Field names are snake_case to match the engine wire format exactly.
@@ -104,8 +106,6 @@ export interface InitializeResult {
   epoch: number;
   capabilities: Record<string, unknown>;
 }
-
-import type { Uri } from 'vscode';
 
 /** Mutable per-repo state shared between the extension host components. */
 export interface RepoState {
