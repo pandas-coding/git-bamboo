@@ -2,6 +2,14 @@ name: Release
 
 # Packages platform-specific VSIX bundles. Triggered by version tags
 # (e.g. v0.1.0) so everyday pushes to main do not pay the packaging cost.
+# The tag is published as a GitHub Release with the VSIX files attached.
+#
+# Visual Studio Marketplace publishing is manual. Automated publish needs
+# an Entra tenant (or an Azure account to create one); this repo does not
+# have one. After the Release succeeds, download the three VSIX assets and
+# upload each on https://marketplace.visualstudio.com/manage — the version
+# comes from editors/vscode/package.json, and must increase every publish.
+# Users can also install a platform VSIX directly from the Release.
 on:
   push:
     tags: ['v*']
@@ -36,7 +44,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Install Extension Dependencies
         # Pinned @vscode/vsce from package-lock.json — no global installs.
         working-directory: editors/vscode
@@ -61,3 +69,36 @@ jobs:
         with:
           name: git-bamboo-${{ matrix.vscode_target }}.vsix
           path: editors/vscode/*.vsix
+
+  github-release:
+    name: GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download VSIX artifacts
+        # gh is preinstalled on GitHub-hosted runners and authenticates with
+        # GITHUB_TOKEN, so no third-party download action (and no extra
+        # pinned SHA) is needed. Each artifact unpacks into dist/<artifact>/.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh run download "$GITHUB_RUN_ID" --dir dist
+          find dist -name '*.vsix' -print
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*/*.vsix)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no VSIX artifacts found" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-release-notes
+          echo "Marketplace publish is manual: upload these VSIX files at"
+          echo "https://marketplace.visualstudio.com/manage"
