@@ -11,7 +11,9 @@
     "type": "git",
     "url": "https://github.com/pandas-coding/git-bamboo"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "icon": "media/icon.png",
   "activationEvents": [
     "onStartupFinished"
@@ -329,7 +331,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
-    "@vscode/vsce": "^2.22.0",
+    "@vscode/vsce": "^4.0.0",
     "typescript": "^5.4.0",
     "vite": "^8.0.0"
   }
