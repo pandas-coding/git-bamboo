@@ -4,12 +4,12 @@ name: Release
 # (e.g. v0.1.0) so everyday pushes to main do not pay the packaging cost.
 # The tag is published as a GitHub Release with the VSIX files attached.
 #
-# Visual Studio Marketplace publishing is manual. Automated publish needs
-# an Entra tenant (or an Azure account to create one); this repo does not
-# have one. After the Release succeeds, download the three VSIX assets and
-# upload each on https://marketplace.visualstudio.com/manage — the version
-# comes from editors/vscode/package.json, and must increase every publish.
-# Users can also install a platform VSIX directly from the Release.
+# GitHub Release is the publish channel. Each asset is a platform VSIX
+# (`vsce package --target`); install with "Extensions: Install from VSIX...".
+# Marketplace listing under name "git-bamboo" is reserved, so do not upload
+# these files via New extension until the package.json name is changed.
+# The version comes from editors/vscode/package.json and must increase
+# every publish.
 on:
   push:
     tags: ['v*']
@@ -99,8 +99,30 @@ jobs:
             echo "no VSIX artifacts found" >&2
             exit 1
           fi
+          notes="$(mktemp)"
+          {
+            echo "Install with **Extensions: Install from VSIX...** and pick the asset for your OS."
+            echo
+            echo "Each file is platform-specific (\`TargetPlatform\` is set). Do not install a VSIX built without \`--target\`."
+            echo
+            echo "| File | Platform |"
+            echo "| --- | --- |"
+            for f in "${files[@]}"; do
+              base="$(basename "$f")"
+              case "$base" in
+                *win32-x64*) plat="Windows x64" ;;
+                *win32-arm64*) plat="Windows ARM64" ;;
+                *darwin-arm64*) plat="macOS Apple Silicon" ;;
+                *darwin-x64*) plat="macOS Intel" ;;
+                *linux-x64*) plat="Linux x64" ;;
+                *linux-arm64*) plat="Linux ARM64" ;;
+                *) plat="see filename" ;;
+              esac
+              echo "| \`$base\` | $plat |"
+            done
+            echo
+            echo "Marketplace name \`git-bamboo\` is already reserved, so this Release is the publish channel."
+          } > "$notes"
           gh release create "$GITHUB_REF_NAME" "${files[@]}" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes
-          echo "Marketplace publish is manual: upload these VSIX files at"
-          echo "https://marketplace.visualstudio.com/manage"
+            --notes-file "$notes"

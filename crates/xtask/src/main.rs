@@ -3,7 +3,8 @@
 //!
 //! Usage (via the alias in .cargo/config.toml):
 //!   cargo xtask vsix    — build the engine + extension and package a
-//!                         current-platform VSIX for local install/testing
+//!                         current-platform VSIX (`vsce --target`) for local
+//!                         install/testing. Never produces a universal VSIX.
 //!   cargo xtask help    — list tasks
 //!
 //! Multi-platform release packaging stays in scripts/package-all.sh;
@@ -40,9 +41,9 @@ fn print_help() {
 
 Tasks:
   vsix    Build the engine (release) and the extension, then package a
-          VSIX for the current platform into editors/vscode/ (for local
-          install & testing). Multi-platform release builds remain
-          scripts/package-all.sh.
+          platform-specific VSIX (`--target` = host) into editors/vscode/
+          (for local install & testing). Multi-platform release builds
+          remain scripts/package-all.sh.
   help    Show this message."
     );
 }
@@ -82,13 +83,16 @@ fn package_vsix() -> Result<(), String> {
         )
     })?;
 
-    // vsce package (via npm run package so the vsce invocation stays
-    // defined in one place, package.json). Any stale VSIX in the tree is
-    // already excluded from the new package via .vscodeignore.
+    // Always pass --target. A VSIX without TargetPlatform is a universal
+    // fallback; Marketplace will not treat it as an OS-specific package.
+    let target = vscode_target()?;
     let status = run_capture(
         Command::new("npm")
             .arg("run")
             .arg("package")
+            .arg("--")
+            .arg("--target")
+            .arg(target)
             .current_dir(&ext_dir),
     )?;
     let _ = status; // vsce output already printed by run_capture
@@ -98,9 +102,24 @@ fn package_vsix() -> Result<(), String> {
     fs::remove_file(&server_bin).map_err(|e| format!("clean up {e}"))?;
 
     let version = read_version(&ext_dir)?;
-    let vsix = ext_dir.join(format!("git-bamboo-{version}.vsix"));
+    let name = read_json_string(&ext_dir, "name")?;
+    let vsix = ext_dir.join(format!("{name}-{target}-{version}.vsix"));
     println!("\n==> VSIX ready: {}", vsix.display());
     Ok(())
+}
+
+fn vscode_target() -> Result<&'static str, String> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux-x64"),
+        ("linux", "aarch64") => Ok("linux-arm64"),
+        ("macos", "x86_64") => Ok("darwin-x64"),
+        ("macos", "aarch64") => Ok("darwin-arm64"),
+        ("windows", "x86_64") => Ok("win32-x64"),
+        ("windows", "aarch64") => Ok("win32-arm64"),
+        (os, arch) => Err(format!(
+            "no VS Code target for {os}/{arch}; package that platform from CI"
+        )),
+    }
 }
 
 fn run(command: &mut Command) -> Result<(), String> {
@@ -146,16 +165,20 @@ fn workspace_root() -> Result<PathBuf, String> {
 }
 
 fn read_version(ext_dir: &Path) -> Result<String, String> {
+    read_json_string(ext_dir, "version")
+}
+
+fn read_json_string(ext_dir: &Path, field: &str) -> Result<String, String> {
     let pkg = fs::read_to_string(ext_dir.join("package.json"))
         .map_err(|e| format!("read package.json: {e}"))?;
-    // Minimal JSON scrape — xtask stays dependency-free, and the version
-    // is a flat "version": "x.y.z" field we control.
-    let marker = "\"version\":";
+    // Minimal JSON scrape — xtask stays dependency-free, and these are
+    // flat string fields we control.
+    let marker = format!("\"{field}\":");
     let idx = pkg
-        .find(marker)
-        .ok_or("version field missing in package.json")?;
+        .find(&marker)
+        .ok_or_else(|| format!("{field} field missing in package.json"))?;
     let rest = &pkg[idx + marker.len()..];
-    let start = rest.find('"').ok_or("version value malformed")? + 1;
-    let end = start + rest[start..].find('"').ok_or("version value malformed")?;
+    let start = rest.find('"').ok_or("json string value malformed")? + 1;
+    let end = start + rest[start..].find('"').ok_or("json string value malformed")?;
     Ok(rest[start..end].to_string())
 }

@@ -6,6 +6,7 @@ vite.config.ts
 vite.webview.config.ts
 tsconfig.json
 build.js
+package-platform.js
 .vscodeignore
 **/.gitignore
 *.vsix

@@ -2,7 +2,7 @@
   "name": "git-bamboo",
   "displayName": "Git Bamboo",
   "description": "High-performance git workbench with virtual-scrolled commit graph and undo engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "pandas-coding",
   "engines": {
     "vscode": "^1.90.0"
@@ -325,7 +325,7 @@
     "watch": "node build.js --watch",
     "build": "node build.js",
     "typecheck": "tsc --noEmit",
-    "package": "vsce package",
+    "package": "node package-platform.js",
     "package-all": "bash ../../scripts/package-all.sh"
   },
   "devDependencies": {
