@@ -83,6 +83,7 @@ jobs:
         # pinned SHA) is needed. Each artifact unpacks into dist/<artifact>/.
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p dist
           gh run download "$GITHUB_RUN_ID" --dir dist
@@ -90,6 +91,7 @@ jobs:
       - name: Create Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           shopt -s nullglob
           files=(dist/*/*.vsix)
