@@ -43,7 +43,7 @@ for entry in "${TARGETS[@]}"; do
      "$EXT_DIR/server/$ENGINE_NAME$SUFFIX"
 
   (cd "$EXT_DIR" && npm run package -- --target "$VSCE_TARGET" \
-     -o "$OUT_DIR/git-bamboo-$VERSION-$VSCE_TARGET.vsix")
+     -o "$OUT_DIR/bamboo-git-$VERSION-$VSCE_TARGET.vsix")
 
   # Remove the binary so a later iteration can never package a stale
   # platform build.

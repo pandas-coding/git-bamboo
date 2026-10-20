@@ -18,9 +18,9 @@ A fast, native Git integration for Visual Studio Code, powered by a Rust engine.
 
 Each GitHub Release attaches one VSIX per platform (`TargetPlatform` is inside the package). Install with **Extensions: Install from VSIX...** and pick the file for your OS:
 
-- Windows x64: `git-bamboo-win32-x64-<version>.vsix`
-- macOS Apple Silicon: `git-bamboo-darwin-arm64-<version>.vsix`
-- Linux x64: `git-bamboo-linux-x64-<version>.vsix`
+- Windows x64: `bamboo-git-win32-x64-<version>.vsix`
+- macOS Apple Silicon: `bamboo-git-darwin-arm64-<version>.vsix`
+- Linux x64: `bamboo-git-linux-x64-<version>.vsix`
 
 ## Usage
 

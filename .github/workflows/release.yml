@@ -4,10 +4,11 @@ name: Release
 # (e.g. v0.1.0) so everyday pushes to main do not pay the packaging cost.
 # The tag is published as a GitHub Release with the VSIX files attached.
 #
-# GitHub Release is the publish channel. Each asset is a platform VSIX
-# (`vsce package --target`); install with "Extensions: Install from VSIX...".
-# Marketplace listing under name "git-bamboo" is reserved, so do not upload
-# these files via New extension until the package.json name is changed.
+# GitHub Release attaches one VSIX per platform (`vsce package --target`).
+# Marketplace publish is not done here: it needs a PAT, and only the first
+# platform may be created as a new extension. Later platforms of the same
+# version must be published with `vsce publish --packagePath` (Update).
+# The extension id is pandas-coding.bamboo-git (name "git-bamboo" is reserved).
 # The version comes from editors/vscode/package.json and must increase
 # every publish.
 on:
@@ -67,7 +68,7 @@ jobs:
       - name: Upload VSIX
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: git-bamboo-${{ matrix.vscode_target }}.vsix
+          name: bamboo-git-${{ matrix.vscode_target }}.vsix
           path: editors/vscode/*.vsix
 
   github-release:
@@ -121,7 +122,7 @@ jobs:
               echo "| \`$base\` | $plat |"
             done
             echo
-            echo "Marketplace name \`git-bamboo\` is already reserved, so this Release is the publish channel."
+            echo "Marketplace id is \`pandas-coding.bamboo-git\`. Upload the first VSIX with New extension, then publish the other platforms of this same version with Update / \`vsce publish --packagePath\`. Do not use New extension for the second file."
           } > "$notes"
           gh release create "$GITHUB_REF_NAME" "${files[@]}" \
             --title "$GITHUB_REF_NAME" \
