@@ -23,6 +23,11 @@ fn test_repo() -> anyhow::Result<tempfile::TempDir> {
     };
 
     git(&["init", "-q", "-b", "main"])?;
+    // Windows git defaults to core.autocrlf=true, which would rewrite LF to
+    // CRLF on every `git checkout` the discard tests perform — making the
+    // restored content platform-dependent. Pin the repo to no conversion
+    // so the tests assert byte-identical content everywhere.
+    git(&["config", "core.autocrlf", "false"])?;
     // Use distinct, increasing commit timestamps so newest-first ordering is deterministic.
     let commit_at = |msg: &str, date: &str| -> anyhow::Result<()> {
         let out = Command::new("git")
@@ -976,17 +981,21 @@ async fn discard_treats_glob_named_paths_literally() -> anyhow::Result<()> {
 
     // A file literally named with a glob metacharacter must be discarded
     // as that exact file — never re-interpreted as a glob matching the
-    // sibling.
-    std::fs::write(dir.path().join("g*.txt"), "star\n")?;
+    // sibling. Brackets are used instead of `*`/`?` because those are
+    // reserved characters in Windows filenames (os error 123) and this
+    // test must run on the Windows CI matrix; `g[1].txt` as a glob would
+    // still match the sibling `g1.txt`, so the literal-only guarantee is
+    // exercised just the same.
+    std::fs::write(dir.path().join("g[1].txt"), "bracket\n")?;
     std::fs::write(dir.path().join("g1.txt"), "one\n")?;
 
     session
         .enqueue_write(bamboo_engine::write_queue::WriteCommand::Discard {
-            paths: vec!["g*.txt".to_string()],
+            paths: vec!["g[1].txt".to_string()],
         })
         .await?;
 
-    assert!(!dir.path().join("g*.txt").exists());
+    assert!(!dir.path().join("g[1].txt").exists());
     assert!(dir.path().join("g1.txt").exists(), "sibling must survive");
     Ok(())
 }
