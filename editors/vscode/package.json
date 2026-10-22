@@ -2,7 +2,7 @@
   "name": "bamboo-git",
   "displayName": "Bamboo Git",
   "description": "High-performance git workbench with virtual-scrolled commit graph and undo engine",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "pandas-coding",
   "engines": {
     "vscode": "^1.90.0"

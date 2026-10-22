@@ -111,6 +111,40 @@ async fn graph_page_reads_commits() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn graph_page_survives_annotated_tag() -> anyhow::Result<()> {
+    // Regression: annotated tag refs point at tag objects, not commits.
+    // The rev walk (and refs) must peel them, otherwise reading the graph
+    // fails with "Expected object of kind commit but got tag".
+    let dir = test_repo()?;
+    let out = Command::new("git")
+        .args(["tag", "-a", "v1.0", "-m", "release 1.0"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let session = open_session(&dir).await?;
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 10,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
+    assert_eq!(page.commits.len(), 3);
+
+    // The tag ref must peel to the commit it annotates (the newest one),
+    // so the webview can key its tag chip by commit id.
+    let refs = bamboo_engine::gix_read::read_refs(&session)?;
+    let tag = refs
+        .iter()
+        .find(|r| r.kind == bamboo_protocol::RefKind::Tag && r.name == "v1.0")
+        .expect("v1.0 tag ref should be listed");
+    assert_eq!(tag.target, page.commits[0].id);
+    assert!(page.commits.iter().any(|c| c.id == tag.target));
+    Ok(())
+}
+
+#[tokio::test]
 async fn graph_page_epoch_mismatch() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;

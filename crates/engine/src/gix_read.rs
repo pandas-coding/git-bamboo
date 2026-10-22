@@ -26,16 +26,34 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
     // Invalidate lane cache if epoch changed.
     let _ = cache.invalidate_on_epoch_change(current_epoch)?;
 
-    // Collect all ref targets plus HEAD as tips.
+    // Collect all ref targets plus HEAD as tips. Refs that point at
+    // annotated tags (refs/tags/*) hold a *tag object* id, and the rev walk
+    // does not peel tips itself — feeding it a tag id fails with "Expected
+    // object of kind commit but got tag". Peel every ref to the commit it
+    // ultimately references instead; refs that don't resolve to a commit
+    // (e.g. refs/notes trees) are skipped rather than failing the page.
     let mut tips = Vec::new();
     for reference in repo.references()?.all()? {
-        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(id) = reference.target().try_id() {
-            tips.push(id.to_owned());
+        let mut reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+        match reference.peel_to_commit() {
+            Ok(commit) => {
+                if !tips.contains(&commit.id) {
+                    tips.push(commit.id);
+                }
+            }
+            Err(err) => {
+                debug!(
+                    reference = %reference.name().as_bstr(),
+                    error = %err,
+                    "skipping ref tip that does not resolve to a commit"
+                );
+            }
         }
     }
     if let Ok(head_commit) = repo.head_commit() {
-        tips.push(head_commit.id);
+        if !tips.contains(&head_commit.id) {
+            tips.push(head_commit.id);
+        }
     }
 
     if tips.is_empty() {
@@ -449,13 +467,20 @@ pub fn read_refs(session: &Session) -> anyhow::Result<Vec<Ref>> {
     let mut refs = Vec::new();
 
     for reference in repo.references()?.all()? {
-        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
         let name = reference.name().as_bstr().to_string();
-        let target = reference
-            .target()
-            .try_id()
-            .map(|id| id.to_owned().to_string())
-            .unwrap_or_default();
+        // Peel to the underlying commit: annotated tag refs point at tag
+        // objects, but consumers (graph row chips, branch pickers) key and
+        // match on commit ids. Refs that don't resolve to a commit fall
+        // back to their direct target.
+        let target = match reference.peel_to_commit() {
+            Ok(commit) => commit.id.to_string(),
+            Err(_) => reference
+                .target()
+                .try_id()
+                .map(|id| id.to_owned().to_string())
+                .unwrap_or_default(),
+        };
 
         let (kind, display) = if name.starts_with("refs/tags/") {
             (RefKind::Tag, name.strip_prefix("refs/tags/"))
