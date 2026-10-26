@@ -10,7 +10,7 @@ use bamboo_protocol::{
 
 use crate::cache::CachedCommit;
 use crate::session::Session;
-use crate::write_queue::validate_ref_arg;
+use crate::write_queue::{redact_credentials, validate_ref_arg};
 
 const PRELOAD_MARGIN: u32 = 500;
 
@@ -670,30 +670,32 @@ fn diff_tree_files(
     id: &str,
 ) -> anyhow::Result<Vec<bamboo_protocol::CommitFile>> {
     let run = |format_flag: &str| -> anyhow::Result<Vec<String>> {
-        let out = std::process::Command::new("git")
-            .arg("diff-tree")
-            .arg("--no-commit-id")
-            .arg("-r")
-            .arg("-M")
-            .arg("-z")
-            .arg(format_flag)
-            .arg(base)
-            .arg(id)
-            .current_dir(repo_path)
-            .output()?;
-        if !out.status.success() {
+        let (ok, stdout, stderr) = git_output(
+            repo_path,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "-r",
+                "-M",
+                "-z",
+                format_flag,
+                base,
+                id,
+            ],
+        )?;
+        if !ok {
             // Raw git diagnostics stay engine-side (log only): the client
             // gets a generic error, so subprocess stderr never reaches the
             // RPC error surface.
             warn!(
                 base,
                 id,
-                stderr = %String::from_utf8_lossy(&out.stderr),
+                stderr = %stderr,
                 "git diff-tree failed"
             );
             return Err(BambooError::git_error("commit diff unavailable").into());
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
+        Ok(stdout
             .split('\0')
             .filter(|t| !t.is_empty())
             .map(str::to_string)
@@ -773,19 +775,16 @@ fn parse_numstat_count(s: &str) -> u32 {
 
 /// One stdout line per remote (`git remote`), NUL/newline-free names.
 fn run_git_stdout_lines(repo_path: &std::path::Path, args: &[&str]) -> anyhow::Result<Vec<String>> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()?;
-    if !out.status.success() {
+    let (ok, stdout, stderr) = git_output(repo_path, args)?;
+    if !ok {
         return Err(BambooError::git_error(format!(
             "git {:?} failed: {}",
             args,
-            String::from_utf8_lossy(&out.stderr).trim()
+            redact_credentials(&stderr).trim()
         ))
         .into());
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(stdout
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -795,15 +794,11 @@ fn run_git_stdout_lines(repo_path: &std::path::Path, args: &[&str]) -> anyhow::R
 
 /// Read one git config value (empty/missing → `None`).
 fn read_config(repo_path: &std::path::Path, key: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["config", "--get", key])
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let (ok, stdout, _) = git_output(repo_path, &["config", "--get", key]).ok()?;
+    if !ok {
         return None;
     }
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let v = stdout.trim().to_string();
     if v.is_empty() {
         None
     } else {
@@ -811,9 +806,30 @@ fn read_config(repo_path: &std::path::Path, key: &str) -> Option<String> {
     }
 }
 
+/// Run one git subcommand synchronously (argv only, no paths) and return
+/// (success, stdout, stderr). The single subprocess shape for the
+/// git-shelling read side — non-interactive auth and a closed stdin so
+/// a read can never hang waiting for terminal input.
+fn git_output(repo_path: &std::path::Path, args: &[&str]) -> anyhow::Result<(bool, String, String)> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
 /// `getRemotes`: one entry per configured remote with its fetch URL and
-/// the default flag (the remote named by the `remote.default` git config
-/// when set, else the first remote in list order).
+/// the default flag. The URL is redacted before it leaves the engine:
+/// git remote URLs frequently embed credentials
+/// (`https://user:pat@host/repo.git`), which must never reach the RPC
+/// client. The `default` flag is a bamboo-side convention (see
+/// `RemoteInfo::default`), not a git-honored notion.
 pub fn read_remotes(session: &Session) -> anyhow::Result<Vec<RemoteInfo>> {
     let repo_path = &session.repo_path;
     let names = run_git_stdout_lines(repo_path, &["remote"])?;
@@ -824,7 +840,22 @@ pub fn read_remotes(session: &Session) -> anyhow::Result<Vec<RemoteInfo>> {
 
     let mut remotes = Vec::with_capacity(names.len());
     for (idx, name) in names.iter().enumerate() {
-        let url = read_config(repo_path, &format!("remote.{name}.url"));
+        // `git remote get-url --all <name>` (the name as its own argv
+        // element) instead of building a `remote.<name>.url` config key
+        // — a crafted remote name could otherwise resolve a different
+        // config key. `--all` lists every configured URL; the first is
+        // the fetch URL (insteadOf rewrites applied).
+        let (ok, stdout, _) = git_output(repo_path, &["remote", "get-url", "--all", name])?;
+        let url = if ok {
+            stdout
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(redact_credentials)
+        } else {
+            None
+        };
         // The configured default only counts when it names a real remote;
         // otherwise "default" falls back to the first in list order.
         let is_default = match configured_default.as_deref() {
@@ -854,6 +885,26 @@ pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Re
             // they reach git (gix is not involved here, this is argv).
             validate_ref_arg(b)
                 .map_err(|e| BambooError::invalid_argument(format!("getBranchStatus: {e}")))?;
+            if b == "HEAD" {
+                // The current branch (incl. detached-HEAD detection) is
+                // expressed by `branch: null`; an explicit "HEAD" would
+                // silently resolve against detached HEAD.
+                return Err(BambooError::invalid_argument(
+                    "getBranchStatus: branch must name a local branch; pass branch: null \
+                     for the current branch",
+                )
+                .into());
+            }
+            // An unknown branch must be an explicit INVALID_ARGUMENT, not
+            // an indistinguishable "no upstream, 0/0" result.
+            let (ok, _, _) =
+                git_output(repo_path, &["show-ref", "--verify", &format!("refs/heads/{b}")])?;
+            if !ok {
+                return Err(BambooError::invalid_argument(format!(
+                    "getBranchStatus: branch {b:?} not found"
+                ))
+                .into());
+            }
             b.to_string()
         }
         None => {
@@ -873,16 +924,12 @@ pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Re
     // Upstream: `branch@{upstream}` fails when none is configured → null.
     // (Branch names containing '@' were rejected by validate_ref_arg, so
     // this rev spec cannot be confused with a user-supplied @{...}.)
-    let upstream = std::process::Command::new("git")
-        .args([
-            "rev-parse",
-            "--abbrev-ref",
-            &format!("{branch}@{{upstream}}"),
-        ])
-        .current_dir(repo_path)
-        .output()?;
-    let upstream = if upstream.status.success() {
-        let name = String::from_utf8_lossy(&upstream.stdout).trim().to_string();
+    let (ok, stdout, _) = git_output(
+        repo_path,
+        &["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")],
+    )?;
+    let upstream = if ok {
+        let name = stdout.trim().to_string();
         if name.is_empty() {
             None
         } else {
@@ -898,24 +945,23 @@ pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Re
             // `upstream...branch` symmetric difference: --count prints
             // left (upstream-only = behind) then right (branch-only =
             // ahead).
-            let out = std::process::Command::new("git")
-                .args([
+            let (ok, stdout, stderr) = git_output(
+                repo_path,
+                &[
                     "rev-list",
                     "--left-right",
                     "--count",
                     &format!("{upstream}...{branch}"),
-                ])
-                .current_dir(repo_path)
-                .output()?;
-            if !out.status.success() {
+                ],
+            )?;
+            if !ok {
                 return Err(BambooError::git_error(format!(
                     "git rev-list failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    redact_credentials(&stderr).trim()
                 ))
                 .into());
             }
-            let counts = String::from_utf8_lossy(&out.stdout);
-            let mut parts = counts.split_whitespace();
+            let mut parts = stdout.split_whitespace();
             let behind = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
             let ahead = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
             (ahead, behind)
@@ -933,18 +979,19 @@ pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Re
 /// `stashList`: `git stash list` parsed into entries
 /// (`ref` = reflog selector, `message` = subject, `date` = commit date).
 pub fn read_stash_list(session: &Session) -> anyhow::Result<Vec<StashEntry>> {
-    let out = std::process::Command::new("git")
-        .args(["stash", "list", "--format=%gd\u{1f}%s\u{1f}%ci"])
-        .current_dir(&session.repo_path)
-        .output()?;
-    if !out.status.success() {
+    // `%cI` = strict ISO-8601 commit date (the doc contract on
+    // `StashEntry::date`); `%ci` would print a non-ISO format.
+    let (ok, stdout, stderr) = git_output(
+        &session.repo_path,
+        &["stash", "list", "--format=%gd\u{1f}%s\u{1f}%cI"],
+    )?;
+    if !ok {
         return Err(BambooError::git_error(format!(
             "git stash list failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            redact_credentials(&stderr).trim()
         ))
         .into());
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let mut entries = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();

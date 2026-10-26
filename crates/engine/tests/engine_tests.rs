@@ -1999,8 +1999,17 @@ async fn stash_validates_ref_and_message() -> anyhow::Result<()> {
     let dir = test_repo()?;
     let session = open_session(&dir).await?;
 
-    // Stash refs are limited to the strict stash@{N} form.
-    for bad in ["--evil", "stash@{x}", "stash@{}", "HEAD~1", "stash@{0} extra"] {
+    // Stash refs are limited to the strict stash@{N} form (and a
+    // bounded number of digits — a multi-megabyte digit string must not
+    // flow into the queue/argv).
+    for bad in [
+        "--evil",
+        "stash@{x}",
+        "stash@{}",
+        "HEAD~1",
+        "stash@{0} extra",
+        "stash@{1234567890}",
+    ] {
         let err = match session
             .enqueue_write(WriteCommand::StashPop {
                 stash_ref: Some(bad.to_string()),
@@ -2075,6 +2084,232 @@ async fn legacy_bool_force_parses_as_lease_at_the_engine_boundary() -> anyhow::R
     assert_ne!(
         gitq(work.path(), &["rev-parse", "origin/main"])?.trim(),
         gitq(work.path(), &["rev-parse", "HEAD"])?.trim()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests: review fixes (queue-blocking safeguards, refspec
+// deletion, pull semantics, credential redaction, stash/branch-status
+// validation)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn push_rejects_remote_branch_deletion_refspecs() -> anyhow::Result<()> {
+    let (work, origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    // `:dst` deletes the remote branch and `src:` is a no-op — both would
+    // bypass the ForceMode confirmation tiers entirely (`git push origin
+    // :main` destroys the remote branch with force: "none"), so they are
+    // rejected before git ever runs.
+    for spec in [":refs/heads/main", "refs/heads/main:"] {
+        let err = session
+            .enqueue_write(push_cmd("origin", spec, ForceMode::None, false))
+            .await
+            .expect_err("deletion-shaped refspec must be rejected");
+        assert!(
+            format!("{err}").contains("invalid push refspec"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // The remote branch was untouched.
+    assert!(
+        gitq(origin.path(), &["rev-parse", "--verify", "refs/heads/main"]).is_ok(),
+        "remote branch must survive"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pull_branch_without_remote_is_invalid_argument() -> anyhow::Result<()> {
+    let (work, _origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    // `git pull` would silently ignore the branch and pull the current
+    // branch's upstream instead — the RPC must fail rather than succeed
+    // against the wrong thing.
+    let err = session
+        .enqueue_write(WriteCommand::Pull {
+            remote: None,
+            branch: Some("main".to_string()),
+            strategy: PullStrategy::Default,
+            auto_stash: false,
+        })
+        .await
+        .expect_err("branch without remote must be rejected");
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pull_ff_only_rejection_restores_auto_stash() -> anyhow::Result<()> {
+    let (work, origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    // Divergent histories: --ff-only must refuse to merge.
+    advance_origin(&origin, "remote work", "remote.txt")?;
+    std::fs::write(work.path().join("local.txt"), "local\n")?;
+    gitq(work.path(), &["add", "."])?;
+    gitq(work.path(), &["commit", "-q", "-m", "local work"])?;
+    let pre_pull_head = gitq(work.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+
+    // Dirty worktree gets auto-stashed before the pull.
+    std::fs::write(work.path().join("a.txt"), "dirty\n")?;
+
+    let err = session
+        .enqueue_write(WriteCommand::Pull {
+            remote: Some("origin".to_string()),
+            branch: Some("main".to_string()),
+            strategy: PullStrategy::FfOnly,
+            auto_stash: true,
+        })
+        .await
+        .expect_err("ff-only pull on divergent branches must fail");
+    assert_eq!(err.code, BambooError::GIT_ERROR);
+    assert!(
+        err.message.contains("git pull failed"),
+        "unexpected error: {}",
+        err.message
+    );
+
+    // The auto-stash was popped back: the dirty change is restored and
+    // nothing is stranded on the stash stack.
+    assert_eq!(std::fs::read_to_string(work.path().join("a.txt"))?, "dirty\n");
+    assert!(gitq(work.path(), &["stash", "list"])?.trim().is_empty());
+    // The failed pull did not move HEAD.
+    assert_eq!(
+        gitq(work.path(), &["rev-parse", "HEAD"])?.trim(),
+        pre_pull_head
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pull_merge_conflict_returns_error_and_queue_survives() -> anyhow::Result<()> {
+    let (work, origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    // Both sides modify a.txt differently → the merge cannot auto-resolve.
+    advance_origin(&origin, "remote change", "a.txt")?;
+    std::fs::write(work.path().join("a.txt"), "local change\n")?;
+    gitq(work.path(), &["add", "."])?;
+    gitq(work.path(), &["commit", "-q", "-m", "local change"])?;
+
+    let err = session
+        .enqueue_write(WriteCommand::Pull {
+            remote: Some("origin".to_string()),
+            branch: Some("main".to_string()),
+            strategy: PullStrategy::Merge,
+            auto_stash: false,
+        })
+        .await
+        .expect_err("conflicting pull must fail, not hang the queue");
+    assert_eq!(err.code, BambooError::GIT_ERROR);
+
+    // Conflict markers in the worktree, as the conflict flow expects.
+    let content = std::fs::read_to_string(work.path().join("a.txt"))?;
+    assert!(content.contains("<<<<<<<"), "unexpected content: {content}");
+
+    // The queue is alive: a subsequent write still executes.
+    session
+        .enqueue_write(WriteCommand::Stage(vec!["a.txt".to_string()]))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn branch_status_rejects_unknown_and_head_branch_names() -> anyhow::Result<()> {
+    let (work, _origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    // An unknown branch must be an explicit INVALID_ARGUMENT (not an
+    // indistinguishable "no upstream, 0/0" result), and an explicit
+    // "HEAD" would silently resolve against detached HEAD.
+    for bad in ["no-such-branch", "HEAD"] {
+        let err = bamboo_engine::gix_read::read_branch_status(&session, Some(bad))
+            .expect_err("invalid branch must be an error");
+        let e = err.downcast_ref::<BambooError>().unwrap();
+        assert_eq!(e.code, BambooError::INVALID_ARGUMENT, "{bad}: {e}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_remotes_redacts_embedded_url_credentials() -> anyhow::Result<()> {
+    let (work, _origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    gitq(
+        work.path(),
+        &["remote", "set-url", "origin", "https://user:token@example.com/repo.git"],
+    )?;
+    let remotes = bamboo_engine::gix_read::read_remotes(&session)?;
+    let url = remotes
+        .iter()
+        .find(|r| r.name == "origin")
+        .unwrap()
+        .url
+        .as_deref()
+        .expect("origin url");
+    assert!(url.starts_with("https://***@"), "not redacted: {url}");
+    assert!(!url.contains("user"), "not redacted: {url}");
+    assert!(!url.contains("token"), "not redacted: {url}");
+    assert!(
+        url.ends_with("example.com/repo.git"),
+        "host/path must survive: {url}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stash_pop_explicit_ref_targets_the_named_entry() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    std::fs::write(dir.path().join("a.txt"), "first\n")?;
+    session
+        .enqueue_write(WriteCommand::StashPush {
+            message: Some("first".to_string()),
+            include_untracked: false,
+            staged_only: false,
+        })
+        .await?;
+    std::fs::write(dir.path().join("b.txt"), "second\n")?;
+    session
+        .enqueue_write(WriteCommand::StashPush {
+            message: Some("second".to_string()),
+            include_untracked: false,
+            staged_only: false,
+        })
+        .await?;
+
+    // stash@{1} is the older ("first") entry; popping it restores only
+    // that entry's changes.
+    session
+        .enqueue_write(WriteCommand::StashPop {
+            stash_ref: Some("stash@{1}".to_string()),
+            apply: false,
+            reinstate_index: false,
+        })
+        .await?;
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "first\n");
+    assert_eq!(std::fs::read_to_string(dir.path().join("b.txt"))?, "b\n");
+
+    // Only the "second" entry remains, now at stash@{0}.
+    let entries = bamboo_engine::gix_read::read_stash_list(&session)?;
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].message.contains("second"),
+        "unexpected subject: {:?}",
+        entries[0].message
+    );
+    // The date is strict ISO-8601 (%cI), as the protocol doc promises.
+    assert!(
+        entries[0].date.contains('T') && entries[0].date.contains('+'),
+        "date should be ISO-8601 with offset: {:?}",
+        entries[0].date
     );
     Ok(())
 }

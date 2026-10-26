@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
     BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
-    Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetGraph, GetHeadResult,
+    Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetGraph, GetHeadResult, GetRemotes,
     GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
     OutputResult, Pull, Push, RefsChanged, RemoteInfo, StashDrop, StashEntry, StashPop, StashPush,
     Stage, StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, WorktreeChanged,
@@ -554,6 +554,9 @@ impl BambooServer {
                 to_json_value(&OutputResult { output })
             }
             "getRemotes" => {
+                // Params are parsed (and validated) for symmetry with
+                // every other method, even though this one takes none.
+                let _: GetRemotes = parse_params("getRemotes", params)?;
                 // Read RPC — never enters the write queue.
                 let remotes: Vec<RemoteInfo> =
                     spawn_blocking_read(session, crate::gix_read::read_remotes)

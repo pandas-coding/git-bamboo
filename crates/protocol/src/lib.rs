@@ -343,11 +343,17 @@ pub struct GetRemotes {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteInfo {
     pub name: String,
-    /// Fetch URL (first configured); `None` if no URL resolves.
+    /// Fetch URL (first configured, `insteadOf` rewrites applied);
+    /// `None` if no URL resolves. Credentials embedded in the URL
+    /// (`https://user:token@host/...`) are redacted before the value
+    /// leaves the engine.
     pub url: Option<String>,
-    /// Whether this is the remote new branches push to by default:
-    /// the remote named by the `remote.default` git config when set,
-    /// else the first remote in list order.
+    /// Whether this is the remote bamboo treats as the default push
+    /// target: the remote named by the `remote.default` git config when
+    /// set, else the first remote in list order. This is a bamboo-side
+    /// convention — git itself has no default-push-remote concept
+    /// (`checkout.defaultRemote` only affects `git pull`'s resolution
+    /// of an ambiguous branch).
     pub default: bool,
 }
 
@@ -407,7 +413,8 @@ pub struct StashEntry {
     /// Subject line of the stash commit (message given at push time or
     /// the generated "WIP on ..." line).
     pub message: String,
-    /// ISO-8601 commit date of the stash entry.
+    /// Strict ISO-8601 commit date of the stash entry, e.g.
+    /// `2026-10-26T12:00:00+08:00` (`git log %cI`).
     pub date: String,
 }
 
@@ -497,8 +504,9 @@ impl BambooError {
     pub const UNDO_BLOCKED: i32 = -32007;
     /// Stash pop/apply hit a merge conflict or would overwrite local
     /// changes. Git has NOT dropped the stash — the entry is retained
-    /// (error message says so); conflicted files are already in the
-    /// worktree for the conflict flow to pick up.
+    /// (the error message says so). For a merge conflict the conflicted
+    /// files are already in the worktree for the conflict flow to pick
+    /// up; for a "would be overwritten" failure git applied nothing.
     pub const STASH_CONFLICT: i32 = -32008;
     /// Push was rejected by the remote (non-fast-forward / stale
     /// force-with-lease / fetch-first). Recovery (pull→push) is a
