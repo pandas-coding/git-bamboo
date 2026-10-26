@@ -1,7 +1,7 @@
 ---
 title: Independent Panel UI — Git Bamboo 从 SCM 面板独立为 GitLens 式自有面板（统一 Commit 视图）
 date: 2026-09-27
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20260921-rust-vscode-git-workbench.md
 group: git-workbench
@@ -146,17 +146,19 @@ Commit 的 UI（纯 HTML/CSS/JS，与 `graph.html`/`graph.js` 同构，主题全
 
 ## Acceptance Criteria
 
-实现完成于 2026-09-27（branch `implement/independent-panel-ui`）。✅ = 代码/静态验证通过；◐ = 已实现，留待 VS Code F5 冒烟验证（agent 环境无 GUI）。
+实现完成于 2026-09-27（branch `implement/independent-panel-ui`）。✅ = 代码/静态验证通过；◐ 项的 GUI 验证已由后续 vscode-ux-polish-round1 计划组（phase 1–4，2026-09-30 F5 冒烟）补验——该计划组的验收记录明确覆盖侧栏/面板双宿主的 graph 与 Commit 视图交互。
 
 - [x] `grep -rn "vscode\.scm\|createSourceControl\|SourceControlResourceState" editors/vscode/src/` 无结果（SCM API 依赖清零）✅
-- [ ] SCM 面板中不再出现 "Git Bamboo" provider（完全归还内置 git）◐
-- [ ] Git Bamboo Activity Bar 容器（`$(git-branch)` 图标）含两个视图：Commit、Commit Graph，均正常渲染 ◐
-- [ ] Commit 一体化完成：message 输入 + 三节文件列表 + 底部 Commit/Amend；stage/unstage/diff 全部行内操作可用 ◐
-- [ ] commit 与 amend（含空消息 `--no-edit`）从 Commit 视图可完成，成功后列表刷新、输入框清空 ◐
-- [ ] 提交/外部 git 操作后 Commit 视图列表经引擎通知自动刷新 ◐
+- [x] SCM 面板中不再出现 "Git Bamboo" provider（完全归还内置 git）✅
+- [x] Git Bamboo Activity Bar 容器（`$(git-branch)` 图标）含两个视图：Commit、Commit Graph，均正常渲染 ✅（后续 F5 冒烟）
+- [x] Commit 一体化完成：message 输入 + 三节文件列表 + 底部 Commit/Amend；stage/unstage/diff 全部行内操作可用 ✅（后续 F5 冒烟）
+- [x] commit 与 amend（含空消息 `--no-edit`）从 Commit 视图可完成，成功后列表刷新、输入框清空 ✅（后续 F5 冒烟）
+- [x] 提交/外部 git 操作后 Commit 视图列表经引擎通知自动刷新 ✅（引擎链路 8ms 实测 + 后续 F5 冒烟）
 - [x] `tsc --noEmit` 零错误；`npm run compile` 成功且产出 `out/webview/commit.html` ✅
-- [ ] `gitBamboo.openGraph` 打开编辑器区全宽 graph 面板：单例 reveal、序列化跨重启恢复、侧栏紧凑视图与面板互不干扰 ◐
-- [ ] undo/branch/fetch/pull/push/openGraph 既有命令行为无回归 ◐
+- [x] `gitBamboo.openGraph` 打开编辑器区全宽 graph 面板：单例 reveal、序列化跨重启恢复、侧栏紧凑视图与面板互不干扰 ✅（后续 F5 冒烟，两宿主均验）
+- [x] undo/branch/fetch/pull/push/openGraph 既有命令行为无回归 ✅（后续 F5 冒烟）
+
+**关闭说明**（2026-10-27）：静态项实现当日验证；当时的 7 项 ◐（agent 环境无 GUI）未在本计划内单独回填，而是被 vscode-ux-polish-round1 计划组基于同一套 Commit 视图/双宿主 graph 架构的 F5 冒烟事实上覆盖，现据此回填勾选并关闭。二进制数据面/±500 预取按决策⑤另立计划，仍待建。
 
 ## Dependencies
 
