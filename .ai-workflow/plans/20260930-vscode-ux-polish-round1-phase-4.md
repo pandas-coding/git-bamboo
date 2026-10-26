@@ -1,7 +1,7 @@
 ---
 title: UX Polish Round 1 — Phase 4（B2）：commit 详情与 diff 视图
 date: 2026-09-30
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20260929-vscode-ux-polish-round1.md
 group: vscode-ux-polish-round1

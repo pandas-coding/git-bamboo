@@ -1,7 +1,7 @@
 ---
 title: T1 Core Engine — Rust Daemon + VS Code Extension Skeleton + Status/Graph/Undo Foundation
 date: 2026-09-21
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20260921-rust-vscode-git-workbench.md
 group: git-workbench
@@ -303,13 +303,13 @@ Before marking Phase 1 complete, run the following benchmarks and spikes:
 - [x] `cargo build --release` produces a single `git-workbench-engine` binary (verified on linux-x64; cross-platform targets defined in CI matrix)
 - [x] VS Code extension compiles clean (tsc --noEmit zero errors) and builds via vite; activates/spawns engine/connects via stdio — code paths verified by the subagent's live smoke test against the real engine binary; full in-editor activation pending manual VS Code run
 - [x] Opening a git repository initializes a Session, starts fs watcher, and loads/creates redb cache (verified e2e + integration tests)
-- [ ] Commit graph renders in webview with virtual scrolling; 100k+ commit repo scrolls at 60fps (implementation complete; visual verification in VS Code + large-repo test pending — Spike E)
+- [~] Commit graph renders in webview with virtual scrolling; 100k+ commit repo scrolls at 60fps — in-editor rendering since verified via the vscode-ux-polish-round1 plan group; the 100k-repo 60fps measurement was never formally run (deferred, see #18)
 - [x] Status panel updates in <100ms after file changes (engine-side path: fs event → notification in 8ms; <100ms measured on 20 dirty files of 1000)
-- [x] Stage/unstage/commit (with/without amend), fetch, pull, push all work via CLI write queue (stage/commit/branch/switch verified e2e; fetch/pull/push implemented, require remote to e2e-test)
+- [x] Stage/unstage/commit (with/without amend), fetch, pull, push all work via CLI write queue (stage/commit/branch/switch verified e2e; fetch/pull/push since e2e-verified against a real bare remote in network-ops phase 1)
 - [x] Each mutating operation creates an undo snapshot; undo restores refs/HEAD correctly within 1 second (Spike D: cascade undo verified, audit.log 5 entries)
 - [x] External git operations (terminal `git commit`) are detected via fs watcher within 200ms (measured: 8ms)
-- [ ] Platform-specific VSIX builds successfully for at least darwin-arm64, linux-x64, win32-x64 (scripts/package-all.sh + CI matrix in place; actual packaging requires cross toolchains)
-- [ ] All PoC benchmarks (A-E) pass with documented numbers (C: 8ms ✓, D: pass ✓, perf smoke 200ms ✓; A needs linux-scale repo clone, E needs in-editor run — deferred with documented numbers in Implementation Notes)
+- [~] Platform-specific VSIX builds for darwin-arm64/linux-x64/win32-x4 — scripts + CI matrix in place, actual cross-toolchain packaging never executed (deferred, see #18)
+- [~] All PoC benchmarks (A–E) pass with documented numbers — C: 8ms ✓, D: pass ✓, perf smoke 200ms ✓; A (linux-scale repo) and E (in-editor 60fps) deferred with documented numbers in Implementation Notes (see #18)
 
 ## Dependencies
 
@@ -349,6 +349,7 @@ A full code review against this plan surfaced 5 Critical + ~20 Warning + ~10 Sug
 15. **Extension architecture**: `git show` and `.git/HEAD` parsing in the extension were replaced with engine RPCs `getBlob`/`getHead`; invalidate/refresh races fixed (requestSeq stale-drop + single EPOCH_MISMATCH retry, error code -32004 defined in the protocol crate); auto-stash is a real stash push/switch/pop flow; amend command added to the SCM title bar; status bar shows the current branch.
 16. **Supply chain**: gix-adapt dead crate and 7 unused dependencies removed; Cargo.lock tracked (CI builds `--locked`); CI actions pinned to commit SHAs (a non-existent `dtolnay/rust-action` reference was found and fixed); vsce runs from package-lock.json via `npm ci` (no global installs); cargo-audit job added.
 17. **Still deferred** (Suggestion-level, T2 candidates): engine auto-restart after unexpected exit, ahead/behind in the status bar (needs upstream info), double-click checkout-to-detach RPC, Benchmark A (linux-scale) numbers, multi-root sessions.
+18. **Plan closure** (2026-10-27): T1's deliverables shipped and were hardened by the post-review pass; in-editor visual verification was subsequently delivered by the vscode-ux-polish-round1 plan group. The three remaining `[~]` acceptance items (100k-repo 60fps measurement, cross-platform VSIX packaging, Benchmark A) never ran and are explicitly carried as deferred — re-open them only if a perf/packaging plan is ever cut, not by silently checking them off.
 
 ## Benchmark Results (scaled-down, local)
 
