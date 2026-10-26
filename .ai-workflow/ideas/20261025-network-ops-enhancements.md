@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强：push/pull/fetch 闭环 + 冲突流 + hunk 暂存 + stash
 date: 2026-10-25
-status: raw
+status: planning
 tags: [git, ui, vscode-extension]
 ---
 
@@ -44,3 +44,9 @@ git-bamboo 当前的网络操作（push/pull/fetch）要求用户手敲 remote �
 - 母 idea：`.ai-workflow/ideas/20260921-rust-vscode-git-workbench.md`（T1/T2 规划来源）
 - 姊妹 idea：`.ai-workflow/ideas/20261025-rebase-and-history-insights.md`（rebase 冲突复用本 idea 的冲突流）
 - 实施计划：`.ai-workflow/plans/20260921-t1-core-engine.md`、`.ai-workflow/plans/20260930-vscode-ux-polish-round1-phase-*.md`
+- 本 idea 实施计划（2026-10-26 定稿，覆盖已删除的 `docs/network-ops-interaction-design.md` 全部设计决策）：
+  - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-1.md`（引擎 RPC 地基）
+  - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-2.md`（命令面板 UX 闭环）
+  - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-3.md`（最小冲突流）
+  - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-4.md`（graph 工具栏 + auto-fetch）
+  - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-5.md`（hunk 暂存 + stash UI）
