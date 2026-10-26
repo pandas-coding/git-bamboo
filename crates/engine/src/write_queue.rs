@@ -5,6 +5,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use bamboo_protocol::{BambooError, ForceMode, PullStrategy};
+
 use crate::session::{EngineEvent, Session};
 use crate::undo::{UndoError, UndoOutcome, UndoSummary, UndoErrorKind};
 
@@ -21,10 +23,46 @@ pub enum WriteCommand {
     Commit { message: String, amend: bool },
     CreateBranch { name: String, base: Option<String> },
     DeleteBranch { name: String, force: bool },
+    /// UNDO DECISION: journaled (moves HEAD + refs; snapshot-recoverable).
     SwitchBranch { name: String, auto_stash: bool },
+    /// UNDO DECISION: bypasses the undo journal — remote-tracking refs
+    /// mirror external truth, so an "undo of fetch" is meaningless (see
+    /// the Fetch arm in `run_write_queue`).
     Fetch { remote: Option<String> },
-    Pull { remote: Option<String>, branch: Option<String> },
-    Push { remote: String, branch: String, force: bool },
+    /// UNDO DECISION: journaled (moves HEAD/refs and, with auto-stash,
+    /// the stash stack — all captured by `Snapshot`, incl. `stash_ref`).
+    Pull {
+        remote: Option<String>,
+        branch: Option<String>,
+        strategy: PullStrategy,
+        auto_stash: bool,
+    },
+    /// UNDO DECISION: journaled (moves the remote branch + upstream
+    /// config; refs are snapshotted, config-only changes are a noop-undo).
+    Push {
+        remote: String,
+        branch: String,
+        force: ForceMode,
+        set_upstream: bool,
+    },
+    /// UNDO DECISION: journaled (moves refs/stash and the index; the
+    /// `Snapshot` carries `stash_ref` + `index_tree` for restore).
+    StashPush {
+        message: Option<String>,
+        include_untracked: bool,
+        staged_only: bool,
+    },
+    /// UNDO DECISION: journaled (moves refs/stash, the index and the
+    /// worktree-adjacent index state). On conflict the stash is retained
+    /// by git and STASH_CONFLICT is returned — the undo transaction is
+    /// committed as failed, which is accurate.
+    StashPop {
+        stash_ref: Option<String>,
+        apply: bool,
+        reinstate_index: bool,
+    },
+    /// UNDO DECISION: journaled (moves refs/stash).
+    StashDrop { stash_ref: Option<String> },
     /// Cascade rollback. Routed through the same single-consumer queue as
     /// every other mutation so undo can never interleave with a write.
     Undo { transaction_id: u64 },
@@ -62,14 +100,33 @@ impl WriteCommand {
                 }
             }
             WriteCommand::Fetch { .. } => "Fetch".to_string(),
-            WriteCommand::Pull { .. } => "Pull".to_string(),
-            WriteCommand::Push { force, .. } => {
-                if *force {
-                    "Push(force)".to_string()
-                } else {
-                    "Push".to_string()
+            WriteCommand::Pull { strategy, auto_stash, .. } => match (*auto_stash, strategy) {
+                (false, PullStrategy::Default) => "Pull".to_string(),
+                (true, PullStrategy::Default) => "Pull(auto-stash)".to_string(),
+                (false, s) => format!("Pull({s:?})"),
+                (true, s) => format!("Pull(auto-stash, {s:?})"),
+            },
+            WriteCommand::Push { force, .. } => match force {
+                ForceMode::None => "Push".to_string(),
+                ForceMode::Lease => "Push(lease)".to_string(),
+                ForceMode::Force => "Push(force)".to_string(),
+            },
+            WriteCommand::StashPush { include_untracked, staged_only, .. } => {
+                match (*include_untracked, *staged_only) {
+                    (false, false) => "StashPush".to_string(),
+                    (true, false) => "StashPush(untracked)".to_string(),
+                    (false, true) => "StashPush(staged)".to_string(),
+                    (true, true) => "StashPush(untracked, staged)".to_string(),
                 }
             }
+            WriteCommand::StashPop { apply, .. } => {
+                if *apply {
+                    "StashApply".to_string()
+                } else {
+                    "StashPop".to_string()
+                }
+            }
+            WriteCommand::StashDrop { .. } => "StashDrop".to_string(),
             WriteCommand::Undo { .. } => "Undo".to_string(),
         }
     }
@@ -78,7 +135,10 @@ impl WriteCommand {
 #[derive(Debug, Clone)]
 pub enum WriteResult {
     Ok(String),
-    Err(String),
+    /// Failure carrying a structured protocol error (code + message) so
+    /// the server can surface STASH_CONFLICT / PUSH_REJECTED /
+    /// AUTH_REQUIRED to the client instead of a flat git-error string.
+    Err(BambooError),
     /// Structured undo outcome (carries a clone-able error projection so
     /// the server can map `UNDO_BLOCKED` / `NotFound` to protocol codes).
     Undo(Result<UndoSummary, UndoErrorKind>),
@@ -103,7 +163,7 @@ fn validate_path_arg(p: &str) -> anyhow::Result<()> {
 /// Validate a branch/ref/remote name (mirrors the essentials of
 /// `git check-ref-format`). Rejects option-like and malformed names before
 /// they reach git as positional arguments.
-fn validate_ref_arg(name: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_ref_arg(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("ref name must not be empty");
     }
@@ -134,12 +194,43 @@ fn validate_ref_arg(name: &str) -> anyhow::Result<()> {
 
 /// Push refspecs may legitimately contain `:` (e.g. `src:dst`); validate the
 /// injection-relevant properties only.
-fn validate_pushspec(spec: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_pushspec(spec: &str) -> anyhow::Result<()> {
     if spec.is_empty() || spec.starts_with('-') || spec.starts_with('+') {
         anyhow::bail!("invalid push refspec: {spec:?}");
     }
     if spec.chars().any(|c| c.is_ascii_control() || c.is_whitespace()) {
         anyhow::bail!("invalid push refspec: {spec:?}");
+    }
+    Ok(())
+}
+
+/// Stash refs are limited to the strict `stash@{N}` form (digits only) so a
+/// caller can never smuggle options, rev ranges or other syntax into what
+/// is always a positional argument to `git stash pop/apply/drop`.
+fn validate_stash_ref(s: &str) -> anyhow::Result<()> {
+    let digits = s
+        .strip_prefix("stash@{")
+        .and_then(|rest| rest.strip_suffix('}'));
+    match digits {
+        Some(d) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => Ok(()),
+        _ => anyhow::bail!("stash ref must be of the form stash@{{N}}: {s:?}"),
+    }
+}
+
+/// Stash messages are the value of `-m`, never parsed as options, but are
+/// still bounded and control-character-free (a single line, no NUL/newline
+/// injection into journal-adjacent output strings).
+const MAX_STASH_MESSAGE_LEN: usize = 500;
+
+fn validate_stash_message(message: &str) -> anyhow::Result<()> {
+    if message.is_empty() {
+        anyhow::bail!("stash message must not be empty");
+    }
+    if message.len() > MAX_STASH_MESSAGE_LEN {
+        anyhow::bail!("stash message exceeds {MAX_STASH_MESSAGE_LEN} bytes");
+    }
+    if message.contains('\0') || message.chars().any(|c| c.is_ascii_control()) {
+        anyhow::bail!("stash message contains control characters");
     }
     Ok(())
 }
@@ -179,7 +270,24 @@ pub async fn run_write_queue(
                 let result = discard_changes(&session, paths).await;
                 match result {
                     Ok(output) => (WriteResult::Ok(output), 0),
-                    Err(e) => (WriteResult::Err(format!("{e}")), 0),
+                    Err(e) => (WriteResult::Err(BambooError::git_error(e.to_string())), 0),
+                }
+            }
+            // Fetch bypasses the undo journal: remote-tracking refs
+            // (refs/remotes/*) are a mirror of EXTERNAL truth. An "undo"
+            // would rewind that mirror to a stale view of the remote —
+            // meaningless to the user — and the post-snapshot ref
+            // comparison would then make every later fetch trip the
+            // external-change detection of older transactions
+            // (UNDO_BLOCKED), blocking undos that are still perfectly
+            // valid. Like Discard it still runs serialized on this queue,
+            // bumps the epoch on success, and is audit-logged — only the
+            // undo tx begin/commit is skipped.
+            WriteCommand::Fetch { .. } => {
+                let result = execute_command(&session, &cmd).await;
+                match result {
+                    Ok(output) => (WriteResult::Ok(output), 0),
+                    Err(e) => (WriteResult::Err(BambooError::git_error(e.to_string())), 0),
                 }
             }
             _ => run_write(&session, &cmd).await,
@@ -225,7 +333,12 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
         Ok(id) => id,
         Err(e) => {
             error!(error = %e, "failed to begin undo transaction");
-            return (WriteResult::Err(format!("undo snapshot failed: {e}")), 0);
+            return (
+                WriteResult::Err(BambooError::git_error(format!(
+                    "undo snapshot failed: {e}"
+                ))),
+                0,
+            );
         }
     };
 
@@ -239,9 +352,9 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
             // The repository was mutated but the operation is not undoable;
             // never report plain success for that.
             return (
-                WriteResult::Err(format!(
+                WriteResult::Err(BambooError::git_error(format!(
                     "git operation succeeded but is NOT undoable (journal write failed): {e}"
-                )),
+                ))),
                 tx_id,
             );
         }
@@ -249,7 +362,16 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
 
     match result {
         Ok(output) => (WriteResult::Ok(output), tx_id),
-        Err(e) => (WriteResult::Err(format!("{e}")), tx_id),
+        // Structured protocol errors (STASH_CONFLICT, PUSH_REJECTED,
+        // AUTH_REQUIRED) survive; everything else degrades to a plain
+        // git error carrying git's stderr.
+        Err(e) => {
+            let mapped = match e.downcast::<BambooError>() {
+                Ok(structured) => structured,
+                Err(e) => BambooError::git_error(e.to_string()),
+            };
+            (WriteResult::Err(mapped), tx_id)
+        }
     }
 }
 
@@ -275,9 +397,37 @@ async fn run_undo(session: Arc<Session>, transaction_id: u64) -> (WriteResult, u
 }
 
 async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Result<String> {
-    // SwitchBranch is a multi-step flow (auto-stash), handled separately.
+    // Multi-step or post-processing flows are handled by dedicated
+    // functions (see each for its undo/validation semantics).
     if let WriteCommand::SwitchBranch { name, auto_stash } = cmd {
         return switch_branch(session, name, *auto_stash).await;
+    }
+    if let WriteCommand::Pull { remote, branch, strategy, auto_stash } = cmd {
+        return run_pull(session, remote, branch, *strategy, *auto_stash).await;
+    }
+    if let WriteCommand::Push { remote, branch, force, set_upstream } = cmd {
+        return run_push(session, remote, branch, *force, *set_upstream).await;
+    }
+    if let WriteCommand::StashPush { message, include_untracked, staged_only } = cmd {
+        return stash_push(
+            &session.repo_path,
+            message.as_deref(),
+            *include_untracked,
+            *staged_only,
+        )
+        .await;
+    }
+    if let WriteCommand::StashPop { stash_ref, apply, reinstate_index } = cmd {
+        return stash_pop(
+            &session.repo_path,
+            stash_ref.as_deref(),
+            *apply,
+            *reinstate_index,
+        )
+        .await;
+    }
+    if let WriteCommand::StashDrop { stash_ref } = cmd {
+        return run_stash_drop(session, stash_ref.as_deref()).await;
     }
 
     let repo_path = &session.repo_path;
@@ -356,35 +506,25 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         WriteCommand::Fetch { remote } => {
             let mut c = Command::new("git");
             c.arg("fetch").current_dir(repo_path);
-            if let Some(remote) = remote {
-                validate_ref_arg(remote)?;
-                c.arg(remote);
-            }
-            c
-        }
-        WriteCommand::Pull { remote, branch } => {
-            let mut c = Command::new("git");
-            c.arg("pull").current_dir(repo_path);
-            if let Some(remote) = remote {
-                validate_ref_arg(remote)?;
-                c.arg(remote);
-                if let Some(branch) = branch {
-                    validate_ref_arg(branch)?;
-                    c.arg(branch);
+            match remote {
+                // None = "refresh every remote" (graph-client mental
+                // model): `--all`. A single-remote fetch is expressed by
+                // passing the remote name explicitly.
+                None => {
+                    c.arg("--all");
+                }
+                Some(remote) => {
+                    validate_ref_arg(remote)?;
+                    c.arg(remote);
                 }
             }
             c
         }
-        WriteCommand::Push { remote, branch, force } => {
-            validate_ref_arg(remote)?;
-            validate_pushspec(branch)?;
-            let mut c = Command::new("git");
-            c.arg("push").current_dir(repo_path);
-            if *force {
-                c.arg("--force-with-lease");
-            }
-            c.arg(remote).arg(branch);
-            c
+        WriteCommand::Pull { .. } | WriteCommand::Push { .. } => {
+            unreachable!("network commands are handled by run_pull/run_push")
+        }
+        WriteCommand::StashPush { .. } | WriteCommand::StashPop { .. } | WriteCommand::StashDrop { .. } => {
+            unreachable!("stash commands are handled by their dedicated fns")
         }
         WriteCommand::Undo { .. } => {
             unreachable!("undo is handled by run_undo, not execute_command")
@@ -404,6 +544,281 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         anyhow::bail!("git command failed: {stderr}");
     }
 
+    Ok(format!("{stdout}{stderr}").trim().to_string())
+}
+
+/// Run one git argv (no paths) and return (success, stdout, stderr) —
+/// used by flows that must classify the failure text themselves
+/// (push rejection, stash conflicts).
+async fn run_git_raw(
+    repo_path: &std::path::Path,
+    argv: &[String],
+) -> anyhow::Result<(bool, String, String)> {
+    let result = Command::new("git")
+        .args(argv)
+        .current_dir(repo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    Ok((
+        result.status.success(),
+        String::from_utf8_lossy(&result.stdout).into_owned(),
+        String::from_utf8_lossy(&result.stderr).into_owned(),
+    ))
+}
+
+/// Push with the three force tiers, optional `-u`, and structured error
+/// classification. The engine never confirms force itself — a force push
+/// is only reachable after the client's confirmation modal.
+async fn run_push(
+    session: &Session,
+    remote: &str,
+    branch: &str,
+    force: ForceMode,
+    set_upstream: bool,
+) -> anyhow::Result<String> {
+    validate_ref_arg(remote)?;
+    validate_pushspec(branch)?;
+
+    let mut argv: Vec<String> = vec!["push".to_string()];
+    match force {
+        // Bare lease (no expected value): weaker than a precise-value
+        // lease, but precise values would need an extra remote-ref read;
+        // the confirm modal + configurable force mode cover the residual
+        // risk (documented trade-off, see the phase-1 plan).
+        ForceMode::Lease => argv.push("--force-with-lease".to_string()),
+        ForceMode::Force => argv.push("--force".to_string()),
+        ForceMode::None => {}
+    }
+    if set_upstream {
+        argv.push("--set-upstream".to_string());
+    }
+    argv.push(remote.to_string());
+    argv.push(branch.to_string());
+
+    let (ok, stdout, stderr) = run_git_raw(&session.repo_path, &argv).await?;
+    if !ok {
+        return Err(classify_push_error(remote, branch, &stdout, &stderr).into());
+    }
+    Ok(format!("{stdout}{stderr}").trim().to_string())
+}
+
+/// Map a failed push's output onto the structured protocol errors the
+/// client can act on (PUSH_REJECTED → offer pull; AUTH_REQUIRED → guide
+/// terminal auth). Anything unrecognized stays a plain git error. The
+/// engine deliberately does NOT orchestrate recovery (pull→push chains
+/// are client-side interaction).
+fn classify_push_error(remote: &str, branch: &str, stdout: &str, stderr: &str) -> BambooError {
+    let combined = format!("{stdout}{stderr}");
+    // Rejections: "! [rejected] main -> main (fetch first)" (non-ff),
+    // "(non-fast-forward)", "(stale info)" (force-with-lease). Carry the
+    // remote branch so the client can name it in the recovery UI.
+    if combined.contains("[rejected")
+        || combined.contains("rejected (fetch first)")
+        || combined.contains("(non-fast-forward)")
+    {
+        return BambooError::push_rejected(format!(
+            "push to {remote}/{branch} was rejected (remote has newer commits, \
+             or the force-with-lease protection tripped): {}",
+            combined.trim()
+        ));
+    }
+    if combined.contains("could not read Username")
+        || combined.contains("Authentication failed")
+        || combined.contains("terminal prompts disabled")
+    {
+        return BambooError::auth_required(format!(
+            "authentication required for {remote}: {}",
+            combined.trim()
+        ));
+    }
+    BambooError::git_error(combined.trim().to_string())
+}
+
+/// Pull with strategy flags and auto-stash. `Default` appends no flag so
+/// the user's `pull.rebase` / `pull.ff` git config decides (engine never
+/// overrides un-asked). Auto-stash: push dirty worktree → pull → pop;
+/// on pop failure the changes are retained in the stash and the error
+/// says so explicitly.
+async fn run_pull(
+    session: &Session,
+    remote: &Option<String>,
+    branch: &Option<String>,
+    strategy: PullStrategy,
+    auto_stash: bool,
+) -> anyhow::Result<String> {
+    if let Some(remote) = remote {
+        validate_ref_arg(remote)?;
+        if let Some(branch) = branch {
+            validate_ref_arg(branch)?;
+        }
+    }
+
+    let repo_path = session.repo_path.clone();
+    let mut output = String::new();
+    let mut stashed = false;
+
+    if auto_stash {
+        let dirty = run_git_checked(&repo_path, &["status", "--porcelain"], &[]).await?;
+        if !dirty.trim().is_empty() {
+            stash_push(&repo_path, None, true, false)
+                .await
+                .map_err(|e| anyhow::anyhow!("auto-stash failed; pull aborted: {e}"))?;
+            stashed = true;
+            output.push_str("stashed local changes; ");
+        }
+    }
+
+    let mut argv: Vec<String> = vec!["pull".to_string()];
+    match strategy {
+        PullStrategy::Default => {}
+        PullStrategy::Merge => argv.push("--no-rebase".to_string()),
+        PullStrategy::Rebase => argv.push("--rebase".to_string()),
+        PullStrategy::FfOnly => argv.push("--ff-only".to_string()),
+    }
+    if let Some(remote) = remote {
+        argv.push(remote.clone());
+        if let Some(branch) = branch {
+            argv.push(branch.clone());
+        }
+    }
+
+    let (ok, stdout, stderr) = run_git_raw(&repo_path, &argv).await?;
+    if !ok {
+        // The pull failed; put the stash back so the user's changes are
+        // not stranded (best-effort — the pull may itself have left the
+        // worktree conflicted, in which case popping can fail too).
+        if stashed {
+            if let Err(pop_err) = stash_pop(&repo_path, None, false, false).await {
+                warn!(error = %pop_err, "failed to restore stash after failed pull");
+            }
+        }
+        anyhow::bail!("git pull failed: {}", format!("{stdout}{stderr}").trim());
+    }
+    output.push_str(format!("{stdout}{stderr}").trim());
+
+    if stashed {
+        match stash_pop(&repo_path, None, false, false).await {
+            Ok(out) => {
+                if !out.is_empty() {
+                    output.push('\n');
+                    output.push_str(&out);
+                }
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "pull succeeded, but restoring the stashed changes failed: {e}\n\
+                     The changes are retained in the stash; run `git stash pop` manually."
+                );
+            }
+        }
+    }
+
+    Ok(output.trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Stash primitives (shared by switchBranch auto-stash and the stash RPCs)
+// ---------------------------------------------------------------------------
+
+/// Stash push primitive: `git stash push [-u] [-S] [-m <msg>]`. Shared by
+/// `switch_branch` (auto-stash) and the `stashPush` RPC — one
+/// implementation, no copies (second consumer triggered the extraction).
+async fn stash_push(
+    repo_path: &std::path::Path,
+    message: Option<&str>,
+    include_untracked: bool,
+    staged_only: bool,
+) -> anyhow::Result<String> {
+    if let Some(message) = message {
+        validate_stash_message(message)?;
+    }
+    let mut argv: Vec<String> = vec!["stash".to_string(), "push".to_string()];
+    if include_untracked {
+        argv.push("--include-untracked".to_string());
+    }
+    if staged_only {
+        argv.push("--staged".to_string());
+    }
+    if let Some(message) = message {
+        argv.push("-m".to_string());
+        argv.push(message.to_string());
+    }
+    let (ok, stdout, stderr) = run_git_raw(repo_path, &argv).await?;
+    if !ok {
+        anyhow::bail!("git stash push failed: {}", format!("{stdout}{stderr}").trim());
+    }
+    Ok(format!("{stdout}{stderr}").trim().to_string())
+}
+
+/// Stash pop/apply primitive: `git stash pop|apply [--index] [stash@{N}]`.
+/// On failure git does NOT drop the stash entry — it is retained. Merge
+/// conflicts ("could not apply", CONFLICT, "local changes ... would be
+/// overwritten") surface as STASH_CONFLICT so the client can hand the
+/// already-checked-out conflicted files to the conflict flow; other
+/// failures stay plain git errors. Shared by `switch_branch` (auto-stash
+/// pop-back) and the stash RPCs.
+async fn stash_pop(
+    repo_path: &std::path::Path,
+    stash_ref: Option<&str>,
+    apply: bool,
+    reinstate_index: bool,
+) -> anyhow::Result<String> {
+    if let Some(stash_ref) = stash_ref {
+        validate_stash_ref(stash_ref)?;
+    }
+    let mut argv: Vec<String> = vec!["stash".to_string()];
+    argv.push(if apply { "apply" } else { "pop" }.to_string());
+    if reinstate_index {
+        argv.push("--index".to_string());
+    }
+    if let Some(stash_ref) = stash_ref {
+        argv.push(stash_ref.to_string());
+    }
+
+    let (ok, stdout, stderr) = run_git_raw(repo_path, &argv).await?;
+    if !ok {
+        let combined = format!("{stdout}{stderr}");
+        if combined.contains("could not apply")
+            || combined.contains("CONFLICT")
+            || combined.contains("would be overwritten")
+        {
+            return Err(BambooError::stash_conflict(format!(
+                "stash {} conflicted; stash retained (git does not drop the \
+                 entry — your changes are safe in the stash; resolve the \
+                 conflicted files in the worktree): {}",
+                if apply { "apply" } else { "pop" },
+                combined.trim()
+            ))
+            .into());
+        }
+        return Err(BambooError::git_error(format!(
+            "git stash {} failed: {}",
+            if apply { "apply" } else { "pop" },
+            combined.trim()
+        ))
+        .into());
+    }
+    Ok(format!("{stdout}{stderr}").trim().to_string())
+}
+
+/// `stashDrop` RPC entry: `git stash drop [stash@{N}]`.
+async fn run_stash_drop(
+    session: &Session,
+    stash_ref: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(stash_ref) = stash_ref {
+        validate_stash_ref(stash_ref)?;
+    }
+    let mut argv: Vec<String> = vec!["stash".to_string(), "drop".to_string()];
+    if let Some(stash_ref) = stash_ref {
+        argv.push(stash_ref.to_string());
+    }
+    let (ok, stdout, stderr) = run_git_raw(&session.repo_path, &argv).await?;
+    if !ok {
+        anyhow::bail!("git stash drop failed: {}", format!("{stdout}{stderr}").trim());
+    }
     Ok(format!("{stdout}{stderr}").trim().to_string())
 }
 
@@ -597,7 +1012,9 @@ async fn switch_branch(
     if auto_stash {
         let dirty = run_git_checked(&repo_path, &["status", "--porcelain"], &[]).await?;
         if !dirty.trim().is_empty() {
-            run_git_checked(&repo_path, &["stash", "push", "--include-untracked"], &[])
+            // Shared stash primitive (same argv as before the extraction:
+            // `stash push --include-untracked`).
+            stash_push(&repo_path, None, true, false)
                 .await
                 .map_err(|e| anyhow::anyhow!("auto-stash failed; switch aborted: {e}"))?;
             stashed = true;
@@ -613,9 +1030,9 @@ async fn switch_branch(
         }
         Err(e) => {
             // The switch failed; put the stash back so the user's changes
-            // are not stranded (best-effort).
+            // are not stranded (best-effort). Shared stash primitive.
             if stashed {
-                if let Err(pop_err) = run_git_checked(&repo_path, &["stash", "pop"], &[]).await {
+                if let Err(pop_err) = stash_pop(&repo_path, None, false, false).await {
                     warn!(error = %pop_err, "failed to restore stash after failed switch");
                 }
             }
@@ -624,7 +1041,7 @@ async fn switch_branch(
     }
 
     if stashed {
-        match run_git_checked(&repo_path, &["stash", "pop"], &[]).await {
+        match stash_pop(&repo_path, None, false, false).await {
             Ok(out) => {
                 if !out.is_empty() {
                     output.push('\n');

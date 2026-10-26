@@ -253,6 +253,24 @@ pub struct Fetch {
 pub struct Pull {
     pub remote: Option<String>,
     pub branch: Option<String>,
+    /// How the merge is performed; `Default` appends no flag so the
+    /// user's `pull.rebase` / `pull.ff` git config is respected.
+    #[serde(default)]
+    pub strategy: PullStrategy,
+    #[serde(default)]
+    pub auto_stash: bool,
+}
+
+/// Merge strategy for `pull`. `Default` adds no flag (git config decides);
+/// the others map to `--rebase` / `--no-rebase` / `--ff-only`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullStrategy {
+    #[default]
+    Default,
+    Merge,
+    Rebase,
+    FfOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,7 +278,137 @@ pub struct Push {
     pub remote: String,
     pub branch: String,
     #[serde(default)]
-    pub force: bool,
+    pub force: ForceMode,
+    #[serde(default)]
+    pub set_upstream: bool,
+}
+
+/// Push force semantics (three tiers).
+///
+/// Backwards wire compatibility: older clients sent `force` as a bool,
+/// so deserialization also accepts `true` (mapped to `Lease`) and `false`
+/// (mapped to `None`) — no protocol version jump.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForceMode {
+    /// No force at all.
+    #[default]
+    None,
+    /// `--force-with-lease`: rejected when the remote moved since our
+    /// remote-tracking ref was last updated.
+    Lease,
+    /// `--force`: unconditional overwrite (only reachable after an
+    /// explicit client-side confirmation modal).
+    Force,
+}
+
+impl<'de> Deserialize<'de> for ForceMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Untagged proxy: accepts the new string form and the legacy bool
+        // form in one pass.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Mode(String),
+            Legacy(bool),
+        }
+        match Raw::deserialize(deserializer)? {
+            // Legacy bool: `true` meant "force with safety", i.e. lease.
+            Raw::Legacy(true) => Ok(ForceMode::Lease),
+            Raw::Legacy(false) => Ok(ForceMode::None),
+            Raw::Mode(s) => match s.as_str() {
+                "none" => Ok(ForceMode::None),
+                "lease" => Ok(ForceMode::Lease),
+                "force" => Ok(ForceMode::Force),
+                _ => Err(serde::de::Error::custom(format!(
+                    "unknown force mode {s:?}; expected \"none\" | \"lease\" | \"force\""
+                ))),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remotes / branch status / stash
+// ---------------------------------------------------------------------------
+
+/// `getRemotes` has no parameters (an empty object).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetRemotes {}
+
+/// One remote as reported by `getRemotes`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
+    /// Fetch URL (first configured); `None` if no URL resolves.
+    pub url: Option<String>,
+    /// Whether this is the remote new branches push to by default:
+    /// the remote named by the `remote.default` git config when set,
+    /// else the first remote in list order.
+    pub default: bool,
+}
+
+/// `getBranchStatus`: branch defaults to the current HEAD branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBranchStatus {
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// Ahead/behind of a branch vs. its upstream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchStatus {
+    pub branch: String,
+    /// Short upstream name (e.g. "origin/main"); `None` when the branch
+    /// has no configured upstream.
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+/// `stashPush` request. `stash_ref` is `stash@{N}` or `None` for the latest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashPush {
+    pub message: Option<String>,
+    #[serde(default)]
+    pub include_untracked: bool,
+    /// `--staged` (staged changes only).
+    #[serde(default)]
+    pub staged_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashPop {
+    /// `stash@{N}`, or `None` for the latest entry.
+    pub stash_ref: Option<String>,
+    /// `true` = `git stash apply` (entry kept), `false` = `pop`.
+    #[serde(default)]
+    pub apply: bool,
+    /// `--index`: restore the staged/unstaged split as it was.
+    #[serde(default)]
+    pub reinstate_index: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashDrop {
+    /// `stash@{N}`, or `None` for the latest entry.
+    pub stash_ref: Option<String>,
+}
+
+/// One entry of `stashList` (`git stash list`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StashEntry {
+    /// Reflog selector, e.g. `stash@{0}`.
+    #[serde(rename = "ref")]
+    pub stash_ref: String,
+    /// Subject line of the stash commit (message given at push time or
+    /// the generated "WIP on ..." line).
+    pub message: String,
+    /// ISO-8601 commit date of the stash entry.
+    pub date: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +495,18 @@ impl BambooError {
     pub const INVALID_ARGUMENT: i32 = -32005;
     pub const NOT_INITIALIZED: i32 = -32006;
     pub const UNDO_BLOCKED: i32 = -32007;
+    /// Stash pop/apply hit a merge conflict or would overwrite local
+    /// changes. Git has NOT dropped the stash — the entry is retained
+    /// (error message says so); conflicted files are already in the
+    /// worktree for the conflict flow to pick up.
+    pub const STASH_CONFLICT: i32 = -32008;
+    /// Push was rejected by the remote (non-fast-forward / stale
+    /// force-with-lease / fetch-first). Recovery (pull→push) is a
+    /// client-side interaction, not engine orchestration.
+    pub const PUSH_REJECTED: i32 = -32009;
+    /// Remote authentication failed / credentials unavailable. The client
+    /// should guide the user through terminal-based authentication.
+    pub const AUTH_REQUIRED: i32 = -32010;
 
     pub fn repo_not_found(msg: impl Into<String>) -> Self {
         Self {
@@ -387,6 +547,27 @@ impl BambooError {
         Self {
             code: Self::UNDO_BLOCKED,
             message: reason.into(),
+        }
+    }
+
+    pub fn stash_conflict(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::STASH_CONFLICT,
+            message: msg.into(),
+        }
+    }
+
+    pub fn push_rejected(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::PUSH_REJECTED,
+            message: msg.into(),
+        }
+    }
+
+    pub fn auth_required(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::AUTH_REQUIRED,
+            message: msg.into(),
         }
     }
 }

@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强 Phase 1：引擎层网络/stash RPC 地基
 date: 2026-10-26
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 group: network-ops-enhancements
@@ -56,14 +56,14 @@ tags: [git, rust]
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p bamboo-engine`（含新增测试）全绿。
-- [ ] `cargo clippy --workspace` 无新告警。
-- [ ] push RPC 返回 `OutputResult`（非 null），`force: "lease"`/`"force"`/`"none"` 产生对应 argv。
-- [ ] 旧客户端发送 `force: true`（布尔）仍被正确解析为 `lease`（serde 兼容测试）。
-- [ ] `getRemotes`、`getBranchStatus`、`stashList` RPC 可用；stash pop 冲突返回 -32008 且 stash 未被丢弃。
-- [ ] fetch `remote: null` 执行 `git fetch --all`。
-- [ ] 每个新 WriteCommand 的 undo 决策（journal 或 bypass）在代码注释中有明确说明。
-- [ ] switchBranch auto-stash 行为不变（现有测试 L648-680 不改动仍通过）。
+- [x] `cargo test -p bamboo-engine`（含新增测试）全绿。（58 通过：40 存量 + 18 新增；另有 16 个协议测试）
+- [x] `cargo clippy --workspace` 无新告警。（0 告警）
+- [x] push RPC 返回 `OutputResult`（非 null），`force: "lease"`/`"force"`/`"none"` 产生对应 argv。（对真实 bare 远端验证：none 被拒、lease 在 stale 拒/同步后成功、force 覆盖）
+- [x] 旧客户端发送 `force: true`（布尔）仍被正确解析为 `lease`（serde 兼容测试）。（协议测试 + 引擎边界测试双重覆盖）
+- [x] `getRemotes`、`getBranchStatus`、`stashList` RPC 可用；stash pop 冲突返回 -32008 且 stash 未被丢弃。
+- [x] fetch `remote: null` 执行 `git fetch --all`。（第二远端跟踪 ref 出现 + undo journal 保持空验证）
+- [x] 每个新 WriteCommand 的 undo 决策（journal 或 bypass）在代码注释中有明确说明。（WriteCommand 枚举变体注释 + run_write_queue 的 Fetch bypass 说明）
+- [x] switchBranch auto-stash 行为不变（现有测试 L648-680 不改动仍通过）。
 
 ## Dependencies
 

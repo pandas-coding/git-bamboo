@@ -154,3 +154,124 @@ fn request_defaults_match_old_parser() {
     let gs: GetStatus = serde_json::from_str("{}").unwrap();
     assert!(gs.paths.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Network ops protocol (push force modes, pull strategy)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn force_mode_string_forms() {
+    let p: Push =
+        serde_json::from_str(r#"{"remote":"origin","branch":"main","force":"lease"}"#).unwrap();
+    assert_eq!(p.force, ForceMode::Lease);
+
+    let p: Push =
+        serde_json::from_str(r#"{"remote":"origin","branch":"main","force":"force"}"#).unwrap();
+    assert_eq!(p.force, ForceMode::Force);
+
+    let p: Push =
+        serde_json::from_str(r#"{"remote":"origin","branch":"main","force":"none"}"#).unwrap();
+    assert_eq!(p.force, ForceMode::None);
+}
+
+#[test]
+fn force_mode_legacy_bool_maps_to_lease_and_none() {
+    // Old clients sent `force: true/false`; no protocol version jump, so
+    // the new enum must still parse them.
+    let p: Push =
+        serde_json::from_str(r#"{"remote":"origin","branch":"main","force":true}"#).unwrap();
+    assert_eq!(p.force, ForceMode::Lease);
+    let p: Push =
+        serde_json::from_str(r#"{"remote":"origin","branch":"main","force":false}"#).unwrap();
+    assert_eq!(p.force, ForceMode::None);
+}
+
+#[test]
+fn force_mode_defaults_and_roundtrip() {
+    // Absent force = none, absent set_upstream = false.
+    let p: Push = serde_json::from_str(r#"{"remote":"origin","branch":"main"}"#).unwrap();
+    assert_eq!(p.force, ForceMode::None);
+    assert!(!p.set_upstream);
+
+    // Roundtrip through the wire format.
+    let p = Push {
+        remote: "origin".into(),
+        branch: "main".into(),
+        force: ForceMode::Lease,
+        set_upstream: true,
+    };
+    let json = serde_json::to_string(&p).unwrap();
+    assert!(json.contains(r#""force":"lease""#), "{json}");
+    let back: Push = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.force, ForceMode::Lease);
+    assert!(back.set_upstream);
+}
+
+#[test]
+fn force_mode_rejects_unknown_strings() {
+    assert!(serde_json::from_str::<Push>(r#"{"remote":"o","branch":"b","force":"nuke"}"#).is_err());
+}
+
+#[test]
+fn pull_strategy_wire_forms() {
+    let base = r#"{"remote":"origin","branch":"main"}"#;
+    let p: Pull = serde_json::from_str(base).unwrap();
+    assert_eq!(p.strategy, PullStrategy::Default);
+    assert!(!p.auto_stash);
+
+    for (wire, strategy) in [
+        ("\"merge\"", PullStrategy::Merge),
+        ("\"rebase\"", PullStrategy::Rebase),
+        ("\"ff-only\"", PullStrategy::FfOnly),
+    ] {
+        let p: Pull = serde_json::from_str(&format!(
+            r#"{{"remote":"o","branch":"b","strategy":{wire},"auto_stash":true}}"#
+        ))
+        .unwrap();
+        assert_eq!(p.strategy, strategy);
+        assert!(p.auto_stash);
+    }
+}
+
+#[test]
+fn stash_types_wire_shapes() {
+    // push: message required-ish (Option), flags default false.
+    let p: StashPush = serde_json::from_str(r#"{"message":null}"#).unwrap();
+    assert!(p.message.is_none());
+    assert!(!p.include_untracked && !p.staged_only);
+
+    let pop: StashPop = serde_json::from_str("{}").unwrap();
+    assert!(pop.stash_ref.is_none());
+    assert!(!pop.apply && !pop.reinstate_index);
+
+    let drop: StashDrop = serde_json::from_str(r#"{"stash_ref":"stash@{1}"}"#).unwrap();
+    assert_eq!(drop.stash_ref.as_deref(), Some("stash@{1}"));
+
+    // StashEntry serializes `ref` (reserved keyword) on the wire.
+    let e = StashEntry {
+        stash_ref: "stash@{0}".into(),
+        message: "WIP on main".into(),
+        date: "2026-10-26 12:00:00 +0800".into(),
+    };
+    let json = serde_json::to_string(&e).unwrap();
+    assert!(json.contains(r#""ref":"stash@{0}""#), "{json}");
+    let back: StashEntry = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, e);
+
+    // getBranchStatus: branch optional (defaults to current).
+    let g: GetBranchStatus = serde_json::from_str("{}").unwrap();
+    assert!(g.branch.is_none());
+
+    // getRemotes: empty params object.
+    let _: GetRemotes = serde_json::from_str("{}").unwrap();
+}
+
+#[test]
+fn new_error_code_constructors() {
+    let e = BambooError::stash_conflict("conflict; stash retained");
+    assert_eq!(e.code, BambooError::STASH_CONFLICT);
+    let e = BambooError::push_rejected("rejected (fetch first)");
+    assert_eq!(e.code, BambooError::PUSH_REJECTED);
+    let e = BambooError::auth_required("could not read Username");
+    assert_eq!(e.code, BambooError::AUTH_REQUIRED);
+}
