@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强 Phase 1：引擎层网络/stash RPC 地基
 date: 2026-10-26
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 group: network-ops-enhancements
