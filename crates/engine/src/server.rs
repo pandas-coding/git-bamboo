@@ -8,10 +8,11 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
-    BambooError, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch, Discard, Fetch,
-    GetBlob, GetCommitDetail, GetGraph, GetHeadResult, GetStatus, GraphPage, HeadChanged,
-    IndexChanged, Initialize, InitializeResult, ListUndoStack, OutputResult, Pull, Push,
-    RefsChanged, Stage, StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, WorktreeChanged,
+    BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
+    Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetGraph, GetHeadResult,
+    GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
+    OutputResult, Pull, Push, RefsChanged, RemoteInfo, StashDrop, StashEntry, StashPop, StashPush,
+    Stage, StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session};
@@ -435,26 +436,19 @@ impl BambooServer {
             }
             "stage" => {
                 let req: Stage = parse_params("stage", params)?;
-                session
-                    .enqueue_write(WriteCommand::Stage(req.paths))
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                session.enqueue_write(WriteCommand::Stage(req.paths)).await?;
                 Ok(Value::Null)
             }
             "unstage" => {
                 let req: Unstage = parse_params("unstage", params)?;
-                session
-                    .enqueue_write(WriteCommand::Unstage(req.paths))
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                session.enqueue_write(WriteCommand::Unstage(req.paths)).await?;
                 Ok(Value::Null)
             }
             "discard" => {
                 let req: Discard = parse_params("discard", params)?;
                 session
                     .enqueue_write(WriteCommand::Discard { paths: req.paths })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 Ok(Value::Null)
             }
             "commit" => {
@@ -464,8 +458,7 @@ impl BambooServer {
                         message: req.message,
                         amend: req.amend,
                     })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 Ok(Value::Null)
             }
             "createBranch" => {
@@ -475,8 +468,7 @@ impl BambooServer {
                         name: req.name,
                         base: req.base,
                     })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 Ok(Value::Null)
             }
             "deleteBranch" => {
@@ -486,8 +478,7 @@ impl BambooServer {
                         name: req.name,
                         force: req.force,
                     })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 Ok(Value::Null)
             }
             "switchBranch" => {
@@ -497,16 +488,14 @@ impl BambooServer {
                         name: req.name,
                         auto_stash: req.auto_stash,
                     })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 to_json_value(&OutputResult { output })
             }
             "fetch" => {
                 let req: Fetch = parse_params("fetch", params)?;
                 let output = session
                     .enqueue_write(WriteCommand::Fetch { remote: req.remote })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 to_json_value(&OutputResult { output })
             }
             "pull" => {
@@ -515,22 +504,85 @@ impl BambooServer {
                     .enqueue_write(WriteCommand::Pull {
                         remote: req.remote,
                         branch: req.branch,
+                        strategy: req.strategy,
+                        auto_stash: req.auto_stash,
                     })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                    .await?;
                 to_json_value(&OutputResult { output })
             }
             "push" => {
                 let req: Push = parse_params("push", params)?;
-                session
+                let output = session
                     .enqueue_write(WriteCommand::Push {
                         remote: req.remote,
                         branch: req.branch,
                         force: req.force,
+                        set_upstream: req.set_upstream,
                     })
-                    .await
-                    .map_err(|e| BambooError::git_error(e.to_string()))?;
-                Ok(Value::Null)
+                    .await?;
+                to_json_value(&OutputResult { output })
+            }
+            "stashPush" => {
+                let req: StashPush = parse_params("stashPush", params)?;
+                let output = session
+                    .enqueue_write(WriteCommand::StashPush {
+                        message: req.message,
+                        include_untracked: req.include_untracked,
+                        staged_only: req.staged_only,
+                    })
+                    .await?;
+                to_json_value(&OutputResult { output })
+            }
+            "stashPop" => {
+                let req: StashPop = parse_params("stashPop", params)?;
+                let output = session
+                    .enqueue_write(WriteCommand::StashPop {
+                        stash_ref: req.stash_ref,
+                        apply: req.apply,
+                        reinstate_index: req.reinstate_index,
+                    })
+                    .await?;
+                to_json_value(&OutputResult { output })
+            }
+            "stashDrop" => {
+                let req: StashDrop = parse_params("stashDrop", params)?;
+                let output = session
+                    .enqueue_write(WriteCommand::StashDrop {
+                        stash_ref: req.stash_ref,
+                    })
+                    .await?;
+                to_json_value(&OutputResult { output })
+            }
+            "getRemotes" => {
+                // Read RPC — never enters the write queue.
+                let remotes: Vec<RemoteInfo> =
+                    spawn_blocking_read(session, crate::gix_read::read_remotes)
+                        .await
+                        .map_err(|e| BambooError::git_error(e.to_string()))?;
+                to_json_value(&remotes)
+            }
+            "getBranchStatus" => {
+                // Read RPC — never enters the write queue.
+                let req: GetBranchStatus = parse_params("getBranchStatus", params)?;
+                let status: BranchStatus = spawn_blocking_read(session, move |s| {
+                    crate::gix_read::read_branch_status(s, req.branch.as_deref())
+                })
+                .await
+                .map_err(|e| {
+                    // Preserve structured errors (INVALID_ARGUMENT for
+                    // detached HEAD / malformed branch names).
+                    e.downcast::<BambooError>()
+                        .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
+                })?;
+                to_json_value(&status)
+            }
+            "stashList" => {
+                // Read RPC — never enters the write queue.
+                let entries: Vec<StashEntry> =
+                    spawn_blocking_read(session, crate::gix_read::read_stash_list)
+                        .await
+                        .map_err(|e| BambooError::git_error(e.to_string()))?;
+                to_json_value(&entries)
             }
             "listUndoStack" => {
                 let req: ListUndoStack = parse_params("listUndoStack", params)?;
@@ -554,7 +606,7 @@ impl BambooServer {
                 let result = session
                     .enqueue_undo(req.transaction_id)
                     .await
-                    .map_err(|e| BambooError::git_error(format!("{e}")))?;
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
 
                 match result {
                     Ok(summary) => {

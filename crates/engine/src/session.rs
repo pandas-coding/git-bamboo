@@ -7,6 +7,8 @@ use notify::Watcher;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use bamboo_protocol::BambooError;
+
 use crate::cache::Cache;
 use crate::gitdir;
 use crate::undo::UndoEngine;
@@ -128,19 +130,24 @@ impl Session {
         self.epoch.load(Ordering::SeqCst)
     }
 
-    pub async fn enqueue_write(&self, cmd: WriteCommand) -> anyhow::Result<String> {
+    /// Enqueue a write command. Errors are typed `BambooError`s so
+    /// structured codes (STASH_CONFLICT, PUSH_REJECTED, ...) reach the
+    /// RPC surface intact.
+    pub async fn enqueue_write(&self, cmd: WriteCommand) -> Result<String, BambooError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.write_tx
             .send((cmd, tx))
             .await
-            .map_err(|_| anyhow::anyhow!("write queue closed"))?;
-        let result = rx.await.map_err(|_| anyhow::anyhow!("write result dropped"))?;
+            .map_err(|_| BambooError::git_error("write queue closed"))?;
+        let result = rx
+            .await
+            .map_err(|_| BambooError::git_error("write result dropped"))?;
         match result {
             WriteResult::Ok(output) => Ok(output),
-            WriteResult::Err(e) => Err(anyhow::anyhow!("{}", e)),
+            WriteResult::Err(e) => Err(e),
             WriteResult::Undo(r) => r
                 .map(|_| String::new())
-                .map_err(|e| anyhow::anyhow!("{e}")),
+                .map_err(|e| BambooError::git_error(e.to_string())),
         }
     }
 
