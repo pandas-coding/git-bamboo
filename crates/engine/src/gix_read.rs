@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
     BambooError, BranchStatus, Commit, GraphPage, GraphViewport, Ref, RefKind, RemoteInfo,
-    StatusCode, StatusItem, StashEntry,
+    StashEntry, StatusCode, StatusItem,
 };
 
 use crate::cache::CachedCommit;
@@ -846,10 +846,7 @@ pub fn read_remotes(session: &Session) -> anyhow::Result<Vec<RemoteInfo>> {
 /// HEAD is an INVALID_ARGUMENT error so the client can disable the
 /// affected buttons. A branch without an upstream reports `upstream: null`
 /// with zero counts.
-pub fn read_branch_status(
-    session: &Session,
-    branch: Option<&str>,
-) -> anyhow::Result<BranchStatus> {
+pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Result<BranchStatus> {
     let repo_path = &session.repo_path;
     let branch = match branch {
         Some(b) => {
@@ -937,11 +934,7 @@ pub fn read_branch_status(
 /// (`ref` = reflog selector, `message` = subject, `date` = commit date).
 pub fn read_stash_list(session: &Session) -> anyhow::Result<Vec<StashEntry>> {
     let out = std::process::Command::new("git")
-        .args([
-            "stash",
-            "list",
-            "--format=%gd\u{1f}%s\u{1f}%ci",
-        ])
+        .args(["stash", "list", "--format=%gd\u{1f}%s\u{1f}%ci"])
         .current_dir(&session.repo_path)
         .output()?;
     if !out.status.success() {

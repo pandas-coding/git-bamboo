@@ -161,10 +161,8 @@ fn request_defaults_match_old_parser() {
 
 #[test]
 fn force_mode_string_forms() {
-    let p: Push = serde_json::from_str(
-        r#"{"remote":"origin","branch":"main","force":"lease"}"#,
-    )
-    .unwrap();
+    let p: Push =
+        serde_json::from_str(r#"{"remote":"origin","branch":"main","force":"lease"}"#).unwrap();
     assert_eq!(p.force, ForceMode::Lease);
 
     let p: Push =
@@ -211,10 +209,7 @@ fn force_mode_defaults_and_roundtrip() {
 
 #[test]
 fn force_mode_rejects_unknown_strings() {
-    assert!(serde_json::from_str::<Push>(
-        r#"{"remote":"o","branch":"b","force":"nuke"}"#
-    )
-    .is_err());
+    assert!(serde_json::from_str::<Push>(r#"{"remote":"o","branch":"b","force":"nuke"}"#).is_err());
 }
 
 #[test]
