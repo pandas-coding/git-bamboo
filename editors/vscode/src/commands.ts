@@ -4,6 +4,7 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient, RpcError } from './engineClient';
+import * as netOps from './netOps';
 import type { Ref, RepoState, UndoEntry } from './types';
 import { errorMessage, relativeTime } from './util';
 
@@ -34,12 +35,6 @@ async function pickBranch(
     { placeHolder },
   );
   return picked?.branchName;
-}
-
-async function pickRemote(): Promise<string | undefined> {
-  const remote = await vscode.window.showInputBox({ prompt: 'Remote name', value: 'origin' });
-  if (remote === undefined) return undefined; // cancelled
-  return remote.trim() || undefined;
 }
 
 export async function switchBranch(client: EngineClient): Promise<void> {
@@ -133,47 +128,32 @@ export async function undoLast(client: EngineClient): Promise<void> {
   }
 }
 
+/** Palette fetch: zero-typing — QuickPick over "All remotes" + the
+ *  engine's remote list; the interaction flow lives in netOps (shared
+ *  with the Phase 4 toolbar). */
 export async function fetchRemotes(client: EngineClient): Promise<void> {
-  const remote = await pickRemote();
-  if (remote === undefined) return; // cancelled
-  await runNetworkCommand(client, 'Git Bamboo: fetching…', 'fetch', remote ? { remote } : {});
-  vscode.window.showInformationMessage('Git Bamboo: fetch complete');
+  await netOps.runFetch({ client });
 }
 
+/** Palette pull: upstream detection, publish fallback, strategy and
+ *  auto-stash settings, conflict surfacing — all in netOps. */
 export async function pull(client: EngineClient, state: RepoState): Promise<void> {
-  const params: Record<string, unknown> = {};
-  if (state.currentBranch) params.branch = state.currentBranch;
-  await runNetworkCommand(client, `Git Bamboo: pulling${state.currentBranch ? ` ${state.currentBranch}` : ''}…`, 'pull', params);
-  vscode.window.showInformationMessage('Git Bamboo: pull complete');
+  await netOps.runPull({ client, repoRoot: state.root });
 }
 
+/** Palette "Pull with strategy…": one-shot strategy override. */
+export async function pullWithStrategy(client: EngineClient, state: RepoState): Promise<void> {
+  await netOps.runPullWithStrategy({ client, repoRoot: state.root });
+}
+
+/** Palette push: publish flow for unpublished branches, one-click push
+ *  (and rejection recovery) otherwise — all in netOps. */
 export async function push(client: EngineClient, state: RepoState): Promise<void> {
-  const remote = await pickRemote();
-  if (remote === undefined) return; // cancelled
-  let branch = state.currentBranch;
-  if (!branch) {
-    branch = await pickBranch(client, 'Push which branch?');
-    if (!branch) return;
-  }
-  await runNetworkCommand(client, `Git Bamboo: pushing ${branch}…`, 'push', {
-    remote: remote ?? 'origin',
-    branch,
-    force: false,
-  });
-  vscode.window.showInformationMessage(`Git Bamboo: pushed ${branch}`);
+  await netOps.runPush({ client, repoRoot: state.root });
 }
 
-async function runNetworkCommand(
-  client: EngineClient,
-  title: string,
-  method: string,
-  params: Record<string, unknown>,
-): Promise<void> {
-  await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title }, async () => {
-    try {
-      await client.request(method, params);
-    } catch (err) {
-      vscode.window.showErrorMessage(`Git Bamboo: ${method} failed — ${errorMessage(err)}`);
-    }
-  });
+/** Explicit force-push entry — the only path (besides the rejection
+ *  recovery button) that can ever produce --force*. */
+export async function forcePush(client: EngineClient, state: RepoState): Promise<void> {
+  await netOps.runForcePush({ client, repoRoot: state.root });
 }
