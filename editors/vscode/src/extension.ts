@@ -60,9 +60,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     activeClient && activeState
       ? commands.pull(activeClient, activeState)
       : noSessionWarning());
+  registerCommand(context, 'gitBamboo.pullWithStrategy', () =>
+    activeClient && activeState
+      ? commands.pullWithStrategy(activeClient, activeState)
+      : noSessionWarning());
   registerCommand(context, 'gitBamboo.push', () =>
     activeClient && activeState
       ? commands.push(activeClient, activeState)
+      : noSessionWarning());
+  registerCommand(context, 'gitBamboo.forcePush', () =>
+    activeClient && activeState
+      ? commands.forcePush(activeClient, activeState)
       : noSessionWarning());
   // Palette "Commit" just focuses the Commit view — the message box and
   // commit button live there.

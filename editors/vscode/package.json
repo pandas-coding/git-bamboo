@@ -66,6 +66,16 @@
         "category": "Git Bamboo"
       },
       {
+        "command": "gitBamboo.pullWithStrategy",
+        "title": "Pull with Strategy...",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.forcePush",
+        "title": "Force Push...",
+        "category": "Git Bamboo"
+      },
+      {
         "command": "gitBamboo.commit",
         "title": "Focus Commit View",
         "category": "Git Bamboo",
@@ -318,6 +328,45 @@
           "icon": "media/bamboo.svg"
         }
       ]
+    },
+    "configuration": {
+      "title": "Git Bamboo",
+      "properties": {
+        "gitbamboo.pull.strategy": {
+          "type": "string",
+          "enum": [
+            "default",
+            "merge",
+            "rebase",
+            "ff-only"
+          ],
+          "default": "default",
+          "description": "How the Pull command merges the upstream: 'default' adds no flag so your pull.rebase / pull.ff git config decides.",
+          "order": 1
+        },
+        "gitbamboo.pull.autoStash": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stash dirty worktree changes before pulling and re-apply them afterwards (git pull --autostash).",
+          "order": 2
+        },
+        "gitbamboo.push.forceMode": {
+          "type": "string",
+          "enum": [
+            "lease",
+            "force"
+          ],
+          "default": "lease",
+          "description": "Force push semantics: 'lease' overwrites only while the remote still points at the commit you last fetched (--force-with-lease); 'force' overwrites unconditionally (--force).",
+          "order": 3
+        },
+        "gitbamboo.push.confirmForce": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a confirmation modal before every force push.",
+          "order": 4
+        }
+      }
     }
   },
   "scripts": {
