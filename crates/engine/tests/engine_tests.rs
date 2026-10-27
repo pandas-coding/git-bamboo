@@ -2313,3 +2313,344 @@ async fn stash_pop_explicit_ref_targets_the_named_entry() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Conflict flow (phase 3): conflict classification, resolution, commit
+// guard, and stage-revision blob reads for the merge editor.
+// ---------------------------------------------------------------------------
+
+/// Both-modified conflict on a.txt: main writes "main\n", branch `side`
+/// writes "side\n", merging `side` into main conflicts (UU). Stages:
+/// :1 = "a\n" (base), :2 = "main\n" (ours), :3 = "side\n" (theirs).
+fn both_modified_repo() -> anyhow::Result<tempfile::TempDir> {
+    let dir = test_repo()?;
+    gitq(dir.path(), &["checkout", "-q", "-b", "side"])?;
+    std::fs::write(dir.path().join("a.txt"), "side\n")?;
+    gitq(dir.path(), &["commit", "-q", "-am", "side change"])?;
+    gitq(dir.path(), &["checkout", "-q", "main"])?;
+    std::fs::write(dir.path().join("a.txt"), "main\n")?;
+    gitq(dir.path(), &["commit", "-q", "-am", "main change"])?;
+    let merge = Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        !merge.status.success(),
+        "expected merge to conflict, got: {}",
+        String::from_utf8_lossy(&merge.stdout)
+    );
+    Ok(dir)
+}
+
+/// deleted-by-them conflict on b.txt: `side` deletes it, main modifies
+/// it; merging `side` into main conflicts (UD).
+fn deleted_by_them_repo() -> anyhow::Result<tempfile::TempDir> {
+    let dir = test_repo()?;
+    gitq(dir.path(), &["checkout", "-q", "-b", "side"])?;
+    gitq(dir.path(), &["rm", "-q", "b.txt"])?;
+    gitq(dir.path(), &["commit", "-q", "-m", "side deletes b"])?;
+    gitq(dir.path(), &["checkout", "-q", "main"])?;
+    std::fs::write(dir.path().join("b.txt"), "ours\n")?;
+    gitq(dir.path(), &["commit", "-q", "-am", "main modifies b"])?;
+    let merge = Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        !merge.status.success(),
+        "expected merge to conflict, got: {}",
+        String::from_utf8_lossy(&merge.stdout)
+    );
+    Ok(dir)
+}
+
+/// deleted-by-us conflict on c.txt: main deletes it, `side` modifies it;
+/// merging `side` into main conflicts (DU).
+fn deleted_by_us_repo() -> anyhow::Result<tempfile::TempDir> {
+    let dir = test_repo()?;
+    gitq(dir.path(), &["checkout", "-q", "-b", "side"])?;
+    std::fs::write(dir.path().join("c.txt"), "theirs\n")?;
+    gitq(dir.path(), &["commit", "-q", "-am", "side modifies c"])?;
+    gitq(dir.path(), &["checkout", "-q", "main"])?;
+    gitq(dir.path(), &["rm", "-q", "c.txt"])?;
+    gitq(dir.path(), &["commit", "-q", "-m", "main deletes c"])?;
+    let merge = Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        !merge.status.success(),
+        "expected merge to conflict, got: {}",
+        String::from_utf8_lossy(&merge.stdout)
+    );
+    Ok(dir)
+}
+
+#[tokio::test]
+async fn status_reports_conflict_kind() -> anyhow::Result<()> {
+    let dir = both_modified_repo()?;
+    let session = open_session(&dir).await?;
+
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    let item = items
+        .iter()
+        .find(|i| i.path == "a.txt")
+        .expect("conflicted a.txt should be listed");
+    assert_eq!(item.status, bamboo_protocol::StatusCode::Conflict);
+    assert_eq!(item.conflict_kind, Some(bamboo_protocol::ConflictKind::BothModified));
+
+    // Delete/modify conflicts classify too.
+    let dir = deleted_by_them_repo()?;
+    let session = open_session(&dir).await?;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    let item = items
+        .iter()
+        .find(|i| i.path == "b.txt")
+        .expect("conflicted b.txt should be listed");
+    assert_eq!(item.status, bamboo_protocol::StatusCode::Conflict);
+    assert_eq!(item.conflict_kind, Some(bamboo_protocol::ConflictKind::DeletedByThem));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_conflict_theirs_and_commit() -> anyhow::Result<()> {
+    let dir = both_modified_repo()?;
+    let session = open_session(&dir).await?;
+
+    let out = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "a.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::Theirs,
+        })
+        .await?;
+    assert!(out.contains("a.txt"), "output should name the path: {out}");
+
+    settle().await;
+    // Worktree took their blob; the resolution is staged (vs HEAD "main\n").
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "side\n");
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(
+        items
+            .iter()
+            .any(|i| i.path == "a.txt" && i.staged
+                && i.status == bamboo_protocol::StatusCode::Modified),
+        "resolved file should be staged as modified, got {:?}",
+        items
+    );
+    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+
+    // With no unmerged entries left, the commit goes through.
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
+            message: "merge side".to_string(),
+            amend: false,
+        })
+        .await?;
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "side\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_conflict_ours_yields_our_content() -> anyhow::Result<()> {
+    let dir = both_modified_repo()?;
+    let session = open_session(&dir).await?;
+
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "a.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::Ours,
+        })
+        .await?;
+    settle().await;
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "main\n");
+
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    // Our blob equals HEAD's, so after staging nothing shows as a change.
+    assert!(
+        !items.iter().any(|i| i.path == "a.txt"),
+        "resolved-with-ours (== HEAD) should show no change, got {:?}",
+        items
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_conflict_rejects_mismatches_and_stale_paths() -> anyhow::Result<()> {
+    let dir = both_modified_repo()?;
+    let session = open_session(&dir).await?;
+
+    // keepOurs on a content conflict: both sides have blobs; only
+    // ours/theirs are legal.
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "a.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::KeepOurs,
+        })
+        .await
+        .expect_err("keepOurs on both-modified must fail");
+    assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+    let msg = format!("{err}");
+    assert!(msg.contains("both-modified"), "should name the kind: {msg}");
+    assert!(msg.contains("ours/theirs"), "should suggest ours/theirs: {msg}");
+
+    // A non-conflicted path (unmodified since HEAD) is rejected: the
+    // classification is fresh, not taken from the client snapshot.
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "c.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::Ours,
+        })
+        .await
+        .expect_err("resolving a clean path must fail");
+    assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+
+    // The conflicted worktree content is untouched by the failed attempts.
+    assert!(std::fs::read_to_string(dir.path().join("a.txt"))?.contains("<<<<<<<"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_deleted_by_them_conflict() -> anyhow::Result<()> {
+    let dir = deleted_by_them_repo()?;
+    let session = open_session(&dir).await?;
+
+    // ours/theirs are illegal here: one side has no blob.
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "b.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::Ours,
+        })
+        .await
+        .expect_err("ours on deleted-by-them must fail");
+    assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+
+    // keepOurs keeps our modified file.
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "b.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::KeepOurs,
+        })
+        .await?;
+    settle().await;
+    assert_eq!(std::fs::read_to_string(dir.path().join("b.txt"))?, "ours\n");
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    // Then commit goes through.
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
+            message: "merge side keeping b".to_string(),
+            amend: false,
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_deleted_by_them_keep_theirs_confirms_deletion() -> anyhow::Result<()> {
+    let dir = deleted_by_them_repo()?;
+    let session = open_session(&dir).await?;
+
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "b.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::KeepTheirs,
+        })
+        .await?;
+    settle().await;
+    assert!(!dir.path().join("b.txt").exists(), "file should be gone");
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    // The confirmed deletion is staged (HEAD still has b.txt until the
+    // merge commit lands).
+    assert!(
+        items
+            .iter()
+            .any(|i| i.path == "b.txt" && i.staged && i.status == bamboo_protocol::StatusCode::Deleted),
+        "deletion confirmed: b.txt should be a staged deletion, got {:?}",
+        items
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_deleted_by_us_conflict() -> anyhow::Result<()> {
+    let dir = deleted_by_us_repo()?;
+    let session = open_session(&dir).await?;
+
+    // keepOurs confirms our deletion: their worktree copy is removed.
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "c.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::KeepOurs,
+        })
+        .await?;
+    settle().await;
+    assert!(!dir.path().join("c.txt").exists(), "our deletion should win");
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert!(!items.iter().any(|i| i.path == "c.txt"));
+
+    // keepTheirs (on a fresh conflict) restores their version from the
+    // index stage — even though the worktree copy was left by the merge.
+    let dir = deleted_by_us_repo()?;
+    let session = open_session(&dir).await?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "c.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::KeepTheirs,
+        })
+        .await?;
+    settle().await;
+    assert_eq!(std::fs::read_to_string(dir.path().join("c.txt"))?, "theirs\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_is_blocked_while_conflicted() -> anyhow::Result<()> {
+    let dir = both_modified_repo()?;
+    let session = open_session(&dir).await?;
+
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
+            message: "should not work".to_string(),
+            amend: false,
+        })
+        .await
+        .expect_err("commit with unmerged entries must fail");
+    let msg = format!("{err}");
+    assert!(msg.contains("a.txt"), "error should name the file: {msg}");
+    assert!(
+        msg.to_lowercase().contains("conflict"),
+        "error should mention conflicts: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_blob_serves_conflict_stages() -> anyhow::Result<()> {
+    let dir = both_modified_repo()?;
+    let session = open_session(&dir).await?;
+
+    let base = bamboo_engine::gix_read::read_blob(&session, ":1", "a.txt")?;
+    let ours = bamboo_engine::gix_read::read_blob(&session, ":2", "a.txt")?;
+    let theirs = bamboo_engine::gix_read::read_blob(&session, ":3", "a.txt")?;
+    assert_eq!(base, "a\n");
+    assert_eq!(ours, "main\n");
+    assert_eq!(theirs, "side\n");
+
+    // A missing stage (delete/modify conflicts have no :3/:2 on the
+    // deleted side... deleted-by-them still stages ours at :2) errors
+    // clearly rather than serving wrong content.
+    let dir = deleted_by_them_repo()?;
+    let session = open_session(&dir).await?;
+    assert!(
+        bamboo_engine::gix_read::read_blob(&session, ":2", "b.txt").is_ok(),
+        "ours stage should exist for deleted-by-them"
+    );
+    assert!(
+        bamboo_engine::gix_read::read_blob(&session, ":3", "b.txt").is_err(),
+        "theirs stage should be absent when they deleted the file"
+    );
+    Ok(())
+}

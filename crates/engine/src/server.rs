@@ -11,7 +11,7 @@ use bamboo_protocol::{
     BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
     Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetGraph, GetHeadResult, GetRemotes,
     GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
-    OutputResult, Pull, Push, RefsChanged, RemoteInfo, StashDrop, StashEntry, StashPop, StashPush,
+    OutputResult, Pull, Push, RefsChanged, RemoteInfo, ResolveConflict, StashDrop, StashEntry, StashPop, StashPush,
     Stage, StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, WorktreeChanged,
 };
 
@@ -450,6 +450,16 @@ impl BambooServer {
                     .enqueue_write(WriteCommand::Discard { paths: req.paths })
                     .await?;
                 Ok(Value::Null)
+            }
+            "resolveConflict" => {
+                let req: ResolveConflict = parse_params("resolveConflict", params)?;
+                let output = session
+                    .enqueue_write(WriteCommand::ResolveConflict {
+                        path: req.path,
+                        resolution: req.resolution,
+                    })
+                    .await?;
+                to_json_value(&OutputResult { output })
             }
             "commit" => {
                 let req: CommitMsg = parse_params("commit", params)?;

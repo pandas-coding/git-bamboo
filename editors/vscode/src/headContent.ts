@@ -17,6 +17,13 @@ export const ENGINE_SCHEME = 'git-bamboo';
  *  from any real git revision, so it can never collide with a sha or 'HEAD'. */
 export const EMPTY_REVISION = 'empty';
 
+/** Conflict-stage revisions the provider serves from the unmerged index:
+ *  base / ours / theirs of a conflicted path (engine getBlob ":N"). The
+ *  merge editor's three-way inputs are built from these. */
+export const STAGE_BASE = ':1';
+export const STAGE_OURS = ':2';
+export const STAGE_THEIRS = ':3';
+
 export class HeadContentProvider implements vscode.Disposable {
   private readonly registration: vscode.Disposable;
 
@@ -70,6 +77,9 @@ export class HeadContentProvider implements vscode.Disposable {
 function parseRevisionQuery(query: string): string | null {
   if (query === 'HEAD') return 'HEAD';
   if (query === EMPTY_REVISION) return '';
+  // Conflict stages (base/ours/theirs of the unmerged index entries) —
+  // tokens, not rev-parse inputs, same trust posture as 'HEAD'.
+  if (query === STAGE_BASE || query === STAGE_OURS || query === STAGE_THEIRS) return query;
   if (COMMIT_ID_RE.test(query)) return query;
   console.error(`[git-bamboo] refusing untrusted revision in URI query: ${query}`);
   return null;
@@ -77,13 +87,19 @@ function parseRevisionQuery(query: string): string | null {
 
 /**
  * Build a git-bamboo: URI serving `relativePath` at `ref` (a full commit sha,
- * 'HEAD', or EMPTY_REVISION) for diff side-by-sides. The path is validated
- * the same way openResource does, because callers reach this with data
- * originating from webview postMessages.
+ * 'HEAD', EMPTY_REVISION, or a conflict stage :1/:2/:3) for diff
+ * side-by-sides. The path is validated the same way openResource does,
+ * because callers reach this with data originating from webview postMessages.
  */
 export function commitRevisionUri(root: vscode.Uri, relativePath: string, ref: string): vscode.Uri {
   const uri = resolveRepoPath(root, relativePath);
   return uri.with({ scheme: ENGINE_SCHEME, query: ref });
+}
+
+/** git-bamboo: URI serving one conflict stage (base/ours/theirs) of a
+ *  conflicted file — the merge editor's input sides. */
+export function stageUri(root: vscode.Uri, relativePath: string, stage: typeof STAGE_BASE | typeof STAGE_OURS | typeof STAGE_THEIRS): vscode.Uri {
+  return commitRevisionUri(root, relativePath, stage);
 }
 
 /**

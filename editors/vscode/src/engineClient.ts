@@ -11,6 +11,7 @@ import type {
   BranchStatus,
   CommitDetail,
   CommitFile,
+  ConflictResolution,
   ForceMode,
   GetHeadResult,
   PullStrategy,
@@ -266,6 +267,17 @@ export class EngineClient {
    */
   discard(paths: string[]): Promise<void> {
     return this.request<void>('discard', { paths });
+  }
+
+  /**
+   * Engine RPC `resolveConflict`: resolve one conflicted path. The engine
+   * re-classifies the conflict fresh at execution time and rejects a
+   * resolution that does not fit the kind (e.g. `theirs` on a
+   * deleted-by-them conflict) with INVALID_ARGUMENT. Resolves with the
+   * engine's human-readable summary line.
+   */
+  resolveConflict(path: string, resolution: ConflictResolution): Promise<string> {
+    return this.request<string>('resolveConflict', { path, resolution });
   }
 
   /** Graceful shutdown request (best-effort, 2s cap), then kill the child. */

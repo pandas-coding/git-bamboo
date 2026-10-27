@@ -42,6 +42,41 @@ pub struct StatusItem {
     /// worktree change (index vs worktree). `Modified`/`Deleted` can be
     /// either; this flag disambiguates them for the SCM view.
     pub staged: bool,
+    /// Classification of the conflict for `StatusCode::Conflict` entries:
+    /// which side added / modified / deleted. Absent (`None`, omitted on
+    /// the wire) for non-conflict entries, so older clients that ignore
+    /// unknown fields keep working (backwards compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_kind: Option<ConflictKind>,
+}
+
+/// Kind of an index conflict, mirroring gix's classification of the
+/// unmerged index stages (stage 1 = base, 2 = ours, 3 = theirs). The
+/// frontend uses it to decide which resolve actions are legal for a
+/// file: content conflicts (both-modified / both-added / added-by-*)
+/// accept `ours`/`theirs` (`git checkout --ours/--theirs`), while
+/// delete/modify kinds only accept `keepOurs`/`keepTheirs`.
+///
+/// Rename/rename and rename/delete conflicts surface as one of these
+/// kinds as far as the unmerged index entries are concerned (the index
+/// only records stage states, not rename detection).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    /// Both sides deleted the file (porcelain `DD`).
+    BothDeleted,
+    /// We added the file, their side diverged (porcelain `AU`).
+    AddedByUs,
+    /// They deleted the file, we modified it (porcelain `UD`).
+    DeletedByThem,
+    /// They added the file, our side diverged (porcelain `UA`).
+    AddedByThem,
+    /// We deleted the file, they modified it (porcelain `DU`).
+    DeletedByUs,
+    /// Both sides added the file with different content (porcelain `AA`).
+    BothAdded,
+    /// Both sides modified the file (porcelain `UU`).
+    BothModified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,6 +228,29 @@ pub struct GetHeadResult {
     pub head: String,
     /// Short branch name (e.g. "main"); `None` when HEAD is detached.
     pub branch: Option<String>,
+}
+
+/// How a conflict is resolved, per the `resolveConflict` write RPC.
+/// `ours`/`theirs` take that side's blob (`git checkout --ours/--theirs`)
+/// and are only legal for content conflicts; `keep_ours`/`keep_theirs`
+/// keep what our/their side *did* — for delete/modify conflicts that
+/// means keeping the file or keeping the deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolution {
+    Ours,
+    Theirs,
+    KeepOurs,
+    KeepTheirs,
+}
+
+/// `resolveConflict` request: resolve one conflicted path. The engine
+/// re-classifies the path's conflict kind at execution time — a stale
+/// client snapshot must never drive the resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveConflict {
+    pub path: String,
+    pub resolution: ConflictResolution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

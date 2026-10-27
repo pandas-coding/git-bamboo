@@ -155,6 +155,21 @@
         "title": "Discard All Untracked Files",
         "category": "Git Bamboo",
         "icon": "$(discard)"
+      },
+      {
+        "command": "gitBamboo.commitView.openMergeEditor",
+        "title": "Resolve in Merge Editor",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.resolveOurs",
+        "title": "Accept Yours",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.commitView.resolveTheirs",
+        "title": "Accept Theirs",
+        "category": "Git Bamboo"
       }
     ],
     "menus": {
@@ -243,6 +258,18 @@
           "when": "false"
         },
         {
+          "command": "gitBamboo.commitView.openMergeEditor",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.resolveOurs",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.commitView.resolveTheirs",
+          "when": "false"
+        },
+        {
           "command": "gitBamboo.commitView.discardAllChanges",
           "when": "git-bamboo:active"
         },
@@ -289,8 +316,23 @@
         },
         {
           "command": "gitBamboo.commitView.openChanges",
-          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked)$/",
+          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked|conflicts)$/",
           "group": "2_open"
+        },
+        {
+          "command": "gitBamboo.commitView.openMergeEditor",
+          "when": "webviewId == gitBamboo.commit && webviewSection == file-conflicts",
+          "group": "2_open"
+        },
+        {
+          "command": "gitBamboo.commitView.resolveOurs",
+          "when": "webviewId == gitBamboo.commit && webviewSection == file-conflicts",
+          "group": "1_resolve@1"
+        },
+        {
+          "command": "gitBamboo.commitView.resolveTheirs",
+          "when": "webviewId == gitBamboo.commit && webviewSection == file-conflicts",
+          "group": "1_resolve@2"
         },
         {
           "command": "gitBamboo.commitView.discardFile",
@@ -299,7 +341,7 @@
         },
         {
           "command": "gitBamboo.commitView.copyPath",
-          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked)$/",
+          "when": "webviewId == gitBamboo.commit && webviewSection =~ /^file-(staged|changes|untracked|conflicts)$/",
           "group": "9_clipboard"
         }
       ]

@@ -7,7 +7,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use bamboo_protocol::{BambooError, ForceMode, PullStrategy};
+use bamboo_protocol::{BambooError, ConflictKind, ConflictResolution, ForceMode, PullStrategy};
 
 use crate::session::{EngineEvent, Session};
 use crate::undo::{UndoError, UndoOutcome, UndoSummary, UndoErrorKind};
@@ -22,6 +22,21 @@ pub enum WriteCommand {
     /// an undo transaction (routed directly in `run_write_queue`, see
     /// there).
     Discard { paths: Vec<String> },
+    /// Resolve one conflicted path by taking a side: `ours`/`theirs` take
+    /// that side's blob (`git checkout --ours/--theirs` + `git add`),
+    /// `keep_ours`/`keep_theirs` keep what that side did — for
+    /// delete/modify conflicts that means keeping the file or confirming
+    /// the deletion. UNDO DECISION: bypasses the undo journal — like
+    /// Discard, this writes worktree file contents the undo `Snapshot`
+    /// does not capture; restoring only the index would leave index and
+    /// worktree inconsistent (see the ResolveConflict arm in
+    /// `run_write_queue`). The conflict classification is re-done fresh
+    /// at execution time, so a stale client snapshot can never drive the
+    /// wrong resolution.
+    ResolveConflict {
+        path: String,
+        resolution: ConflictResolution,
+    },
     Commit { message: String, amend: bool },
     CreateBranch { name: String, base: Option<String> },
     DeleteBranch { name: String, force: bool },
@@ -79,6 +94,9 @@ impl WriteCommand {
             WriteCommand::Stage(paths) => format!("Stage({} paths)", paths.len()),
             WriteCommand::Unstage(paths) => format!("Unstage({} paths)", paths.len()),
             WriteCommand::Discard { .. } => "Discard changes".to_string(),
+            WriteCommand::ResolveConflict { resolution, .. } => {
+                format!("ResolveConflict({:?})", resolution)
+            }
             WriteCommand::Commit { amend, .. } => {
                 if *amend {
                     "Commit(amend)".to_string()
@@ -286,6 +304,26 @@ pub async fn run_write_queue(
                     Err(e) => (WriteResult::Err(BambooError::git_error(e.to_string())), 0),
                 }
             }
+            // ResolveConflict bypasses the undo journal (same reasoning as
+            // Discard, see the WriteCommand::ResolveConflict declaration):
+            // the resolution writes worktree file contents, which the undo
+            // snapshot does not capture — a snapshot-only index restore would
+            // leave index and worktree inconsistent. It still runs
+            // serialized on this queue, bumps the epoch on success, and is
+            // audit-logged — only the undo tx begin/commit is skipped.
+            WriteCommand::ResolveConflict { path, resolution } => {
+                let result = resolve_conflict(&session, path, *resolution).await;
+                match result {
+                    Ok(output) => (WriteResult::Ok(output), 0),
+                    Err(e) => {
+                        let mapped = match e.downcast::<BambooError>() {
+                            Ok(structured) => structured,
+                            Err(e) => BambooError::git_error(e.to_string()),
+                        };
+                        (WriteResult::Err(mapped), 0)
+                    }
+                }
+            }
             // Fetch bypasses the undo journal: remote-tracking refs
             // (refs/remotes/*) are a mirror of EXTERNAL truth. An "undo"
             // would rewind that mirror to a stale view of the remote —
@@ -422,6 +460,9 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         WriteCommand::Discard { .. } => {
             unreachable!("discard is routed in run_write_queue")
         }
+        WriteCommand::ResolveConflict { .. } => {
+            unreachable!("resolveConflict is routed in run_write_queue")
+        }
         WriteCommand::SwitchBranch { name, auto_stash } => {
             return switch_branch(session, name, *auto_stash).await;
         }
@@ -477,6 +518,12 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
             argv
         }
         WriteCommand::Commit { message, amend } => {
+            // Commit guard: refuse to commit while unmerged index entries
+            // exist — git itself would refuse (or, for `--amend` on a
+            // conflicted merge state, produce a commit with conflict
+            // markers). Engine-side, so the protection does not depend on
+            // any frontend interception.
+            assert_no_unmerged_paths(&session.repo_path).await?;
             // The message is the value of `-m`, never parsed as an option.
             if message.contains('\0') {
                 anyhow::bail!("commit message contains NUL");
@@ -1046,33 +1093,13 @@ async fn classify_discard_paths(
     )
     .await?;
 
-    // -z records are NUL-terminated and unquoted; a rename/copy entry
-    // carries the original path as an extra trailing field that must be
-    // consumed, never parsed as an entry itself.
-    let mut entries: Vec<(String, String)> = Vec::new();
-    let mut fields = out.split('\0');
-    while let Some(field) = fields.next() {
-        if field.is_empty() {
-            continue;
-        }
-        if field.len() < 3 {
-            continue;
-        }
-        let xy = &field[..2];
-        let path = field[3..].to_string();
-        entries.push((xy.to_string(), path));
-        if xy.starts_with('R') || xy.starts_with('C') {
-            // Consume the rename/copy source path field.
-            let _ = fields.next();
-        }
-    }
+    let entries = parse_porcelain_z(&out);
 
     // Unmerged index states (both sides diverge); `AA`/`DD` also only
     // arise from unmerged index entries.
-    const CONFLICT_CODES: [&str; 7] = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
     if let Some((_, path)) = entries
         .iter()
-        .find(|(xy, _)| CONFLICT_CODES.contains(&xy.as_str()))
+        .find(|(xy, _)| porcelain_conflict_kind(xy).is_some())
     {
         anyhow::bail!(
             "cannot discard {path:?}: the file has merge conflicts \
@@ -1108,6 +1135,207 @@ async fn classify_discard_paths(
     }
 
     Ok((tracked, untracked, intent_to_add))
+}
+
+/// Parse `git status --porcelain -z` output into (XY, path) records.
+/// -z records are NUL-terminated and unquoted; a rename/copy entry
+/// carries the original path as an extra trailing field that must be
+/// consumed, never parsed as an entry itself.
+fn parse_porcelain_z(out: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut fields = out.split('\0');
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        if field.len() < 3 {
+            continue;
+        }
+        let xy = &field[..2];
+        let path = field[3..].to_string();
+        entries.push((xy.to_string(), path));
+        if xy.starts_with('R') || xy.starts_with('C') {
+            // Consume the rename/copy source path field.
+            let _ = fields.next();
+        }
+    }
+    entries
+}
+
+/// Map a `git status --porcelain` XY code onto the conflict kind it
+/// represents, or `None` for non-conflict codes. Unmerged codes:
+/// DD both deleted, AU added by us, UD deleted by them, UA added by
+/// them, DU deleted by us, AA both added, UU both modified.
+fn porcelain_conflict_kind(xy: &str) -> Option<ConflictKind> {
+    match xy {
+        "DD" => Some(ConflictKind::BothDeleted),
+        "AU" => Some(ConflictKind::AddedByUs),
+        "UD" => Some(ConflictKind::DeletedByThem),
+        "UA" => Some(ConflictKind::AddedByThem),
+        "DU" => Some(ConflictKind::DeletedByUs),
+        "AA" => Some(ConflictKind::BothAdded),
+        "UU" => Some(ConflictKind::BothModified),
+        _ => None,
+    }
+}
+
+/// What git commands a conflict resolution boils down to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAction {
+    /// `git checkout --ours -- <path>` + `git add --` (take our blob —
+    /// also the "keep our file" side of a delete/modify conflict, since
+    /// our blob is staged at stage 2).
+    TakeOurs,
+    /// `git checkout --theirs -- <path>` + `git add --` (take their blob —
+    /// likewise the surviving side of a delete/modify conflict).
+    TakeTheirs,
+    /// Confirm the deletion: `git rm -f -- <path>` (drop all stages and
+    /// any worktree copy of the other side's content).
+    Remove,
+}
+
+/// The git commands a resolution maps to for a given conflict kind.
+/// Content conflicts (both-modified, both-added, added-by-*) have both
+/// blobs staged, so `ours`/`theirs` are `git checkout --ours/--theirs`;
+/// delete/modify conflicts only have one surviving side, so the actions
+/// are "keep the file" or "confirm the deletion". `keep_ours`/`keep_theirs`
+/// name the side whose *change* survives, not a blob — for content
+/// conflicts they are the same as `ours`/`theirs`.
+fn action_for(kind: ConflictKind, resolution: ConflictResolution) -> Result<ConflictAction, BambooError> {
+    use ConflictKind as K;
+    let kind_name = |k: ConflictKind| match k {
+        K::BothDeleted => "both-deleted",
+        K::AddedByUs => "added-by-us",
+        K::DeletedByThem => "deleted-by-them",
+        K::AddedByThem => "added-by-them",
+        K::DeletedByUs => "deleted-by-us",
+        K::BothAdded => "both-added",
+        K::BothModified => "both-modified",
+    };
+    let mismatch = || {
+        let (kind_str, hint) = match kind {
+            K::BothDeleted | K::DeletedByThem | K::DeletedByUs => (
+                kind_name(kind),
+                "a side deleted the file: use keepOurs/keepTheirs",
+            ),
+            _ => (
+                kind_name(kind),
+                "both sides have content: use ours/theirs",
+            ),
+        };
+        BambooError::invalid_argument(format!(
+            "resolution {resolution:?} is not valid for a {kind_str} conflict ({hint})"
+        ))
+    };
+    Ok(match (kind, resolution) {
+        // Content conflicts: both sides' blobs are staged.
+        (K::BothModified | K::BothAdded | K::AddedByUs | K::AddedByThem, ConflictResolution::Ours) => {
+            ConflictAction::TakeOurs
+        }
+        (K::BothModified | K::BothAdded | K::AddedByUs | K::AddedByThem, ConflictResolution::Theirs) => {
+            ConflictAction::TakeTheirs
+        }
+        // Delete/modify: "keep" names the side whose change survives.
+        // We modified, they deleted: keepOurs keeps the file (our blob is
+        // staged and in the worktree); keepTheirs confirms the deletion.
+        (K::DeletedByThem, ConflictResolution::KeepOurs) => ConflictAction::TakeOurs,
+        (K::DeletedByThem, ConflictResolution::KeepTheirs) => ConflictAction::Remove,
+        // We deleted, they modified: keepOurs confirms our deletion
+        // (the worktree copy of their content goes away); keepTheirs keeps
+        // their file, which is exactly the staged stage-3 blob.
+        (K::DeletedByUs, ConflictResolution::KeepOurs) => ConflictAction::Remove,
+        (K::DeletedByUs, ConflictResolution::KeepTheirs) => ConflictAction::TakeTheirs,
+        // Both deleted: any "keep" confirms the deletion.
+        (K::BothDeleted, ConflictResolution::KeepOurs | ConflictResolution::KeepTheirs) => {
+            ConflictAction::Remove
+        }
+        // Everything else is a kind/resolution mismatch: never guess.
+        _ => return Err(mismatch()),
+    })
+}
+
+/// Classify `path`'s conflict kind fresh, at execution time, from
+/// `git status --porcelain -z`. `None` (mapped to an INVALID_ARGUMENT
+/// error) when the path is not currently conflicted — a stale client
+/// snapshot must never drive a resolution.
+async fn classify_conflict_path(session: &Session, path: &str) -> Result<ConflictKind, BambooError> {
+    let out = run_git_checked(
+        &session.repo_path,
+        &["status", "--porcelain", "-z"],
+        &[path.to_string()],
+    )
+    .await
+    .map_err(|e| BambooError::git_error(e.to_string()))?;
+    let entries = parse_porcelain_z(&out);
+    // The pathspec filter limits records to this path (component-aware);
+    // a directory-shaped pathspec could match several files, so require
+    // exactly one and require it to be a conflict.
+    match entries.as_slice() {
+        [(xy, _)] if porcelain_conflict_kind(xy).is_some() => {
+            Ok(porcelain_conflict_kind(xy).expect("checked above"))
+        }
+        _ => Err(BambooError::invalid_argument(format!(
+            "{path:?} is not a conflicted file (its state may have changed \
+             since the UI snapshot — refresh and retry)"
+        ))),
+    }
+}
+
+/// Refuse to commit while any unmerged index entries exist (commit
+/// guard; engine-side so no frontend interception is required).
+async fn assert_no_unmerged_paths(repo_path: &std::path::Path) -> anyhow::Result<()> {
+    let out = run_git_checked(repo_path, &["status", "--porcelain", "-z"], &[]).await?;
+    if let Some((_, path)) = parse_porcelain_z(&out)
+        .into_iter()
+        .find(|(xy, _)| porcelain_conflict_kind(xy).is_some())
+    {
+        anyhow::bail!(
+            "cannot commit: {path:?} has unresolved merge conflicts \
+             (resolve them in the Commit view first)"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve one conflicted path: fresh classification → legality check →
+/// the mapped git commands (`checkout --ours/--theirs` + `add`, or
+/// `rm -f` for confirmed deletions). Runs on the write queue but
+/// bypasses the undo journal (see the WriteCommand::ResolveConflict
+/// declaration for the reasoning).
+async fn resolve_conflict(
+    session: &Session,
+    path: &str,
+    resolution: ConflictResolution,
+) -> anyhow::Result<String> {
+    validate_path_arg(path)?;
+    if path.ends_with('/') {
+        anyhow::bail!("conflict paths must name files, not directories: {path:?}");
+    }
+
+    let kind = classify_conflict_path(session, path).await?;
+    let action = action_for(kind, resolution)?;
+
+    let repo_path = &session.repo_path;
+    let paths = [path.to_string()];
+    let summary = match action {
+        ConflictAction::TakeOurs => {
+            run_git_checked(repo_path, &["checkout", "--ours"], &paths).await?;
+            run_git_checked(repo_path, &["add"], &paths).await?;
+            format!("resolved conflict in {path:?} (kept ours)")
+        }
+        ConflictAction::TakeTheirs => {
+            run_git_checked(repo_path, &["checkout", "--theirs"], &paths).await?;
+            run_git_checked(repo_path, &["add"], &paths).await?;
+            format!("resolved conflict in {path:?} (kept theirs)")
+        }
+        ConflictAction::Remove => {
+            // -f: unmerged entries (and the worktree copy of the other
+            // side's content) go without a staged-content comparison.
+            run_git_checked(repo_path, &["rm", "-f"], &paths).await?;
+            format!("resolved conflict in {path:?} (confirmed the deletion)")
+        }
+    };
+    Ok(summary)
 }
 
 /// Run one git subcommand, optionally with a `--`-separated path list

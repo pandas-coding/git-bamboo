@@ -15,13 +15,32 @@ export type StatusCode =
   | 'ignored'
   | 'conflict';
 
+/** Conflict classification for StatusItem.status === 'conflict': which
+ *  side added / modified / deleted. Mirrors protocol ConflictKind. */
+export type ConflictKind =
+  | 'both_modified'
+  | 'both_added'
+  | 'added_by_us'
+  | 'added_by_them'
+  | 'deleted_by_us'
+  | 'deleted_by_them'
+  | 'both_deleted';
+
 export interface StatusItem {
   path: string;
   status: StatusCode;
   old_path?: string;
   /** Whether the change is staged (index vs HEAD) vs a worktree change. */
   staged: boolean;
+  /** Conflict classification; absent for non-conflict entries. */
+  conflict_kind?: ConflictKind;
 }
+
+/** How a conflict is resolved, per the engine's `resolveConflict` RPC.
+ *  `ours`/`theirs` take that side's blob (content conflicts only);
+ *  `keepOurs`/`keepTheirs` keep what that side did — for delete/modify
+ *  conflicts, keeping the file or confirming the deletion. */
+export type ConflictResolution = 'ours' | 'theirs' | 'keep_ours' | 'keep_theirs';
 
 export interface Commit {
   id: string;

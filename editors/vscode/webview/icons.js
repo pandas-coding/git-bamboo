@@ -20,6 +20,14 @@ export const ICONS = {
   renamed: '<path d="M3.25 8h9.5"/><path d="M9 4.25 12.75 8 9 11.75"/>',
   copied: '<path d="M5.5 5.5h7v7h-7z"/><path d="M10.5 5.5v-2h-7v7h2"/>',
   typechanged: '<path d="M8 2.75 14.25 13.25H1.75z"/><path d="M8 6.75v2.75"/><path d="M8 11.5v.01"/>',
+  /** Merge-editor entry (conflict rows): two panes joined in the middle. */
+  mergeEditor:
+    '<path d="M2.5 2.5h11v11h-11z"/>' +
+    '<path d="M8 2.5v11"/>' +
+    '<path d="M6 6.75 4.75 8 6 9.25"/><path d="M10 6.75 11.25 8 10 9.25"/>',
+  /** Accept one side of a conflict (check with a direction hint). */
+  acceptOurs: '<path d="M3 8.5l2.25 2.25L9 6.25"/><path d="M11.75 3.75v3.75h-3.75"/>',
+  acceptTheirs: '<path d="M3 8.5l2.25 2.25L9 6.25"/><path d="M4.25 3.75v3.75h3.75"/>',
 };
 
 /** Wraps an ICONS body in the shared 16x16 stroke SVG element markup. */

@@ -355,6 +355,24 @@ fn path_matches(path: &str, filter: &str) -> bool {
     path == filter || path.starts_with(&format!("{filter}/"))
 }
 
+/// Map gix's conflict summary onto the protocol `ConflictKind` (same
+/// shape: which side added / modified / deleted the entry).
+fn map_conflict_summary(
+    summary: gix::status::plumbing::index_as_worktree::Conflict,
+) -> bamboo_protocol::ConflictKind {
+    use bamboo_protocol::ConflictKind as K;
+    use gix::status::plumbing::index_as_worktree::Conflict as C;
+    match summary {
+        C::BothDeleted => K::BothDeleted,
+        C::AddedByUs => K::AddedByUs,
+        C::DeletedByThem => K::DeletedByThem,
+        C::AddedByThem => K::AddedByThem,
+        C::DeletedByUs => K::DeletedByUs,
+        C::BothAdded => K::BothAdded,
+        C::BothModified => K::BothModified,
+    }
+}
+
 fn map_tree_index_change(change: gix::diff::index::Change) -> Option<StatusItem> {
     use gix::diff::index::Change as C;
 
@@ -364,18 +382,21 @@ fn map_tree_index_change(change: gix::diff::index::Change) -> Option<StatusItem>
             status: StatusCode::Added,
             old_path: None,
             staged: false,
+            conflict_kind: None,
         }),
         C::Deletion { location, .. } => Some(StatusItem {
             path: location.to_string(),
             status: StatusCode::Deleted,
             old_path: None,
             staged: false,
+            conflict_kind: None,
         }),
         C::Modification { location, .. } => Some(StatusItem {
             path: location.to_string(),
             status: StatusCode::Modified,
             old_path: None,
             staged: false,
+            conflict_kind: None,
         }),
         C::Rewrite {
             source_location,
@@ -391,6 +412,7 @@ fn map_tree_index_change(change: gix::diff::index::Change) -> Option<StatusItem>
             },
             old_path: Some(source_location.to_string()),
             staged: false,
+            conflict_kind: None,
         }),
     }
 }
@@ -403,15 +425,24 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
         IW::Modification {
             rela_path, status, ..
         } => {
-            let code = match status {
-                ES::Conflict { .. } => StatusCode::Conflict,
-                ES::Change(change) => match change {
-                    gix::status::plumbing::index_as_worktree::Change::Removed => {
-                        StatusCode::Deleted
-                    }
-                    _ => StatusCode::Modified,
-                },
-                ES::IntentToAdd => StatusCode::Added,
+            // Conflict entries map to Conflict + a classification (which
+            // side added/modified/deleted); the classification lets the
+            // frontend offer only the resolve actions that are legal for
+            // this file's conflict kind.
+            let (code, conflict_kind) = match status {
+                ES::Conflict { summary, .. } => {
+                    (StatusCode::Conflict, Some(map_conflict_summary(summary)))
+                }
+                ES::Change(change) => (
+                    match change {
+                        gix::status::plumbing::index_as_worktree::Change::Removed => {
+                            StatusCode::Deleted
+                        }
+                        _ => StatusCode::Modified,
+                    },
+                    None,
+                ),
+                ES::IntentToAdd => (StatusCode::Added, None),
                 ES::NeedsUpdate(_) => return None,
             };
             Some(StatusItem {
@@ -419,6 +450,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
                 status: code,
                 old_path: None,
                 staged: false,
+                conflict_kind,
             })
         }
         IW::DirectoryContents { entry, .. } => {
@@ -432,6 +464,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
                 status: code,
                 old_path: None,
                 staged: false,
+                conflict_kind: None,
             })
         }
         IW::Rewrite {
@@ -459,6 +492,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
                 },
                 old_path,
                 staged: false,
+                conflict_kind: None,
             })
         }
     }
@@ -507,6 +541,10 @@ pub fn read_refs(session: &Session) -> anyhow::Result<Vec<Ref>> {
 /// Returns an empty string when the path is absent (the UI treats that as
 /// no content rather than an error). `revision` is parsed by gix (no shell),
 /// but reject option-like strings defensively anyway.
+///
+/// Stage revisions `:1`/`:2`/`:3` are served from the unmerged index
+/// entries of `path` (base/ours/theirs of a conflict) instead of a
+/// commit — the merge-editor flow needs all three sides.
 pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Result<String> {
     if revision.is_empty()
         || revision.starts_with('-')
@@ -519,6 +557,10 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
     }
 
     let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(stage) = parse_stage_revision(revision) {
+        return read_conflict_stage_blob(&repo, path, stage);
+    }
 
     let id = repo
         .rev_parse_single(revision.as_bytes())
@@ -540,6 +582,44 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .try_into_blob()
         .map_err(|e| anyhow::anyhow!("{path:?} is not a file: {e}"))?;
+    Ok(String::from_utf8_lossy(&blob.data).into_owned())
+}
+
+/// `":N"` (N in 1..=3) as a conflict-stage revision; anything else is
+/// None (a normal rev-parse revision).
+fn parse_stage_revision(revision: &str) -> Option<gix::index::entry::Stage> {
+    match revision {
+        ":1" => Some(gix::index::entry::Stage::Base),
+        ":2" => Some(gix::index::entry::Stage::Ours),
+        ":3" => Some(gix::index::entry::Stage::Theirs),
+        _ => None,
+    }
+}
+
+/// Blob content of `path` at the given unmerged index stage. Missing
+/// stage (e.g. `:1` for a both-added conflict, `:3` for a deleted-by-
+/// them conflict) → empty string, matching the absent-path convention
+/// the diff/merge views already rely on.
+fn read_conflict_stage_blob(
+    repo: &gix::Repository,
+    path: &str,
+    stage: gix::index::entry::Stage,
+) -> anyhow::Result<String> {
+    let index = repo.index()?;
+    let entry = index
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.stage() == stage && entry.path_in(index.path_backing()) == path.as_bytes()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no stage {revision} entry for {path:?} — the file may not be \
+                 conflicted (or that side is absent)",
+                revision = stage as u32
+            )
+        })?;
+    let blob = repo.find_blob(entry.id)?;
     Ok(String::from_utf8_lossy(&blob.data).into_owned())
 }
 

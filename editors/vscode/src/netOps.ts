@@ -19,6 +19,9 @@ import { errorMessage } from './util';
 export interface NetOpsContext {
   readonly client: EngineClient;
   readonly repoRoot: vscode.Uri;
+  /** Focuses the Commit view and expands its Conflicts section (the pull
+   *  conflict banner's "Open Conflict Files" button). */
+  readonly showConflicts: () => Promise<void>;
 }
 
 const CONFIG_SECTION = 'gitbamboo';
@@ -159,8 +162,8 @@ export async function runPullWithStrategy(ctx: NetOpsContext): Promise<void> {
 }
 
 /** Pull failure surface: conflicts keep the worktree conflicted (never
- *  auto-aborted — same semantic as discard's refusal) and offer to focus
- *  the Commit view, where Phase 3's conflict section will pick them up. */
+ *  auto-aborted — same semantic as discard's refusal) and offer to jump to
+ *  the Commit view's conflicts section. */
 function showPullError(ctx: NetOpsContext, err: unknown, branch: string): void {
   if (isPullConflict(err)) {
     void vscode.window
@@ -170,10 +173,8 @@ function showPullError(ctx: NetOpsContext, err: unknown, branch: string): void {
         'Open Conflict Files',
       )
       .then((choice) => {
-        // Placeholder behavior until Phase 3's conflict section: focusing
-        // the Commit view already lists the conflicted files as changes.
         if (choice === 'Open Conflict Files') {
-          void vscode.commands.executeCommand('gitBamboo.commit.focus');
+          void ctx.showConflicts();
         }
       });
     return;

@@ -224,6 +224,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!(await activeCommitView.runContextCommand(action))) noCommitTargetWarning();
     });
   }
+  // Conflict-row context actions (conflicts bucket only; runContextCommand
+  // bucket-checks). Accept-side buttons pass the UI side — the provider
+  // maps it to the resolution the engine accepts for the file's kind.
+  const commitViewConflictActions = [
+    ['openMergeEditor', 'openMergeEditor', undefined],
+    ['resolveConflict', 'resolveOurs', 'ours'],
+    ['resolveConflict', 'resolveTheirs', 'theirs'],
+  ] as const;
+  for (const [action, command, side] of commitViewConflictActions) {
+    registerCommand(context, `gitBamboo.commitView.${command}`, async () => {
+      if (!activeCommitView) {
+        noSessionWarning();
+        return;
+      }
+      if (!(await activeCommitView.runContextCommand(action, side))) noCommitTargetWarning();
+    });
+  }
+  // Net-ops conflict banner "Open Conflict Files": focus the Commit view
+  // and expand its conflicts section.
+  registerCommand(context, 'gitBamboo.commit.showConflicts', async () => {
+    if (!activeCommitView) {
+      noSessionWarning();
+      return;
+    }
+    await activeCommitView.showConflicts();
+  });
   registerCommand(context, 'gitBamboo.commitView.copyPath', async () => {
     if (!activeCommitView) {
       noSessionWarning();

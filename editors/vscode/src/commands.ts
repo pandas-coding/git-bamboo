@@ -128,32 +128,44 @@ export async function undoLast(client: EngineClient): Promise<void> {
   }
 }
 
-/** Palette fetch: zero-typing — QuickPick over "All remotes" + the
- *  engine's remote list; the interaction flow lives in netOps (shared
- *  with the Phase 4 toolbar). */
+/** Build the shared net-ops context: the engine client, repo root, and
+ *  the conflict-flow entry point (focuses the Commit view's conflicts
+ *  section via its command, registered per-session in extension.ts). */
+function netOpsContext(client: EngineClient, state: RepoState): netOps.NetOpsContext {
+  return {
+    client,
+    repoRoot: state.root,
+    showConflicts: async () => {
+      await vscode.commands.executeCommand('gitBamboo.commit.showConflicts');
+    },
+  };
+}
+
+/** Fetch wrapper: remote pick and status surfacing live in netOps, which
+ *  also needs the engine's remote list. */
 export async function fetchRemotes(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runFetch({ client, repoRoot: state.root });
+  await netOps.runFetch(netOpsContext(client, state));
 }
 
 /** Palette pull: upstream detection, publish fallback, strategy and
  *  auto-stash settings, conflict surfacing — all in netOps. */
 export async function pull(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runPull({ client, repoRoot: state.root });
+  await netOps.runPull(netOpsContext(client, state));
 }
 
 /** Palette "Pull with strategy…": one-shot strategy override. */
 export async function pullWithStrategy(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runPullWithStrategy({ client, repoRoot: state.root });
+  await netOps.runPullWithStrategy(netOpsContext(client, state));
 }
 
 /** Palette push: publish flow for unpublished branches, one-click push
  *  (and rejection recovery) otherwise — all in netOps. */
 export async function push(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runPush({ client, repoRoot: state.root });
+  await netOps.runPush(netOpsContext(client, state));
 }
 
 /** Explicit force-push entry — the only path (besides the rejection
  *  recovery button) that can ever produce --force*. */
 export async function forcePush(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runForcePush({ client, repoRoot: state.root });
+  await netOps.runForcePush(netOpsContext(client, state));
 }
