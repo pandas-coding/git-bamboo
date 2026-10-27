@@ -55,7 +55,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ? commands.deleteBranch(activeClient, activeState)
       : noSessionWarning());
   registerCommand(context, 'gitBamboo.fetch', () =>
-    activeClient ? commands.fetchRemotes(activeClient) : noSessionWarning());
+    activeClient && activeState
+      ? commands.fetchRemotes(activeClient, activeState)
+      : noSessionWarning());
   registerCommand(context, 'gitBamboo.pull', () =>
     activeClient && activeState
       ? commands.pull(activeClient, activeState)

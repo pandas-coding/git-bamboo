@@ -14,10 +14,11 @@ import type { BranchStatus, ForceMode, PullStrategy, RemoteInfo } from './types'
 import { errorMessage } from './util';
 
 /** What the netOps flows need from the host: the engine client and the
- *  repo root (for opening a terminal at the right cwd on auth failure). */
+ *  repo root (for opening a terminal at the right cwd on auth failure).
+ *  Every consumer (palette now, Phase 4 toolbar later) has both. */
 export interface NetOpsContext {
   readonly client: EngineClient;
-  readonly repoRoot?: vscode.Uri;
+  readonly repoRoot: vscode.Uri;
 }
 
 const CONFIG_SECTION = 'gitbamboo';
@@ -34,7 +35,16 @@ interface StrategyPickItem extends vscode.QuickPickItem {
 // Settings readers
 // ---------------------------------------------------------------------------
 
+/** Read a setting from user/global scope only. Workspace settings live
+ *  inside the opened repository, so a cloned untrusted repo could
+ *  otherwise flip safety knobs via its own `.vscode/settings.json`. */
+function trustedSetting<T>(key: string, fallback: T): T {
+  const inspected = vscode.workspace.getConfiguration(CONFIG_SECTION).inspect<T>(key);
+  return inspected?.globalValue ?? inspected?.defaultValue ?? fallback;
+}
+
 function pullStrategySetting(): PullStrategy {
+  // Pull preferences are not safety-critical, so workspace scope is fine.
   const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<string>('pull.strategy');
   return value === 'merge' || value === 'rebase' || value === 'ff-only' ? value : 'default';
 }
@@ -43,18 +53,33 @@ function pullAutoStashSetting(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>('pull.autoStash') ?? false;
 }
 
+// The force-push knobs are deliberately scope-restricted: an untrusted
+// repo must not be able to silence the confirmation or upgrade to a
+// unconditional --force (see trustedSetting).
 function pushForceModeSetting(): ForceMode {
-  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<string>('push.forceMode');
-  return value === 'force' ? 'force' : 'lease';
+  return trustedSetting<string>('push.forceMode', 'lease') === 'force' ? 'force' : 'lease';
 }
 
 function pushConfirmForceSetting(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>('push.confirmForce') ?? true;
+  return trustedSetting('push.confirmForce', true);
 }
 
 // ---------------------------------------------------------------------------
 // Fetch
 // ---------------------------------------------------------------------------
+
+/** QuickPick items for the configured remotes, default remote first —
+ *  the single mapping shared by fetch and publish. */
+function remotePickItems(remotes: RemoteInfo[]): RemotePickItem[] {
+  return [...remotes]
+    .sort((a, b) => Number(b.default) - Number(a.default))
+    .map((remote) => ({
+      label: remote.name,
+      description: remote.url ?? '(no fetch URL)',
+      detail: remote.default ? 'Default remote' : undefined,
+      remote: remote.name,
+    }));
+}
 
 /** Fetch flow: QuickPick of "All remotes" (fetch --all) plus each
  *  configured remote — never a hand-typed remote name. */
@@ -68,12 +93,7 @@ export async function runFetch(ctx: NetOpsContext): Promise<void> {
         description: 'git fetch --all',
         remote: null,
       },
-      ...remotes.map((remote) => ({
-        label: remote.name,
-        description: remote.url ?? '(no fetch URL)',
-        detail: remote.default ? 'Default remote' : undefined,
-        remote: remote.name,
-      })),
+      ...remotePickItems(remotes),
     ],
     { placeHolder: 'Fetch from', matchOnDescription: true },
   );
@@ -166,7 +186,7 @@ function showPullError(ctx: NetOpsContext, err: unknown, branch: string): void {
 function isPullConflict(err: unknown): boolean {
   const code = rpcErrorCode(err);
   if (code === RpcErrorCode.STASH_CONFLICT) return true;
-  if (code !== undefined && code !== -32002) return false;
+  if (code !== undefined && code !== RpcErrorCode.GIT_ERROR) return false;
   return /conflict/i.test(errorMessage(err));
 }
 
@@ -189,7 +209,19 @@ export async function runPush(ctx: NetOpsContext): Promise<void> {
     return;
   }
   if (status.ahead === 0) {
-    // Nothing to push — force remains reachable via its explicit command.
+    if (status.behind > 0) {
+      // Nothing to push, but the branch is behind — offer the pull that
+      // actually moves it forward instead of a misleading "up to date".
+      const behind = status.behind;
+      const choice = await vscode.window.showInformationMessage(
+        `Git Bamboo: ${status.branch} is ${behind} commit${behind === 1 ? '' : 's'} ` +
+          `behind ${status.upstream} — nothing to push`,
+        'Pull',
+      );
+      if (choice === 'Pull') await runPull(ctx);
+      return;
+    }
+    // Truly in sync — force remains reachable via its explicit command.
     vscode.window.showInformationMessage(
       `Git Bamboo: ${status.branch} is already up to date with ${status.upstream}`,
     );
@@ -236,17 +268,55 @@ async function publishBranch(ctx: NetOpsContext, branch: string): Promise<boolea
 /** Remote QuickPick for publish: the engine-flagged default remote
  *  first, then the rest — no hand-typed names. */
 async function pickRemoteForPublish(remotes: RemoteInfo[]): Promise<string | undefined> {
-  const ordered = [...remotes].sort((a, b) => Number(b.default) - Number(a.default));
-  const picked = await vscode.window.showQuickPick<RemotePickItem>(
-    ordered.map((remote) => ({
-      label: remote.name,
-      description: remote.url ?? '(no fetch URL)',
-      detail: remote.default ? 'Default remote' : undefined,
-      remote: remote.name,
-    })),
-    { placeHolder: 'Publish to which remote?' },
-  );
+  const picked = await vscode.window.showQuickPick<RemotePickItem>(remotePickItems(remotes), {
+    placeHolder: 'Publish to which remote?',
+  });
   return picked?.remote ?? undefined;
+}
+
+/** Push target derived from an upstream short name: the remote and the
+ *  pushspec to send. A branch tracking a differently named remote branch
+ *  (e.g. local `foo` tracking `origin/bar`) pushes `foo:bar` so the
+ *  update lands on the ref the user actually tracks. */
+interface PushTarget {
+  readonly remote: string;
+  readonly pushspec: string;
+}
+
+/** Resolve an upstream like "origin/main" against the repo's configured
+ *  remotes. Malformed tracking names or a remote that is no longer
+ *  configured fail with a readable error instead of feeding an
+ *  unvalidated name into push. */
+async function resolvePushTarget(
+  ctx: NetOpsContext,
+  branch: string,
+  upstream: string,
+): Promise<PushTarget | null> {
+  const slash = upstream.indexOf('/');
+  if (slash <= 0 || slash === upstream.length - 1) {
+    vscode.window.showErrorMessage(
+      `Git Bamboo: unexpected upstream '${upstream}' — cannot determine the remote branch`,
+    );
+    return null;
+  }
+  const remote = upstream.slice(0, slash);
+  const remoteBranch = upstream.slice(slash + 1);
+  let remotes: RemoteInfo[];
+  try {
+    remotes = await ctx.client.getRemotes();
+  } catch (err) {
+    vscode.window.showErrorMessage(
+      `Git Bamboo: remotes unavailable — ${displaySafe(errorMessage(err))}`,
+    );
+    return null;
+  }
+  if (!remotes.some((r) => r.name === remote)) {
+    vscode.window.showErrorMessage(
+      `Git Bamboo: upstream remote '${remote}' is not configured in this repository`,
+    );
+    return null;
+  }
+  return { remote, pushspec: remoteBranch === branch ? branch : `${branch}:${remoteBranch}` };
 }
 
 /** Plain push of `branch` to its `upstream`; a -32009 rejection opens
@@ -256,9 +326,11 @@ async function pushWithRecovery(
   branch: string,
   upstream: string,
 ): Promise<void> {
+  const target = await resolvePushTarget(ctx, branch, upstream);
+  if (!target) return;
   try {
     await withNetworkProgress(`Pushing ${branch} → ${upstream}…`, () =>
-      ctx.client.push(remoteOf(upstream), branch, 'none', false),
+      ctx.client.push(target.remote, target.pushspec, 'none', false),
     );
     vscode.window.showInformationMessage(`Git Bamboo: pushed ${branch} → ${upstream}`);
   } catch (err) {
@@ -325,9 +397,11 @@ async function confirmAndForcePush(
     );
     if (confirmed !== 'Force Push') return; // cancelled
   }
+  const target = await resolvePushTarget(ctx, branch, upstream);
+  if (!target) return;
   try {
     await withNetworkProgress(`Force pushing ${branch} → ${upstream}…`, () =>
-      ctx.client.push(remoteOf(upstream), branch, forceMode, false),
+      ctx.client.push(target.remote, target.pushspec, forceMode, false),
     );
     vscode.window.showInformationMessage(
       `Git Bamboo: force pushed ${branch} → ${upstream} (--force${
@@ -349,19 +423,25 @@ async function confirmAndForcePush(
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
-/** Remote part of a short upstream name like "origin/main". */
-function remoteOf(upstream: string): string {
-  const slash = upstream.indexOf('/');
-  return slash > 0 ? upstream.slice(0, slash) : upstream;
+/** Notifications must stay plain strings: git output and engine error
+ *  messages embed remote-controlled text (stderr, URLs, ref names), which
+ *  is inert as text but would render as markup if ever passed as a
+ *  MarkdownString. Strip control characters and angle brackets at the
+ *  notification boundary so such a refactor can't turn hostile remote
+ *  content into an injection surface. */
+function displaySafe(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[<>]/g, '');
 }
 
 /** getBranchStatus for the current branch; null (with a readable
- *  notification) when HEAD is detached or the RPC fails. */
+ *  notification) when HEAD is detached, the RPC fails, or the engine
+ *  returns a malformed payload. */
 async function currentBranchStatus(ctx: NetOpsContext): Promise<BranchStatus | null> {
+  let status: BranchStatus | null;
   try {
-    return await ctx.client.getBranchStatus();
+    status = await ctx.client.getBranchStatus();
   } catch (err) {
-    const message = errorMessage(err);
+    const message = displaySafe(errorMessage(err));
     if (/detached/i.test(message)) {
       vscode.window.showWarningMessage(
         'Git Bamboo: HEAD is detached — switch to a branch to pull or push',
@@ -371,6 +451,13 @@ async function currentBranchStatus(ctx: NetOpsContext): Promise<BranchStatus | n
     }
     return null;
   }
+  if (!status) {
+    vscode.window.showErrorMessage(
+      'Git Bamboo: branch status unavailable — malformed engine response',
+    );
+    return null;
+  }
+  return status;
 }
 
 /** getRemotes; null (with a warning) when the repo has none configured
@@ -380,7 +467,9 @@ async function getRemotesOrWarn(ctx: NetOpsContext): Promise<RemoteInfo[] | null
   try {
     remotes = await ctx.client.getRemotes();
   } catch (err) {
-    vscode.window.showErrorMessage(`Git Bamboo: remotes unavailable — ${errorMessage(err)}`);
+    vscode.window.showErrorMessage(
+      `Git Bamboo: remotes unavailable — ${displaySafe(errorMessage(err))}`,
+    );
     return null;
   }
   if (remotes.length === 0) {
@@ -390,9 +479,10 @@ async function getRemotesOrWarn(ctx: NetOpsContext): Promise<RemoteInfo[] | null
   return remotes;
 }
 
-/** Network commands run under a progress notification. Without
- *  engine-side `--progress` parsing the stages are client-known only:
- *  connecting → transferring → done. */
+/** Network commands run under an indeterminate progress notification.
+ *  Engine-side `--progress` parsing is deliberately deferred (original
+ *  design §2.6), and the client cannot observe git's transfer stages, so
+ *  this is a single "transferring…" stage held until the RPC resolves. */
 async function withNetworkProgress(
   title: string,
   run: () => Promise<string>,
@@ -400,10 +490,8 @@ async function withNetworkProgress(
   return vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `Git Bamboo: ${title}` },
     async (progress) => {
-      progress.report({ message: 'connecting…' });
-      const output = await run();
-      progress.report({ message: 'done' });
-      return output;
+      progress.report({ message: 'transferring…' });
+      return run();
     },
   );
 }
@@ -413,7 +501,7 @@ async function withNetworkProgress(
 function showNetworkError(ctx: NetOpsContext, err: unknown, action: string): void {
   if (rpcErrorCode(err) === RpcErrorCode.AUTH_REQUIRED) {
     void vscode.window
-      .showErrorMessage(`Git Bamboo: ${action} needs authentication — ${errorMessage(err)}`, {
+      .showErrorMessage(`Git Bamboo: ${action} needs authentication — ${displaySafe(errorMessage(err))}`, {
         title: 'Open Terminal & Fetch',
         isCloseAffordance: true,
       })
@@ -422,7 +510,7 @@ function showNetworkError(ctx: NetOpsContext, err: unknown, action: string): voi
       });
     return;
   }
-  vscode.window.showErrorMessage(`Git Bamboo: ${action} failed — ${errorMessage(err)}`);
+  vscode.window.showErrorMessage(`Git Bamboo: ${action} failed — ${displaySafe(errorMessage(err))}`);
 }
 
 /** Non-interactive engine auth cannot prompt — guide the user to run one
@@ -430,17 +518,18 @@ function showNetworkError(ctx: NetOpsContext, err: unknown, action: string): voi
 function openTerminalAndFetch(ctx: NetOpsContext): void {
   const terminal = vscode.window.createTerminal({
     name: 'Git Bamboo auth',
-    ...(ctx.repoRoot ? { cwd: ctx.repoRoot } : {}),
+    cwd: ctx.repoRoot,
   });
   terminal.show();
   terminal.sendText('git fetch');
 }
 
 /** First meaningful line of git output as a completion summary (e.g.
- *  "Fast-forward", "Already up to date."), capped for a notification. */
+ *  "Fast-forward", "Already up to date."), capped and sanitized for a
+ *  notification (the output embeds remote-controlled text). */
 function outputSummary(output: string): string {
   const firstLine = output.trim().split('\n').find((line) => line.trim().length > 0);
   if (!firstLine) return '';
-  const summary = firstLine.trim().slice(0, 120);
+  const summary = displaySafe(firstLine.trim()).slice(0, 120);
   return ` — ${summary}`;
 }

@@ -131,8 +131,8 @@ export async function undoLast(client: EngineClient): Promise<void> {
 /** Palette fetch: zero-typing — QuickPick over "All remotes" + the
  *  engine's remote list; the interaction flow lives in netOps (shared
  *  with the Phase 4 toolbar). */
-export async function fetchRemotes(client: EngineClient): Promise<void> {
-  await netOps.runFetch({ client });
+export async function fetchRemotes(client: EngineClient, state: RepoState): Promise<void> {
+  await netOps.runFetch({ client, repoRoot: state.root });
 }
 
 /** Palette pull: upstream detection, publish fallback, strategy and

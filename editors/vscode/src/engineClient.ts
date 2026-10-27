@@ -16,11 +16,12 @@ import type {
   PullStrategy,
   Ref,
   RemoteInfo,
-  StashEntry,
 } from './types';
 
 /** Engine JSON-RPC error codes the client acts on (beyond raw display). */
 export const RpcErrorCode = {
+  /** Plain git failure (non-zero exit, no structured classification). */
+  GIT_ERROR: -32002,
   /** Stash pop/apply conflict — the stash entry is retained. */
   STASH_CONFLICT: -32008,
   /** Push rejected (non-fast-forward / stale lease) — recovery is client-side. */
@@ -238,26 +239,24 @@ export class EngineClient {
   }
 
   /** Engine RPC `getRemotes`: all configured remotes (URLs credential-
-   *  redacted server-side), with the default push target flagged. */
+   *  redacted server-side), with the default push target flagged.
+   *  Malformed entries are dropped rather than half-trusted. */
   async getRemotes(): Promise<RemoteInfo[]> {
     const result = await this.request<unknown>('getRemotes', {}, 5_000);
-    return Array.isArray(result) ? (result as RemoteInfo[]) : [];
+    return Array.isArray(result) ? result.filter(isValidRemoteInfo) : [];
   }
 
   /** Engine RPC `getBranchStatus`: upstream + ahead/behind counts of
-   *  `branch` (defaults to the current HEAD branch). */
-  async getBranchStatus(branch?: string): Promise<BranchStatus> {
-    return this.request<BranchStatus>(
+   *  `branch` (defaults to the current HEAD branch). Resolves null on a
+   *  malformed response (same convention as `getCommitDetail`) so callers
+   *  show a readable error instead of acting on a half-valid status. */
+  async getBranchStatus(branch?: string): Promise<BranchStatus | null> {
+    const result = await this.request<unknown>(
       'getBranchStatus',
       branch === undefined ? {} : { branch },
       5_000,
     );
-  }
-
-  /** Engine RPC `stashList`: all stash entries, newest first. */
-  async stashList(): Promise<StashEntry[]> {
-    const result = await this.request<unknown>('stashList', {}, 5_000);
-    return Array.isArray(result) ? (result as StashEntry[]) : [];
+    return isValidBranchStatus(result) ? result : null;
   }
 
   /**
@@ -402,6 +401,27 @@ function isValidCommitFile(value: unknown): value is CommitFile {
     (status === 'A' || status === 'D' || status === 'M' || status === 'R' || status === 'C' || status === 'T') &&
     typeof v.additions === 'number' &&
     typeof v.deletions === 'number'
+  );
+}
+
+function isValidRemoteInfo(value: unknown): value is RemoteInfo {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.name === 'string' &&
+    (typeof v.url === 'string' || v.url === null) &&
+    typeof v.default === 'boolean'
+  );
+}
+
+function isValidBranchStatus(value: unknown): value is BranchStatus {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.branch === 'string' &&
+    (typeof v.upstream === 'string' || v.upstream === null) &&
+    typeof v.ahead === 'number' &&
+    typeof v.behind === 'number'
   );
 }
 
