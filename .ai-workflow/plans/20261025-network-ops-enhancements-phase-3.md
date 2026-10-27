@@ -56,14 +56,14 @@ pull/stash pop 出现冲突后，用户在 git-bamboo 内完成解决：提交�
 
 ## Acceptance Criteria
 
-- [ ] 构造 both-modified 冲突后，提交视图出现置顶冲突栏，文件不再混入 changes。
-- [ ] Accept Yours/Theirs 一键解决单文件（status 转为 staged）。
-- [ ] [Resolve in Merge Editor] 打开 VS Code 三栏合并编辑器，accept + 保存后文件自动 staged。
-- [ ] delete/modify 冲突只提供 keep 动作；对它请求 ours/theirs 被引擎拒绝。
-- [ ] pull 冲突 → [Open Conflict Files] 聚焦冲突栏；不自动 abort。
-- [ ] 存在未解决冲突时 commit 被引擎拒绝。
-- [ ] 每条新增 webview→host 消息在 host 有类型/枚举/路径验证；右键目标消费时新鲜校验。
-- [ ] `cargo test` 与 tsc 通过。
+- [x] 构造 both-modified 冲突后，提交视图出现置顶冲突栏，文件不再混入 changes。
+- [x] Accept Yours/Theirs 一键解决单文件（status 转为 staged）。
+- [x] [Resolve in Merge Editor] 打开 VS Code 三栏合并编辑器，accept + 保存后文件自动 staged。
+- [x] delete/modify 冲突只提供 keep 动作；对它请求 ours/theirs 被引擎拒绝。
+- [x] pull 冲突 → [Open Conflict Files] 聚焦冲突栏；不自动 abort。
+- [x] 存在未解决冲突时 commit 被引擎拒绝。
+- [x] 每条新增 webview→host 消息在 host 有类型/枚举/路径验证；右键目标消费时新鲜校验。
+- [x] `cargo test` 与 tsc 通过。
 
 ## Dependencies
 

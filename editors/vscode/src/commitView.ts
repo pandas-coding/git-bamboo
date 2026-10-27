@@ -400,14 +400,13 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     } else {
       await vscode.commands.executeCommand(`${CommitViewProvider.viewId}.focus`);
     }
-    // The view may just now be resolving (focus of a collapsed view) —
-    // its webview is not loaded yet and would drop the message. Flag
-    // it and replay with the next status push (the ready handshake
-    // triggers one immediately).
+    // Send immediately when a view is attached, and flag the request so
+    // the next status push replays it: a freshly resolved view's webview
+    // is not loaded yet (the ready handshake triggers that push), and
+    // would silently drop the message. The replay is idempotent.
     this.pendingShowConflicts = true;
     if (this.view) {
-      await this.view?.webview.postMessage({ type: 'showConflicts' });
-      this.pendingShowConflicts = false;
+      await this.view.webview.postMessage({ type: 'showConflicts' });
     }
   }
 
