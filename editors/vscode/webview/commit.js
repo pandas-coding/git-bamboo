@@ -6,21 +6,31 @@
  * Host protocol (see src/commitView.ts):
  *   outbound: { type: 'stage' | 'unstage', paths }
  *             { type: 'openResource', path, status }
+ *             { type: 'openMergeEditor', path }
+ *             { type: 'resolveConflict', path, resolution }
  *             { type: 'commit', message, amend }
  *             { type: 'contextTarget', file: { path, status, bucket } | null }
  *   inbound:  { type: 'status', items }  — raw engine StatusItem[], bucketed here
  *             { type: 'committed' }      — clear the message box
+ *             { type: 'showConflicts' }  — expand + reveal the conflicts section
  */
 
 import { iconSvg } from './icons.js';
 
 const vscode = acquireVsCodeApi();
 
-/** @typedef {{ path: string, status: string, old_path?: string, staged: boolean }} StatusItem */
+/** @typedef {{ path: string, status: string, old_path?: string, staged: boolean,
+ *              conflict_kind?: string }} StatusItem */
 
-/** Bucketing rule mirrored from the old scmProvider: staged flag first,
- *  then untracked; ignored items are filtered out entirely. */
-const BUCKETS = ['staged', 'changes', 'untracked'];
+/** Bucketing rule mirrored from the host (commitView.ts bucketOf):
+ *  conflicted files first (an unmerged entry is neither staged nor
+ *  unstaged), then staged flag, then untracked; ignored items are
+ *  filtered out entirely. */
+const BUCKETS = ['conflicts', 'staged', 'changes', 'untracked'];
+
+/** Buckets with a section-header bulk button (conflicts has none: there
+ *  is no meaningful "resolve all with one side" bulk action). */
+const BULK_BUCKETS = ['staged', 'changes', 'untracked'];
 
 /** UI state preserved across re-renders (only the list DOM is replaced). */
 const collapsed = new Set();
@@ -40,21 +50,25 @@ const els = {
   message: document.getElementById('commit-message'),
   empty: document.getElementById('empty-state'),
   sections: {
+    conflicts: document.getElementById('conflicts-section'),
     staged: document.getElementById('staged-section'),
     changes: document.getElementById('changes-section'),
     untracked: document.getElementById('untracked-section'),
   },
   counts: {
+    conflicts: document.getElementById('conflicts-count'),
     staged: document.getElementById('staged-count'),
     changes: document.getElementById('changes-count'),
     untracked: document.getElementById('untracked-count'),
   },
   bodies: {
+    conflicts: document.getElementById('conflicts-body'),
     staged: document.getElementById('staged-body'),
     changes: document.getElementById('changes-body'),
     untracked: document.getElementById('untracked-body'),
   },
   bulk: {
+    conflicts: null,
     staged: document.getElementById('staged-bulk'),
     changes: document.getElementById('changes-bulk'),
     untracked: document.getElementById('untracked-bulk'),
@@ -66,9 +80,36 @@ const els = {
 };
 
 function bucketOf(item) {
+  if (item.status === 'conflict') return 'conflicts';
   if (item.staged) return 'staged';
   if (item.status === 'untracked') return 'untracked';
   return 'changes';
+}
+
+/** Resolution buttons offered for a conflict of the given kind — the
+ *  labels name what the side did for delete/modify conflicts (the
+ *  host/engine enforce the same kind→resolution table). */
+function conflictResolutions(kind) {
+  switch (kind) {
+    case 'deleted_by_them':
+      return [
+        { resolution: 'keep_ours', icon: 'acceptOurs', title: 'Keep Current Change (file stays)' },
+        { resolution: 'keep_theirs', icon: 'acceptTheirs', title: 'Accept Their Deletion (file goes)' },
+      ];
+    case 'deleted_by_us':
+      return [
+        { resolution: 'keep_ours', icon: 'acceptOurs', title: 'Accept Our Deletion (file goes)' },
+        { resolution: 'keep_theirs', icon: 'acceptTheirs', title: 'Keep Their Change (file stays)' },
+      ];
+    case 'both_deleted':
+      return [{ resolution: 'keep_ours', icon: 'acceptOurs', title: 'Accept Deletion' }];
+    default:
+      // Content conflicts (both-modified/added, added-by-either side).
+      return [
+        { resolution: 'ours', icon: 'acceptOurs', title: 'Accept Yours' },
+        { resolution: 'theirs', icon: 'acceptTheirs', title: 'Accept Theirs' },
+      ];
+  }
 }
 
 /** Splits a repo-relative path into { filename, dirname } for the compact
@@ -130,10 +171,20 @@ function createFileRow(item) {
     row.appendChild(dir);
   }
 
-  // Inline actions: staged rows offer unstage + diff; others stage + open.
+  // Inline actions: conflict rows offer the merge editor + side
+  // buttons; staged rows offer unstage + diff; others stage + open.
   const actions = document.createElement('span');
   actions.className = 'actions';
-  if (bucket === 'staged') {
+  if (bucket === 'conflicts') {
+    actions.appendChild(createButton('mergeEditor', 'Resolve in Merge Editor', () => {
+      vscode.postMessage({ type: 'openMergeEditor', path: item.path });
+    }));
+    for (const { resolution, icon, title } of conflictResolutions(item.conflict_kind)) {
+      actions.appendChild(createButton(icon, title, () => {
+        vscode.postMessage({ type: 'resolveConflict', path: item.path, resolution });
+      }));
+    }
+  } else if (bucket === 'staged') {
     actions.appendChild(createButton('unstage', 'Unstage Changes', () => {
       vscode.postMessage({ type: 'unstage', paths: [item.path] });
     }));
@@ -165,7 +216,7 @@ function createFileRow(item) {
 }
 
 function render(items) {
-  const buckets = { staged: [], changes: [], untracked: [] };
+  const buckets = { conflicts: [], staged: [], changes: [], untracked: [] };
   for (const item of items) {
     if (item.status === 'ignored') continue; // hidden, as in the old SCM view
     buckets[bucketOf(item)].push(item);
@@ -181,15 +232,25 @@ function render(items) {
     body.replaceChildren(...list.map(createFileRow));
     els.counts[key].textContent = String(list.length);
     section.style.display = list.length > 0 ? '' : 'none';
-    els.bulk[key].disabled = list.length === 0;
+    if (els.bulk[key]) els.bulk[key].disabled = list.length === 0;
     applyCollapsed(key);
   }
+
+  // Commit is blocked while any file is conflicted (the engine rejects
+  // commits with unmerged entries too — this mirrors the guard so the
+  // button doesn't invite a doomed action).
+  const hasConflicts = buckets.conflicts.length > 0;
+  els.btnCommit.disabled = hasConflicts;
+  els.btnAmend.disabled = hasConflicts;
+  els.btnCommit.title = hasConflicts ? 'Resolve the merge conflicts first' : '';
+  els.btnAmend.title = hasConflicts ? 'Resolve the merge conflicts first' : '';
 
   els.empty.classList.toggle('visible', total === 0);
   els.stats.textContent = total === 0 ? '' : `${total} file${total === 1 ? '' : 's'} · ${buckets.staged.length} staged`;
 }
 
 function sendCommit(amend) {
+  if (els.btnCommit.disabled) return; // conflicts guard set by render()
   vscode.postMessage({ type: 'commit', message: els.message.value.trim(), amend });
 }
 
@@ -220,8 +281,9 @@ for (const key of BUCKETS) {
 // Section-level bulk actions: reuse the stage/unstage message with every
 // path of the bucket (host side needs no changes). The paths are derived
 // from the rendered rows at click time (no parallel state to drift), and
-// stopPropagation keeps the header's collapse toggle out of it.
-for (const key of BUCKETS) {
+// stopPropagation keeps the header's collapse toggle out of it. The
+// conflicts bucket has no bulk button by design.
+for (const key of BULK_BUCKETS) {
   els.bulk[key].addEventListener('click', (event) => {
     event.stopPropagation();
     const paths = Array.from(
@@ -264,6 +326,11 @@ window.addEventListener('message', (event) => {
   } else if (message.type === 'committed') {
     els.message.value = '';
     autoGrow(); // programmatic clears don't fire the input event
+  } else if (message.type === 'showConflicts') {
+    // net-ops banner "Open Conflict Files": expand and reveal the section.
+    collapsed.delete('conflicts');
+    applyCollapsed('conflicts');
+    els.sections.conflicts.scrollIntoView({ block: 'nearest' });
   }
 });
 

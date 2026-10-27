@@ -11,18 +11,23 @@
  */
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { EngineClient } from './engineClient';
+import { EngineClient, rpcErrorCode } from './engineClient';
 import { createContextTargetSlot } from './contextTargetSlot';
 import { isValidRepoPath, openResource } from './headContent';
-import type { StatusItem } from './types';
+import { MergeEditorManager } from './mergeEditor';
+import type { ConflictKind, ConflictResolution, StatusItem } from './types';
 import { errorMessage } from './util';
 import { buildWebviewHtml } from './webviewHtml';
+
+/** Engine JSON-RPC INVALID_ARGUMENT (see protocol BambooError) — the
+ *  resolveConflict kind-mismatch / stale-snapshot rejection. */
+const RPC_INVALID_ARGUMENT = -32005;
 
 /** Debounce for status refreshes (the engine coalesces fs events at 50ms). */
 const REFRESH_DEBOUNCE_MS = 50;
 
 /** Valid context-menu buckets (mirror of the webview's BUCKETS). */
-const CONTEXT_BUCKETS = new Set(['staged', 'changes', 'untracked']);
+const CONTEXT_BUCKETS = new Set(['conflicts', 'staged', 'changes', 'untracked']);
 
 interface CommitViewMessage {
   type?: string;
@@ -31,6 +36,7 @@ interface CommitViewMessage {
   status?: string;
   message?: string;
   amend?: boolean;
+  resolution?: string;
   /** contextTarget payload: the file under the webview's context menu
    *  (null = right-click landed on a non-file row; clears any target). */
   file?: { path?: unknown; status?: unknown; bucket?: unknown } | null;
@@ -40,14 +46,32 @@ interface CommitViewMessage {
 export interface CommitContextTarget {
   path: string;
   status: string;
-  bucket: 'staged' | 'changes' | 'untracked';
+  bucket: 'conflicts' | 'staged' | 'changes' | 'untracked';
 }
 
-/** Bucketing rule mirrored from the webview (commit.js bucketOf). */
-function bucketOf(item: StatusItem): 'staged' | 'changes' | 'untracked' {
+/** Bucketing rule mirrored from the webview (commit.js bucketOf):
+ *  conflicted files first (conflicts take priority over staged state —
+ *  an unmerged entry is neither staged nor unstaged), then staged,
+ *  then untracked, then worktree changes. */
+function bucketOf(item: StatusItem): 'conflicts' | 'staged' | 'changes' | 'untracked' {
+  if (item.status === 'conflict') return 'conflicts';
   if (item.staged) return 'staged';
   if (item.status === 'untracked') return 'untracked';
   return 'changes';
+}
+
+/** Map a UI side ("accept ours/theirs") to the resolution the engine
+ *  accepts for the file's conflict kind: delete/modify kinds need the
+ *  keep_* variants (one side has no blob to take). The webview row
+ *  buttons apply the same mapping client-side. */
+export function sideResolution(
+  kind: ConflictKind | undefined,
+  side: 'ours' | 'theirs',
+): ConflictResolution {
+  const deleteModify =
+    kind === 'deleted_by_us' || kind === 'deleted_by_them' || kind === 'both_deleted';
+  if (side === 'ours') return deleteModify ? 'keep_ours' : 'ours';
+  return deleteModify ? 'keep_theirs' : 'theirs';
 }
 
 export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -69,12 +93,21 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   /** Per-view subscriptions, torn down on re-resolution so listeners
    *  never double up (mirrors GraphWebviewProvider.teardownSession). */
   private viewDisposables: vscode.Disposable[] = [];
+  /** Merge-editor sessions for this repo's conflicts (tracks saves of
+   *  open merge-editor outputs and stages finished resolutions). */
+  private readonly mergeEditors: MergeEditorManager;
+  /** A showConflicts request that raced the webview's readiness (net-ops
+   *  banner can fire before the view is resolved): replayed with the
+   *  next status push. */
+  private pendingShowConflicts = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly client: EngineClient,
     private readonly root: vscode.Uri,
-  ) {}
+  ) {
+    this.mergeEditors = new MergeEditorManager(client, root);
+  }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     // Re-resolution (view disposed then re-opened): tear down any prior
@@ -119,6 +152,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     if (this.disposed) return;
     this.disposed = true;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    this.mergeEditors.dispose();
     this.teardownView();
     this.view = undefined;
   }
@@ -136,6 +170,16 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       case 'openResource':
         if (typeof message.path === 'string') {
           void this.openResource(message.path, message.status ?? '');
+        }
+        break;
+      case 'resolveConflict':
+        if (typeof message.path === 'string') {
+          void this.resolveConflict(message.path, message.resolution ?? '');
+        }
+        break;
+      case 'openMergeEditor':
+        if (typeof message.path === 'string') {
+          void this.openMergeEditor(message.path);
         }
         break;
       case 'commit':
@@ -173,6 +217,12 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
         type: 'status',
         items: this.lastItems,
       });
+      // Replay a showConflicts request that raced the webview's readiness
+      // (sent while the view was resolving and its webview not yet loaded).
+      if (this.pendingShowConflicts && this.view) {
+        this.pendingShowConflicts = false;
+        await this.view.webview.postMessage({ type: 'showConflicts' });
+      }
     } catch (err) {
       vscode.window.showErrorMessage(`Git Bamboo: status refresh failed — ${errorMessage(err)}`);
     } finally {
@@ -281,6 +331,86 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     }
   }
 
+  /** Resolve one conflicted file (webview "Accept Yours/Theirs" or
+   *  keep-file/keep-deletion buttons). Same flow shape as discard minus
+   *  the modal (each resolution is reversible enough via git); the engine
+   *  re-classifies the conflict at execution time and rejects a stale
+   *  snapshot with INVALID_ARGUMENT, surfaced here as a warning. */
+  private async resolveConflict(relativePath: string, resolution: string): Promise<void> {
+    // Trust boundary: only repo-relative paths and the four known
+    // resolutions reach the engine write RPC.
+    const resolutions = new Set<ConflictResolution>(['ours', 'theirs', 'keep_ours', 'keep_theirs']);
+    if (!isValidRepoPath(relativePath) || !resolutions.has(resolution as ConflictResolution)) {
+      return;
+    }
+    // Freshness cross-check: the buttons were rendered against a status
+    // snapshot; require the file to still be listed as conflicted.
+    const current = this.lastItems.find(
+      (item) => item.path === relativePath && item.status === 'conflict',
+    );
+    if (current === undefined) {
+      vscode.window.showWarningMessage(
+        `Git Bamboo: ${path.posix.basename(relativePath)} is no longer conflicted — nothing was changed.`,
+      );
+      return;
+    }
+    try {
+      await this.client.resolveConflict(relativePath, resolution as ConflictResolution);
+      await this.doRefresh();
+    } catch (err) {
+      // INVALID_ARGUMENT = kind mismatch or stale path (engine message is
+      // user-readable); anything else is a real engine failure.
+      if (rpcErrorCode(err) === RPC_INVALID_ARGUMENT) {
+        vscode.window.showWarningMessage(`Git Bamboo: ${errorMessage(err)}`);
+      } else {
+        vscode.window.showErrorMessage(
+          `Git Bamboo: resolving ${relativePath} failed — ${errorMessage(err)}`,
+        );
+      }
+    }
+  }
+
+  /** Open the 3-way merge editor for one conflicted file (webview
+   *  "Resolve in Merge Editor" button). */
+  private async openMergeEditor(relativePath: string): Promise<void> {
+    if (!isValidRepoPath(relativePath)) return;
+    const current = this.lastItems.find(
+      (item) => item.path === relativePath && item.status === 'conflict',
+    );
+    if (current === undefined) {
+      vscode.window.showWarningMessage(
+        `Git Bamboo: ${path.posix.basename(relativePath)} is no longer conflicted.`,
+      );
+      return;
+    }
+    try {
+      await this.mergeEditors.openFor(relativePath, current.conflict_kind);
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        `Git Bamboo: opening the merge editor for ${relativePath} failed — ${errorMessage(err)}`,
+      );
+    }
+  }
+
+  /** Focus the Commit view and expand its Conflicts section (net-ops
+   *  banner's "Open Conflict Files" button). */
+  async showConflicts(): Promise<void> {
+    if (this.view) {
+      this.view.show(true);
+    } else {
+      await vscode.commands.executeCommand(`${CommitViewProvider.viewId}.focus`);
+    }
+    // The view may just now be resolving (focus of a collapsed view) —
+    // its webview is not loaded yet and would drop the message. Flag
+    // it and replay with the next status push (the ready handshake
+    // triggers one immediately).
+    this.pendingShowConflicts = true;
+    if (this.view) {
+      await this.view?.webview.postMessage({ type: 'showConflicts' });
+      this.pendingShowConflicts = false;
+    }
+  }
+
   /** Returns (and clears) the file targeted by the Commit view's context
    *  menu, if any — but only when the file is still listed in the current
    *  status under the same bucket (a refresh may have moved or removed it
@@ -297,9 +427,13 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
    *  when no current target is parked (safety net for programmatic
    *  invocation of the palette-hidden commands). Stage/unstage go through
    *  changePaths (path validation + refresh); open delegates to the shared
-   *  openResource helper; discard goes through the confirmation flow. */
+   *  openResource helper; discard goes through the confirmation flow;
+   *  conflict actions (merge editor / accept a side) apply only to the
+   *  conflicts bucket, with ours/theirs mapped to the kind's legal
+   *  resolution. */
   async runContextCommand(
-    action: 'openChanges' | 'stageFile' | 'unstageFile' | 'discardFile',
+    action: 'openChanges' | 'stageFile' | 'unstageFile' | 'discardFile' | 'openMergeEditor' | 'resolveConflict',
+    side?: 'ours' | 'theirs',
   ): Promise<boolean> {
     const target = this.takeContextTarget();
     if (!target) return false;
@@ -311,8 +445,24 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     //  would silently rewrite it to its pre-stage content — the staged
     //  bucket deliberately offers no discard (mirrors the menu when clause).
     if (action === 'discardFile' && target.bucket === 'staged') return false;
+    if (
+      (action === 'openMergeEditor' || action === 'resolveConflict') &&
+      target.bucket !== 'conflicts'
+    ) {
+      return false;
+    }
     if (action === 'openChanges') {
       await this.openResource(target.path, target.status);
+    } else if (action === 'openMergeEditor') {
+      await this.openMergeEditor(target.path);
+    } else if (action === 'resolveConflict') {
+      const kind = this.lastItems.find(
+        (item) => item.path === target.path && item.status === 'conflict',
+      )?.conflict_kind;
+      await this.resolveConflict(
+        target.path,
+        sideResolution(kind, side === 'theirs' ? 'theirs' : 'ours'),
+      );
     } else if (action === 'discardFile') {
       await this.discardPaths([target.path]);
     } else {
