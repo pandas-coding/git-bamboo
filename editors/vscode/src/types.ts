@@ -91,6 +91,44 @@ export interface GetHeadResult {
   branch: string | null;
 }
 
+/** One remote as reported by the engine's `getRemotes` RPC.
+ *  URLs are credential-redacted server-side before they leave the engine. */
+export interface RemoteInfo {
+  name: string;
+  /** Fetch URL (first configured, `insteadOf` rewrites applied); null if
+   *  no URL resolves. Credentials are redacted by the engine. */
+  url: string | null;
+  /** Whether bamboo treats this remote as the default push target
+   *  (`remote.default` git config when set, else the first remote). */
+  default: boolean;
+}
+
+/** Ahead/behind of a branch vs. its upstream (`getBranchStatus` RPC). */
+export interface BranchStatus {
+  branch: string;
+  /** Short upstream name (e.g. "origin/main"); null when the branch has
+   *  no configured upstream. */
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+}
+
+/** One entry of the engine's `stashList` RPC. */
+export interface StashEntry {
+  /** Reflog selector, e.g. "stash@{0}". */
+  ref: string;
+  message: string;
+  /** Strict ISO-8601 commit date of the stash entry. */
+  date: string;
+}
+
+/** Merge strategy for `pull`. `default` adds no flag so the user's
+ *  `pull.rebase` / `pull.ff` git config is respected. */
+export type PullStrategy = 'default' | 'merge' | 'rebase' | 'ff-only';
+
+/** Push force semantics (three tiers, see protocol `ForceMode`). */
+export type ForceMode = 'none' | 'lease' | 'force';
+
 export interface UndoEntry {
   id: number;
   /** Unix seconds. */

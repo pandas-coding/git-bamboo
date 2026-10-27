@@ -7,7 +7,33 @@
  * (notification). Pure Node — no vscode dependency, easy to unit test.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { CommitDetail, CommitFile, GetHeadResult, Ref } from './types';
+import type {
+  BranchStatus,
+  CommitDetail,
+  CommitFile,
+  ForceMode,
+  GetHeadResult,
+  PullStrategy,
+  Ref,
+  RemoteInfo,
+  StashEntry,
+} from './types';
+
+/** Engine JSON-RPC error codes the client acts on (beyond raw display). */
+export const RpcErrorCode = {
+  /** Stash pop/apply conflict — the stash entry is retained. */
+  STASH_CONFLICT: -32008,
+  /** Push rejected (non-fast-forward / stale lease) — recovery is client-side. */
+  PUSH_REJECTED: -32009,
+  /** Auth failed / credentials unavailable — guide the user to a terminal. */
+  AUTH_REQUIRED: -32010,
+} as const;
+
+/** Error code of `err` when it is an engine RpcError, else undefined —
+ *  lets callers switch on structured codes without instanceof chains. */
+export function rpcErrorCode(err: unknown): number | undefined {
+  return err instanceof RpcError ? err.code : undefined;
+}
 
 /** Error carrying the engine's JSON-RPC error code (e.g. -32007 UNDO_BLOCKED). */
 export class RpcError extends Error {
@@ -167,6 +193,71 @@ export class EngineClient {
       return null; // engine error (e.g. unknown commit): treat as unavailable
     }
     return isValidCommitDetail(result) ? result : null;
+  }
+
+  /**
+   * Engine RPC `fetch`: `remote == null` means `--all`. Resolves with
+   * git's (redacted) combined output.
+   */
+  fetch(remote: string | null): Promise<string> {
+    const params: Record<string, unknown> = remote === null ? {} : { remote };
+    return this.request<string>('fetch', params);
+  }
+
+  /**
+   * Engine RPC `pull` of the current branch from its upstream (omit
+   * remote/branch so the engine never silently re-targets another
+   * branch). `strategy` defaults to `default` (git config decides);
+   * `auto_stash` stashes a dirty worktree and re-applies afterwards.
+   * Resolves with git's output; conflicts surface as -32008 or a
+   * conflict-bearing GIT_ERROR.
+   */
+  pull(strategy: PullStrategy = 'default', autoStash = false): Promise<string> {
+    return this.request<string>('pull', { strategy, auto_stash: autoStash });
+  }
+
+  /**
+   * Engine RPC `push`. `force` is the three-tier enum (`none` for plain
+   * pushes — force is only reachable from an explicit user-confirmed
+   * flow); `setUpstream` publishes an unpublished branch (`push -u`).
+   * Resolves with git's (redacted) output. Rejections surface as
+   * -32009, auth failures as -32010.
+   */
+  push(
+    remote: string,
+    branch: string,
+    force: ForceMode = 'none',
+    setUpstream = false,
+  ): Promise<string> {
+    return this.request<string>('push', {
+      remote,
+      branch,
+      force,
+      set_upstream: setUpstream,
+    });
+  }
+
+  /** Engine RPC `getRemotes`: all configured remotes (URLs credential-
+   *  redacted server-side), with the default push target flagged. */
+  async getRemotes(): Promise<RemoteInfo[]> {
+    const result = await this.request<unknown>('getRemotes', {}, 5_000);
+    return Array.isArray(result) ? (result as RemoteInfo[]) : [];
+  }
+
+  /** Engine RPC `getBranchStatus`: upstream + ahead/behind counts of
+   *  `branch` (defaults to the current HEAD branch). */
+  async getBranchStatus(branch?: string): Promise<BranchStatus> {
+    return this.request<BranchStatus>(
+      'getBranchStatus',
+      branch === undefined ? {} : { branch },
+      5_000,
+    );
+  }
+
+  /** Engine RPC `stashList`: all stash entries, newest first. */
+  async stashList(): Promise<StashEntry[]> {
+    const result = await this.request<unknown>('stashList', {}, 5_000);
+    return Array.isArray(result) ? (result as StashEntry[]) : [];
   }
 
   /**
