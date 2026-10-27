@@ -355,6 +355,24 @@ fn path_matches(path: &str, filter: &str) -> bool {
     path == filter || path.starts_with(&format!("{filter}/"))
 }
 
+/// Map gix's conflict summary onto the protocol `ConflictKind` (same
+/// shape: which side added / modified / deleted the entry).
+fn map_conflict_summary(
+    summary: gix::status::plumbing::index_as_worktree::Conflict,
+) -> bamboo_protocol::ConflictKind {
+    use bamboo_protocol::ConflictKind as K;
+    use gix::status::plumbing::index_as_worktree::Conflict as C;
+    match summary {
+        C::BothDeleted => K::BothDeleted,
+        C::AddedByUs => K::AddedByUs,
+        C::DeletedByThem => K::DeletedByThem,
+        C::AddedByThem => K::AddedByThem,
+        C::DeletedByUs => K::DeletedByUs,
+        C::BothAdded => K::BothAdded,
+        C::BothModified => K::BothModified,
+    }
+}
+
 fn map_tree_index_change(change: gix::diff::index::Change) -> Option<StatusItem> {
     use gix::diff::index::Change as C;
 
@@ -364,18 +382,21 @@ fn map_tree_index_change(change: gix::diff::index::Change) -> Option<StatusItem>
             status: StatusCode::Added,
             old_path: None,
             staged: false,
+            conflict_kind: None,
         }),
         C::Deletion { location, .. } => Some(StatusItem {
             path: location.to_string(),
             status: StatusCode::Deleted,
             old_path: None,
             staged: false,
+            conflict_kind: None,
         }),
         C::Modification { location, .. } => Some(StatusItem {
             path: location.to_string(),
             status: StatusCode::Modified,
             old_path: None,
             staged: false,
+            conflict_kind: None,
         }),
         C::Rewrite {
             source_location,
@@ -391,6 +412,7 @@ fn map_tree_index_change(change: gix::diff::index::Change) -> Option<StatusItem>
             },
             old_path: Some(source_location.to_string()),
             staged: false,
+            conflict_kind: None,
         }),
     }
 }
@@ -403,15 +425,24 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
         IW::Modification {
             rela_path, status, ..
         } => {
-            let code = match status {
-                ES::Conflict { .. } => StatusCode::Conflict,
-                ES::Change(change) => match change {
-                    gix::status::plumbing::index_as_worktree::Change::Removed => {
-                        StatusCode::Deleted
-                    }
-                    _ => StatusCode::Modified,
-                },
-                ES::IntentToAdd => StatusCode::Added,
+            // Conflict entries map to Conflict + a classification (which
+            // side added/modified/deleted); the classification lets the
+            // frontend offer only the resolve actions that are legal for
+            // this file's conflict kind.
+            let (code, conflict_kind) = match status {
+                ES::Conflict { summary, .. } => {
+                    (StatusCode::Conflict, Some(map_conflict_summary(summary)))
+                }
+                ES::Change(change) => (
+                    match change {
+                        gix::status::plumbing::index_as_worktree::Change::Removed => {
+                            StatusCode::Deleted
+                        }
+                        _ => StatusCode::Modified,
+                    },
+                    None,
+                ),
+                ES::IntentToAdd => (StatusCode::Added, None),
                 ES::NeedsUpdate(_) => return None,
             };
             Some(StatusItem {
@@ -419,6 +450,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
                 status: code,
                 old_path: None,
                 staged: false,
+                conflict_kind,
             })
         }
         IW::DirectoryContents { entry, .. } => {
@@ -432,6 +464,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
                 status: code,
                 old_path: None,
                 staged: false,
+                conflict_kind: None,
             })
         }
         IW::Rewrite {
@@ -459,6 +492,7 @@ fn map_index_worktree_item(item: gix::status::index_worktree::Item) -> Option<St
                 },
                 old_path,
                 staged: false,
+                conflict_kind: None,
             })
         }
     }

@@ -23,9 +23,63 @@ fn status_code_serializes_snake_case() {
         status: StatusCode::Untracked,
         old_path: None,
         staged: false,
+        conflict_kind: None,
     };
     let json = serde_json::to_string(&item).unwrap();
     assert!(json.contains("\"untracked\""));
+}
+
+#[test]
+fn status_item_conflict_kind_omitted_for_non_conflicts() {
+    // Backwards wire compatibility: non-conflict entries carry no
+    // conflict_kind field at all, and parsing old payloads (no field)
+    // still yields None.
+    let item = StatusItem {
+        path: "a.txt".into(),
+        status: StatusCode::Modified,
+        old_path: None,
+        staged: false,
+        conflict_kind: None,
+    };
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(!json.contains("conflict_kind"));
+    let legacy = r#"{"path":"a.txt","status":"modified","staged":false}"#;
+    let back: StatusItem = serde_json::from_str(legacy).unwrap();
+    assert_eq!(back.conflict_kind, None);
+}
+
+#[test]
+fn conflict_kind_serializes_snake_case() {
+    let item = StatusItem {
+        path: "a.txt".into(),
+        status: StatusCode::Conflict,
+        old_path: None,
+        staged: false,
+        conflict_kind: Some(ConflictKind::BothModified),
+    };
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(json.contains("\"conflict_kind\":\"both_modified\""));
+    let back: StatusItem = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.conflict_kind, Some(ConflictKind::BothModified));
+}
+
+#[test]
+fn resolve_conflict_roundtrip() {
+    let req = ResolveConflict {
+        path: "src/main.rs".into(),
+        resolution: ConflictResolution::KeepTheirs,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains("\"keep_theirs\""));
+    let back: ResolveConflict = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.path, "src/main.rs");
+    assert_eq!(back.resolution, ConflictResolution::KeepTheirs);
+    // Unknown resolutions are rejected at the parse boundary, not deep
+    // in the engine.
+    assert!(serde_json::from_str::<ResolveConflict>(
+        r#"{"path":"a","resolution":"bogus"}"#
+    )
+    .is_err());
 }
 
 #[test]
