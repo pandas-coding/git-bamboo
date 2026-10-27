@@ -2561,9 +2561,13 @@ async fn resolve_deleted_by_them_keep_theirs_confirms_deletion() -> anyhow::Resu
     assert!(!dir.path().join("b.txt").exists(), "file should be gone");
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
     assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    // The confirmed deletion is staged (HEAD still has b.txt until the
+    // merge commit lands).
     assert!(
-        !items.iter().any(|i| i.path == "b.txt"),
-        "deletion confirmed: b.txt should show no entry, got {:?}",
+        items
+            .iter()
+            .any(|i| i.path == "b.txt" && i.staged && i.status == bamboo_protocol::StatusCode::Deleted),
+        "deletion confirmed: b.txt should be a staged deletion, got {:?}",
         items
     );
     Ok(())
