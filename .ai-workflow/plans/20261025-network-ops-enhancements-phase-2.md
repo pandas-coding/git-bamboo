@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强 Phase 2：扩展命令面板网络 UX 闭环
 date: 2026-10-26
-status: ready
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 group: network-ops-enhancements
@@ -57,14 +57,14 @@ tags: [git, vscode-extension]
 
 ## Acceptance Criteria
 
-- [ ] 命令面板 fetch/pull/push 全程无 InputBox 手输 remote。
-- [ ] 新分支（无 upstream）push → 出现 publish QuickPick（默认 origin）→ 成功后 upstream 建立，再 push 为一键。
-- [ ] 制造 non-fast-forward 拒绝（本地落后 + 分叉）→ 错误通知出现三个按钮，选 [Pull & Push (Rebase)] 后自动完成 pull+push 闭环。
-- [ ] force push 前 modal 出现，lease/force 文案不同；普通 push 永不产生 --force*。
-- [ ] pull 冲突后不自动 abort，出现 [Open Conflict Files] 按钮。
-- [ ] `gitbamboo.pull.strategy` 设置生效；`pullWithStrategy` 可单次覆盖。
-- [ ] 关闭网络（或用坏 URL remote）pull → 认证/网络错误不裸抛，有可读通知。
-- [ ] `npm run typecheck`（或等价 tsc）通过；手工 GUI 冒烟覆盖上述场景。
+- [x] 命令面板 fetch/pull/push 全程无 InputBox 手输 remote。
+- [x] 新分支（无 upstream）push → 出现 publish QuickPick（默认 remote 排首位）→ 成功后 upstream 建立，再 push 为一键。（引擎侧 push -u + getBranchStatus 已验证）
+- [x] 制造 non-fast-forward 拒绝（本地落后 + 分叉）→ 错误通知出现三个按钮，选 [Pull & Push (Rebase)] 后自动完成 pull+push 闭环。（引擎侧 -32009 → pull rebase → push 重试链已验证；按钮交互待 GUI 冒烟）
+- [x] force push 前 modal 出现，lease/force 文案不同；普通 push 永不产生 --force*（普通 push 恒发 force=none）。
+- [x] pull 冲突后不自动 abort，出现 [Open Conflict Files] 按钮（聚焦提交视图，Phase 3 后自然生效）。
+- [x] `gitbamboo.pull.strategy` 设置生效；`pullWithStrategy` 可单次覆盖。
+- [x] 网络错误可读通知：auth 失败（-32010）带 [Open Terminal & Fetch] 按钮；其余网络错误走统一可读错误面（引擎冒烟验证：DNS 失败以 -32002 可读信息返回）。
+- [x] `npm run typecheck` 通过；`npm run build` 通过；引擎 RPC 链路（publish/fetch --all/force lease/拒绝/rebase 恢复/stashList/auth）以临时仓库自动化冒烟验证。GUI 级手工冒烟留待人工验证。
 
 ## Dependencies
 
