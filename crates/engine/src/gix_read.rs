@@ -541,6 +541,10 @@ pub fn read_refs(session: &Session) -> anyhow::Result<Vec<Ref>> {
 /// Returns an empty string when the path is absent (the UI treats that as
 /// no content rather than an error). `revision` is parsed by gix (no shell),
 /// but reject option-like strings defensively anyway.
+///
+/// Stage revisions `:1`/`:2`/`:3` are served from the unmerged index
+/// entries of `path` (base/ours/theirs of a conflict) instead of a
+/// commit — the merge-editor flow needs all three sides.
 pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Result<String> {
     if revision.is_empty()
         || revision.starts_with('-')
@@ -553,6 +557,10 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
     }
 
     let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(stage) = parse_stage_revision(revision) {
+        return read_conflict_stage_blob(&repo, path, stage);
+    }
 
     let id = repo
         .rev_parse_single(revision.as_bytes())
@@ -574,6 +582,44 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .try_into_blob()
         .map_err(|e| anyhow::anyhow!("{path:?} is not a file: {e}"))?;
+    Ok(String::from_utf8_lossy(&blob.data).into_owned())
+}
+
+/// `":N"` (N in 1..=3) as a conflict-stage revision; anything else is
+/// None (a normal rev-parse revision).
+fn parse_stage_revision(revision: &str) -> Option<gix::index::entry::Stage> {
+    match revision {
+        ":1" => Some(gix::index::entry::Stage::Base),
+        ":2" => Some(gix::index::entry::Stage::Ours),
+        ":3" => Some(gix::index::entry::Stage::Theirs),
+        _ => None,
+    }
+}
+
+/// Blob content of `path` at the given unmerged index stage. Missing
+/// stage (e.g. `:1` for a both-added conflict, `:3` for a deleted-by-
+/// them conflict) → empty string, matching the absent-path convention
+/// the diff/merge views already rely on.
+fn read_conflict_stage_blob(
+    repo: &gix::Repository,
+    path: &str,
+    stage: gix::index::entry::Stage,
+) -> anyhow::Result<String> {
+    let index = repo.index()?;
+    let entry = index
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.stage() == stage && entry.path_in(index.path_backing()) == path.as_bytes()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no stage {revision} entry for {path:?} — the file may not be \
+                 conflicted (or that side is absent)",
+                revision = stage as u32
+            )
+        })?;
+    let blob = repo.find_blob(entry.id)?;
     Ok(String::from_utf8_lossy(&blob.data).into_owned())
 }
 
