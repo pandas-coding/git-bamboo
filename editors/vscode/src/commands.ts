@@ -130,8 +130,10 @@ export async function undoLast(client: EngineClient): Promise<void> {
 
 /** Build the shared net-ops context: the engine client, repo root, and
  *  the conflict-flow entry point (focuses the Commit view's conflicts
- *  section via its command, registered per-session in extension.ts). */
-function netOpsContext(client: EngineClient, state: RepoState): netOps.NetOpsContext {
+ *  section via its command, registered per-session in extension.ts).
+ *  Shared by the palette commands and the graph toolbar (graphSession) —
+ *  every surface gets the identical interaction flows. */
+export function netOpsContext(client: EngineClient, state: RepoState): netOps.NetOpsContext {
   return {
     client,
     repoRoot: state.root,
