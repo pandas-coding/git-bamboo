@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强 Phase 3：最小冲突流（冲突栏 + Accept + VS Code 合并编辑器）
 date: 2026-10-26
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 group: network-ops-enhancements
