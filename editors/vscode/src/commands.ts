@@ -128,46 +128,39 @@ export async function undoLast(client: EngineClient): Promise<void> {
   }
 }
 
-/** Build the shared net-ops context: the engine client, repo root, and
- *  the conflict-flow entry point (focuses the Commit view's conflicts
- *  section via its command, registered per-session in extension.ts).
- *  Shared by the palette commands and the graph toolbar (graphSession) —
- *  every surface gets the identical interaction flows. */
-export function netOpsContext(client: EngineClient, state: RepoState): netOps.NetOpsContext {
-  return {
-    client,
-    repoRoot: state.root,
-    showConflicts: async () => {
-      await vscode.commands.executeCommand('gitBamboo.commit.showConflicts');
-    },
-  };
-}
-
 /** Fetch wrapper: remote pick and status surfacing live in netOps, which
- *  also needs the engine's remote list. */
+ *  also needs the engine's remote list. Runs under the shared net-op
+ *  in-flight guard (an op already running for this repo session drops
+ *  the command — see netOps.withNetOpGuard). */
 export async function fetchRemotes(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runFetch(netOpsContext(client, state));
+  await netOps.withNetOpGuard(client, () => netOps.runFetch(netOps.netOpsContext(client, state)));
 }
 
 /** Palette pull: upstream detection, publish fallback, strategy and
  *  auto-stash settings, conflict surfacing — all in netOps. */
 export async function pull(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runPull(netOpsContext(client, state));
+  await netOps.withNetOpGuard(client, () => netOps.runPull(netOps.netOpsContext(client, state)));
 }
 
 /** Palette "Pull with strategy…": one-shot strategy override. */
 export async function pullWithStrategy(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runPullWithStrategy(netOpsContext(client, state));
+  await netOps.withNetOpGuard(
+    client,
+    () => netOps.runPullWithStrategy(netOps.netOpsContext(client, state)),
+  );
 }
 
 /** Palette push: publish flow for unpublished branches, one-click push
  *  (and rejection recovery) otherwise — all in netOps. */
 export async function push(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runPush(netOpsContext(client, state));
+  await netOps.withNetOpGuard(client, () => netOps.runPush(netOps.netOpsContext(client, state)));
 }
 
 /** Explicit force-push entry — the only path (besides the rejection
  *  recovery button) that can ever produce --force*. */
 export async function forcePush(client: EngineClient, state: RepoState): Promise<void> {
-  await netOps.runForcePush(netOpsContext(client, state));
+  await netOps.withNetOpGuard(
+    client,
+    () => netOps.runForcePush(netOps.netOpsContext(client, state)),
+  );
 }

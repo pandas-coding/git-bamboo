@@ -10,8 +10,8 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
-import type { BranchStatus, ForceMode, PullStrategy, RemoteInfo } from './types';
-import { errorMessage } from './util';
+import type { BranchStatus, ForceMode, PullStrategy, RemoteInfo, RepoState } from './types';
+import { errorMessage, isDetachedError } from './util';
 
 /** What the netOps flows need from the host: the engine client and the
  *  repo root (for opening a terminal at the right cwd on auth failure).
@@ -22,6 +22,62 @@ export interface NetOpsContext {
   /** Focuses the Commit view and expands its Conflicts section (the pull
    *  conflict banner's "Open Conflict Files" button). */
   readonly showConflicts: () => Promise<void>;
+}
+
+/** Build the shared net-ops context: the engine client, repo root, and
+ *  the conflict-flow entry point (focuses the Commit view's conflicts
+ *  section via its command, registered per-session in extension.ts).
+ *  Lives here — next to the NetOpsContext type it constructs — so every
+ *  consumer (palette commands, graph toolbar) imports it without pulling
+ *  in the whole command module. */
+export function netOpsContext(client: EngineClient, state: RepoState): NetOpsContext {
+  return {
+    client,
+    repoRoot: state.root,
+    showConflicts: async () => {
+      await vscode.commands.executeCommand('gitBamboo.commit.showConflicts');
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// In-flight guard
+// ---------------------------------------------------------------------------
+
+/** Repository sessions with a net op currently running. While an op
+ *  runs, further ops from ANY surface (graph toolbar, command palette,
+ *  the other graph host, auto-fetch) are dropped, not queued — concurrent
+ *  mutating git operations on one repo must not interleave. WeakSet: the
+ *  guard lives and dies with the engine client. */
+const netOpInFlight = new WeakSet<EngineClient>();
+
+/** Begins a net op for `client`; false when one is already running (the
+ *  caller must then drop the request). Every true is paired with
+ *  endNetOp — the release belongs in a finally. */
+export function tryBeginNetOp(client: EngineClient): boolean {
+  if (netOpInFlight.has(client)) return false;
+  netOpInFlight.add(client);
+  return true;
+}
+
+/** Releases the in-flight slot taken by tryBeginNetOp. */
+export function endNetOp(client: EngineClient): void {
+  netOpInFlight.delete(client);
+}
+
+/** Runs a flow under the shared in-flight guard: dropped while another op
+ *  runs for the same repository session. Errors propagate to the caller's
+ *  error surface (the palette's uniform command handler in extension.ts). */
+export async function withNetOpGuard(
+  client: EngineClient,
+  run: () => Promise<void>,
+): Promise<void> {
+  if (!tryBeginNetOp(client)) return;
+  try {
+    await run();
+  } finally {
+    endNetOp(client);
+  }
 }
 
 const CONFIG_SECTION = 'gitbamboo';
@@ -40,8 +96,9 @@ interface StrategyPickItem extends vscode.QuickPickItem {
 
 /** Read a setting from user/global scope only. Workspace settings live
  *  inside the opened repository, so a cloned untrusted repo could
- *  otherwise flip safety knobs via its own `.vscode/settings.json`. */
-function trustedSetting<T>(key: string, fallback: T): T {
+ *  otherwise flip safety knobs via its own `.vscode/settings.json`.
+ *  Exported for extension.ts's auto-fetch interval (same reason). */
+export function trustedSetting<T>(key: string, fallback: T): T {
   const inspected = vscode.workspace.getConfiguration(CONFIG_SECTION).inspect<T>(key);
   return inspected?.globalValue ?? inspected?.defaultValue ?? fallback;
 }
@@ -102,8 +159,15 @@ export async function runFetch(ctx: NetOpsContext): Promise<void> {
   );
   if (!picked) return; // cancelled
   const target = picked.remote ?? 'all remotes';
+  await fetchFrom(ctx, picked.remote, target);
+}
+
+/** Shared fetch execution: progress, completion toast, error surface —
+ *  one implementation behind both the palette's picked remote and the
+ *  toolbar's one-click --all fetch. */
+async function fetchFrom(ctx: NetOpsContext, remote: string | null, target: string): Promise<void> {
   try {
-    await withNetworkProgress(`Fetching from ${target}…`, () => ctx.client.fetch(picked.remote));
+    await withNetworkProgress(`Fetching from ${target}…`, () => ctx.client.fetch(remote));
     // The engine's refsChanged notification refreshes the graph/commit
     // view on its own — nothing to nudge here.
     vscode.window.showInformationMessage(`Git Bamboo: fetched from ${target}`);
@@ -123,16 +187,29 @@ export async function runPull(ctx: NetOpsContext, strategyOverride?: PullStrateg
   const status = await currentBranchStatus(ctx);
   if (!status) return;
   if (!status.upstream) {
-    const choice = await vscode.window.showInformationMessage(
-      `Git Bamboo: branch '${status.branch}' has no upstream`,
-      'Set Upstream & Pull…',
-    );
-    if (choice !== 'Set Upstream & Pull…') return;
-    const published = await publishBranch(ctx, status.branch);
-    if (!published) return; // cancelled or failed
-    return runPull(ctx, strategyOverride); // upstream now exists — pull
+    if (await offerPublish(ctx, status.branch, 'has no upstream', 'Set Upstream & Pull…')) {
+      return runPull(ctx, strategyOverride); // upstream now exists — pull
+    }
+    return;
   }
   await pullCurrentBranch(ctx, status.branch, strategyOverride ?? pullStrategySetting());
+}
+
+/** No-upstream fallback shared by the pull/push/sync flows: an info
+ *  message offering publish, then the publish QuickPick. Returns true
+ *  when the branch was published (the caller may continue its flow). */
+async function offerPublish(
+  ctx: NetOpsContext,
+  branch: string,
+  reason: string,
+  button = 'Publish Branch…',
+): Promise<boolean> {
+  const choice = await vscode.window.showInformationMessage(
+    `Git Bamboo: branch '${branch}' ${reason}`,
+    button,
+  );
+  if (choice !== button) return false;
+  return publishBranch(ctx, branch);
 }
 
 /** Pull of a branch whose upstream is known to exist. Returns true when
@@ -212,31 +289,33 @@ function isPullConflict(err: unknown): boolean {
 export async function runPush(ctx: NetOpsContext): Promise<void> {
   const status = await currentBranchStatus(ctx);
   if (!status) return;
-  if (!status.upstream) {
-    const choice = await vscode.window.showInformationMessage(
-      `Git Bamboo: branch '${status.branch}' is not published yet`,
-      'Publish Branch…',
-    );
-    if (choice !== 'Publish Branch…') return;
-    await publishBranch(ctx, status.branch);
+  const { upstream } = status;
+  if (!upstream) {
+    await offerPublish(ctx, status.branch, 'is not published yet');
     return;
   }
-  await pushCurrentBranch(ctx, status);
+  await pushCurrentBranch(ctx, status.branch, upstream, status.ahead, status.behind);
 }
 
-/** Push of a branch that has an upstream (shared by runPush and runSync's
- *  push phase): up-to-date / behind branches get the appropriate message
- *  instead of a pointless RPC; otherwise push with rejection recovery. */
-async function pushCurrentBranch(ctx: NetOpsContext, status: BranchStatus): Promise<void> {
-  if (!status.upstream) return; // callers route unpublished branches to publish
-  if (status.ahead === 0) {
-    if (status.behind > 0) {
+/** Push of a branch that has an upstream (the parameter types carry the
+ * invariant — every caller routes upstream-less branches to offerPublish
+ * first): up-to-date / behind branches get the appropriate message instead
+ * of a pointless RPC; otherwise push with rejection recovery. Shared by
+ * runPush and runSync's push phase. */
+async function pushCurrentBranch(
+  ctx: NetOpsContext,
+  branch: string,
+  upstream: string,
+  ahead: number,
+  behind: number,
+): Promise<void> {
+  if (ahead === 0) {
+    if (behind > 0) {
       // Nothing to push, but the branch is behind — offer the pull that
       // actually moves it forward instead of a misleading "up to date".
-      const behind = status.behind;
       const choice = await vscode.window.showInformationMessage(
-        `Git Bamboo: ${status.branch} is ${behind} commit${behind === 1 ? '' : 's'} ` +
-          `behind ${status.upstream} — nothing to push`,
+        `Git Bamboo: ${branch} is ${behind} commit${behind === 1 ? '' : 's'} ` +
+          `behind ${upstream} — nothing to push`,
         'Pull',
       );
       if (choice === 'Pull') await runPull(ctx);
@@ -244,11 +323,11 @@ async function pushCurrentBranch(ctx: NetOpsContext, status: BranchStatus): Prom
     }
     // Truly in sync — force remains reachable via its explicit command.
     vscode.window.showInformationMessage(
-      `Git Bamboo: ${status.branch} is already up to date with ${status.upstream}`,
+      `Git Bamboo: ${branch} is already up to date with ${upstream}`,
     );
     return;
   }
-  await pushWithRecovery(ctx, status.branch, status.upstream);
+  await pushWithRecovery(ctx, branch, upstream);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,12 +338,7 @@ async function pushCurrentBranch(ctx: NetOpsContext, status: BranchStatus): Prom
  *  entry keeps the per-remote QuickPick — the command palette stays the
  *  capability superset; the toolbar button always fetches --all. */
 export async function runFetchAll(ctx: NetOpsContext): Promise<void> {
-  try {
-    await withNetworkProgress('Fetching from all remotes…', () => ctx.client.fetch(null));
-    vscode.window.showInformationMessage('Git Bamboo: fetched from all remotes');
-  } catch (err) {
-    showNetworkError(ctx, err, 'fetch');
-  }
+  await fetchFrom(ctx, null, 'all remotes');
 }
 
 /** Publish flow for the current branch (the graph toolbar's `↑✱` badge
@@ -292,11 +366,7 @@ export async function runSync(ctx: NetOpsContext): Promise<void> {
   const status = await currentBranchStatus(ctx);
   if (!status) return;
   if (!status.upstream) {
-    const choice = await vscode.window.showInformationMessage(
-      `Git Bamboo: branch '${status.branch}' has no upstream`,
-      'Publish Branch…',
-    );
-    if (choice === 'Publish Branch…') await publishBranch(ctx, status.branch);
+    await offerPublish(ctx, status.branch, 'has no upstream');
     return;
   }
   // Pull phase: the shared pull path (progress, conflict surfacing).
@@ -305,7 +375,7 @@ export async function runSync(ctx: NetOpsContext): Promise<void> {
   // ahead/behind (and the up-to-date messaging) must reflect the new state.
   const fresh = await currentBranchStatus(ctx);
   if (!fresh || !fresh.upstream) return; // unreachable post-pull; engine says otherwise
-  await pushCurrentBranch(ctx, fresh);
+  await pushCurrentBranch(ctx, fresh.branch, fresh.upstream, fresh.ahead, fresh.behind);
 }
 
 /** Explicit force-push entry (`gitBamboo.forcePush` command or the push
@@ -519,13 +589,12 @@ async function currentBranchStatus(ctx: NetOpsContext): Promise<BranchStatus | n
   try {
     status = await ctx.client.getBranchStatus();
   } catch (err) {
-    const message = displaySafe(errorMessage(err));
-    if (/detached/i.test(message)) {
+    if (isDetachedError(err)) {
       vscode.window.showWarningMessage(
         'Git Bamboo: HEAD is detached — switch to a branch to pull or push',
       );
     } else {
-      vscode.window.showErrorMessage(`Git Bamboo: branch status unavailable — ${message}`);
+      vscode.window.showErrorMessage(`Git Bamboo: branch status unavailable — ${displaySafe(errorMessage(err))}`);
     }
     return null;
   }

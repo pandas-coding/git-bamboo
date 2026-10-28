@@ -50,12 +50,11 @@
   /** op -> which button spins while it runs (publish spins push). */
   const OP_SPIN = { fetch: 'fetch', pull: 'pull', push: 'push', sync: 'sync', publish: 'push' };
 
-  const OP_TITLES = {
-    fetch: 'Fetch from all remotes',
-    pull: 'Pull',
-    push: 'Push',
-    sync: 'Sync (pull, then push)',
-  };
+  /** op -> button title, captured from the HTML at load (single source of
+   *  truth: updateToolbar restores these after detached tooltips). */
+  const OP_TITLES = Object.fromEntries(
+    Object.entries(netButtons).map(([op, btn]) => [op, btn.title]),
+  );
   const DETACHED_TITLE = 'HEAD is detached — switch to a branch to pull or push';
 
   /** True while a net op runs (netOpState from the host). */
@@ -319,7 +318,8 @@
           const pill = document.createElement('span');
           // Tags are distinguished by the tag icon + per-name border color
           // (no dedicated class); remote branches by the remote-pill style.
-          pill.className = ref.kind === 'remote_branch' ? 'branch-tag remote-pill' : 'branch-tag';
+          pill.className =
+            ref.kind === 'remote_branch' ? 'pill branch-tag remote-pill' : 'pill branch-tag';
           if (ref.kind !== 'remote_branch') pill.style.borderColor = tagColor(ref.name);
           if (ref.kind === 'tag') pill.appendChild(tagIcon());
           // Text node, not innerHTML: ref names are untrusted.

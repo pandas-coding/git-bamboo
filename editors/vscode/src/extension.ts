@@ -17,13 +17,9 @@ import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
 import { openCommitDetailPanel } from './commitDetail';
 import { takeGraphContextTarget, type GraphContextCommit } from './graphSession';
 import { HeadContentProvider } from './headContent';
+import { trustedSetting, withNetOpGuard } from './netOps';
 import type { InitializeResult, RepoState } from './types';
-import { errorMessage } from './util';
-
-/** Debounce shared by the status-bar branchStatus refresh: refsChanged
- *  fires in bursts (auto-fetch, pushes) and each refresh costs one RPC.
- *  Mirrors graphSession's BRANCH_STATUS_DEBOUNCE_MS. */
-const BRANCH_STATUS_DEBOUNCE_MS = 200;
+import { BRANCH_STATUS_DEBOUNCE_MS, debounce, errorMessage } from './util';
 
 let activeClient: EngineClient | undefined;
 let activeState: RepoState | undefined;
@@ -386,15 +382,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     renderBranchItem();
   };
-  let branchStatusTimer: NodeJS.Timeout | undefined;
-  const scheduleBranchStatus = (): void => {
-    if (branchStatusTimer) clearTimeout(branchStatusTimer);
-    branchStatusTimer = setTimeout(() => {
-      branchStatusTimer = undefined;
-      void refreshBranchStatus();
-    }, BRANCH_STATUS_DEBOUNCE_MS);
-  };
-
+  const scheduleBranchStatus = debounce(
+    () => void refreshBranchStatus(),
+    BRANCH_STATUS_DEBOUNCE_MS,
+  );
+  // Initial ahead/behind: refsChanged/headChanged only fire on changes, so
+  // a fresh window would otherwise show no counts until the first external
+  // ref move (or the first auto-fetch tick — 180s away by default).
+  void refreshBranchStatus();
   // Auto-fetch: a silent periodic `git fetch --all` (refsChanged then
   // refreshes the graph/commit view on its own). Completely quiet — no
   // progress notification, no completion toast; failures log to the
@@ -402,17 +397,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // silence distinguishes automatic from user-initiated. Ticks while this
   // window is inactive are skipped so a backgrounded VS Code stops
   // hitting the network; `gitbamboo.autoFetch.intervalSeconds` (0 = off)
-  // is read live, so a settings change re-arms the timer.
+  // is read live, so a settings change re-arms the timer. Read from user
+  // scope only (trustedSetting) and clamped: a cloned untrusted repo must
+  // not be able to crank the silent timer into a per-second network beacon
+  // via its own `.vscode/settings.json`.
   let autoFetchTimer: NodeJS.Timeout | undefined;
   const autoFetchIntervalMs = (): number => {
-    const seconds = vscode.workspace
-      .getConfiguration('gitbamboo')
-      .get<number>('autoFetch.intervalSeconds');
+    const seconds = trustedSetting<number>('autoFetch.intervalSeconds', 180);
     const safe =
-      typeof seconds === 'number' && Number.isFinite(seconds)
-        ? Math.max(0, Math.floor(seconds))
-        : 180;
-    return safe * 1000;
+      typeof seconds === 'number' && Number.isFinite(seconds) ? Math.floor(seconds) : 180;
+    if (safe <= 0) return 0; // 0 = disabled
+    return Math.min(3600, Math.max(10, safe)) * 1000;
   };
   const scheduleAutoFetch = (): void => {
     if (autoFetchTimer) clearInterval(autoFetchTimer);
@@ -421,8 +416,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (intervalMs <= 0) return; // 0 = disabled
     autoFetchTimer = setInterval(() => {
       if (!vscode.window.state.active) return; // window backgrounded
-      void client.fetch(null).catch((err) => {
-        console.error('[git-bamboo] auto-fetch failed:', errorMessage(err));
+      // Guarded like every other net op: a pull/push/sync in flight skips
+      // the tick (fetch is read-only, so a dropped tick costs nothing).
+      void withNetOpGuard(client, async () => {
+        try {
+          await client.fetch(null);
+        } catch (err) {
+          console.error('[git-bamboo] auto-fetch failed:', errorMessage(err));
+        }
       });
     }, intervalMs);
   };
@@ -434,6 +435,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     { dispose: () => { if (autoFetchTimer) clearInterval(autoFetchTimer); } },
+    { dispose: () => scheduleBranchStatus.cancel() },
   );
 
   // Engine notifications drive all UI refreshes.

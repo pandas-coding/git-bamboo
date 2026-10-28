@@ -8,12 +8,17 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient, RpcError } from './engineClient';
-import { netOpsContext } from './commands';
 import { openCommitDetailPanel } from './commitDetail';
 import { createContextTargetSlot } from './contextTargetSlot';
 import * as netOps from './netOps';
 import type { GraphPage, RepoState } from './types';
-import { COMMIT_ID_RE, errorMessage } from './util';
+import {
+  BRANCH_STATUS_DEBOUNCE_MS,
+  COMMIT_ID_RE,
+  debounce,
+  errorMessage,
+  isDetachedError,
+} from './util';
 
 /** JSON-RPC error code the engine returns when the client's epoch is stale. */
 const EPOCH_MISMATCH = -32004;
@@ -21,13 +26,20 @@ const EPOCH_MISMATCH = -32004;
 /** Debounce for viewport requests coming from scroll events. */
 const VIEWPORT_DEBOUNCE_MS = 16;
 
-/** Debounce for branchStatus refreshes: refsChanged can fire in bursts
- *  (auto-fetch, pushes, branch switches) and each one costs a
- *  getBranchStatus RPC — one trailing refresh per burst is enough. */
-const BRANCH_STATUS_DEBOUNCE_MS = 200;
-
 /** The net-op kinds the graph toolbar can request (webview → host). */
 type NetOp = 'fetch' | 'pull' | 'push' | 'sync' | 'publish';
+
+/** Toolbar op → shared netOps flow (the toolbar runs the exact
+ *  implementations the command palette uses — no per-surface copies).
+ *  The webview's op string is validated against this table's keys (trust
+ *  boundary) and dispatched through it: one table, no double dispatch. */
+const NET_OPS: Record<NetOp, (ctx: netOps.NetOpsContext) => Promise<void>> = {
+  fetch: netOps.runFetchAll,
+  pull: netOps.runPull,
+  push: netOps.runPush,
+  sync: netOps.runSync,
+  publish: netOps.runPublish,
+};
 
 /** host → webview branchStatus payload (upstream/ahead/behind for the
  *  toolbar badge; `detached` disables the branch-bound buttons). */
@@ -98,11 +110,12 @@ export class GraphSession implements vscode.Disposable {
   private debounceTimer: NodeJS.Timeout | undefined;
   /** Coalesces invalidation bursts from the engine's fs watcher. */
   private invalidateTimer: NodeJS.Timeout | undefined;
-  /** Debounces branchStatus refreshes (refsChanged/headChanged bursts). */
-  private branchStatusTimer: NodeJS.Timeout | undefined;
-  /** True while a toolbar net op runs — a second op arriving then is
-   *  dropped, not queued (see runNetOp). */
-  private netOpInFlight = false;
+  /** Debounced branchStatus refresh (refsChanged/headChanged bursts) —
+   *  shared trailing-debounce helper, cancelled on dispose. */
+  private readonly scheduleBranchStatus = debounce(
+    () => void this.sendBranchStatus(),
+    BRANCH_STATUS_DEBOUNCE_MS,
+  );
   /** Sequence number so stale getGraph responses are dropped. */
   private requestSeq = 0;
   private disposed = false;
@@ -145,7 +158,7 @@ export class GraphSession implements vscode.Disposable {
     graphContextSlot.clearIf((target) => target.owner === this);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.invalidateTimer) clearTimeout(this.invalidateTimer);
-    if (this.branchStatusTimer) clearTimeout(this.branchStatusTimer);
+    this.scheduleBranchStatus.cancel();
     // Unsubscribe engine notification listeners and webview subscriptions.
     for (const disposable of this.disposables) disposable.dispose();
     this.disposables.length = 0;
@@ -242,17 +255,11 @@ export class GraphSession implements vscode.Disposable {
       }
     } else if (message?.type === 'netOp') {
       // Toolbar button / badge click. The op is validated against the
-      // enum before anything runs — the webview is a trust boundary, so
-      // an unknown op is dropped, not stringly dispatched.
+      // NET_OPS table's keys before anything runs — the webview is a trust
+      // boundary, so an unknown op is dropped, not stringly dispatched.
       const op = message.op;
-      if (
-        op === 'fetch' ||
-        op === 'pull' ||
-        op === 'push' ||
-        op === 'sync' ||
-        op === 'publish'
-      ) {
-        void this.runNetOp(op);
+      if (typeof op === 'string' && Object.hasOwn(NET_OPS, op)) {
+        void this.runNetOp(op as NetOp);
       }
     } else if (message?.type === 'openCommitDetail') {
       // Single-click on a commit row opens the detail panel — the chosen UX
@@ -326,35 +333,24 @@ export class GraphSession implements vscode.Disposable {
 
   /** Runs one toolbar net op via the shared netOps flows (identical to
    *  the command palette: upstream detection, publish fallback, rejection
-   *  recovery, conflict surfacing). While it runs, netOpState disables
-   *  the whole toolbar row; an op arriving in that window is dropped —
-   *  queueing it would let a stale click mutate refs mid-operation, the
-   *  same freshness discipline the context-target slot applies. */
+   *  recovery, conflict surfacing). The shared per-repo in-flight guard
+   *  (netOps.tryBeginNetOp — one slot per engine client, shared with the
+   *  palette commands and the other graph host) drops the op while any
+   *  surface runs one: queueing it would let a stale click mutate refs
+   *  mid-operation, the same freshness discipline the context-target slot
+   *  applies. While it runs, netOpState disables the whole toolbar row. */
   private async runNetOp(op: NetOp): Promise<void> {
-    if (this.netOpInFlight || this.disposed) return;
-    this.netOpInFlight = true;
-    const ctx = netOpsContext(this.client, this.state);
-    await this.webview.postMessage({ type: 'netOpState', active: true, op });
+    if (this.disposed || !netOps.tryBeginNetOp(this.client)) return;
+    const ctx = netOps.netOpsContext(this.client, this.state);
     try {
-      switch (op) {
-        case 'fetch':
-          await netOps.runFetchAll(ctx);
-          break;
-        case 'pull':
-          await netOps.runPull(ctx);
-          break;
-        case 'push':
-          await netOps.runPush(ctx);
-          break;
-        case 'sync':
-          await netOps.runSync(ctx);
-          break;
-        case 'publish':
-          await netOps.runPublish(ctx);
-          break;
-      }
+      await this.webview.postMessage({ type: 'netOpState', active: true, op });
+      await NET_OPS[op](ctx);
+    } catch (err) {
+      // The flows surface their own errors; an escaping throw breaks that
+      // contract — log it instead of leaving an unhandled rejection.
+      console.error('[git-bamboo] net op failed:', err);
     } finally {
-      this.netOpInFlight = false;
+      netOps.endNetOp(this.client);
       if (!this.disposed) {
         await this.webview.postMessage({ type: 'netOpState', active: false, op: null });
       }
@@ -363,17 +359,6 @@ export class GraphSession implements vscode.Disposable {
       // deserves a settled state, and the RPC is cheap.
       this.scheduleBranchStatus();
     }
-  }
-
-  /** Debounced branchStatus refresh: refsChanged fires in bursts (fetch,
-   *  pull, push, branch switches) and each refresh costs one RPC. */
-  private scheduleBranchStatus(): void {
-    if (this.disposed) return;
-    if (this.branchStatusTimer) clearTimeout(this.branchStatusTimer);
-    this.branchStatusTimer = setTimeout(() => {
-      this.branchStatusTimer = undefined;
-      void this.sendBranchStatus();
-    }, BRANCH_STATUS_DEBOUNCE_MS);
   }
 
   /** Pushes the current branch's upstream/ahead/behind so the webview can
@@ -394,7 +379,7 @@ export class GraphSession implements vscode.Disposable {
         };
       }
     } catch (err) {
-      if (/detached/i.test(errorMessage(err))) {
+      if (isDetachedError(err)) {
         payload = { detached: true, upstream: null, ahead: 0, behind: 0 };
       } else {
         console.error('[git-bamboo] getBranchStatus for graph failed:', err);

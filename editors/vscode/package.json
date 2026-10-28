@@ -412,7 +412,8 @@
           "type": "number",
           "default": 180,
           "minimum": 0,
-          "description": "Periodically run a silent `git fetch --all` in the background while the window is active; 0 disables auto-fetch.",
+          "maximum": 3600,
+          "description": "Periodically run a silent `git fetch --all` in the background while the window is active; 0 disables auto-fetch. Read from user settings only; non-zero values are clamped to 10–3600 seconds.",
           "order": 5
         }
       }
