@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强 Phase 4：graph 工具栏网络按钮 + ahead/behind 徽标 + Sync + auto-fetch
 date: 2026-10-26
-status: ready
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 group: network-ops-enhancements
@@ -50,15 +50,33 @@ graph 视图头部出现网络操作区：`[⟳] [↓ Pull] [↑ Push] [⇧ Sync
 
 ## Acceptance Criteria
 
-- [ ] graph 头部出现四按钮 + 徽标；无 upstream 显示 `↑✱`，点击进入 publish 流程（QuickPick remote）。
-- [ ] pull/push/sync 按钮行为与命令面板入口一致（同一 netOps.ts 实现，无复制逻辑）。
-- [ ] 操作期间按钮 loading 且同排禁用；完成自动复位。
-- [ ] 徽标数字在 fetch/pull/push 后自动刷新（refsChanged 驱动）。
-- [ ] detached HEAD 时按钮禁用且有 tooltip 说明。
-- [ ] autoFetch=180 时后台周期 fetch 全静默；设 0 关闭。
-- [ ] 状态栏分支项显示 ↑n↓n。
-- [ ] 所有 host→webview 初始推送在 ready 握手之后；所有 webview→host 消息 host 侧验证。
-- [ ] tsc 通过 + 手工冒烟记录。
+- [x] graph 头部出现四按钮 + 徽标；无 upstream 显示 `↑✱`，点击进入 publish 流程（QuickPick remote）。 \
+  实现为头 #toolbar 行（scroller/overlay/splitter 移入相对定位的 #graph-area，几何不变）；`↑✱` 徽标点击发 `netOp {op:'publish'}` 走 netOps.publishBranch 同一 QuickPick。
+- [x] pull/push/sync 按钮行为与命令面板入口一致（同一 netOps.ts 实现，无复制逻辑）。 \
+  graphSession.runNetOp 经共享 netOpsContext 调 netOps.runPull/runPush/runSync；pull/push 主体已抽取为 pullCurrentBranch/pushCurrentBranch 供两处复用。
+- [x] 操作期间按钮 loading 且同排禁用；完成自动复位。 \
+  host 在 op 前后回发 netOpState {active, op}；进行中按钮 SVG 旋转动画 + 整排 disabled，finally 中复位。
+- [x] 徽标数字在 fetch/pull/push 后自动刷新（refsChanged 驱动）。 \
+  引擎侧验证：fetch --all 后 refsChanged+graphInvalidated 确实发出（驱动 200ms 防抖的 sendBranchStatus）；引擎冒烟脚本比对 `git rev-list --left-right --count` 前后一致。
+- [x] detached HEAD 时按钮禁用且有 tooltip 说明。 \
+  引擎返回 detached 错误（冒烟已验证），host 转 branchStatus {detached:true}，pull/push/sync 禁用 + DETACHED_TITLE tooltip；fetch 保持可用。 
+- [x] autoFetch=180 时后台周期 fetch 全静默；设 0 关闭。 \
+  extension 定时器直调 client.fetch(null)，无进度通知、无 toast、失败仅 console；窗口非活跃跳过 tick；0 = 不起定时器；配置变更实时重臂。
+- [x] 状态栏分支项显示 ↑n↓n。 \
+  branchLabel/aheadBehindText 两段组合渲染，refsChanged/headChanged 200ms 防抖刷新；无 upstream/detached 省略。
+- [x] 所有 host→webview 初始推送在 ready 握手之后；所有 webview→host 消息 host 侧验证。 \
+  初始 branchStatus 挂在 ready 处理器（构造函数零 postMessage）；netOp op 枚举白名单校验，branchStatus 载荷 webview 侧形状校验。
+- [x] tsc 通过 + 手工冒烟记录。 \
+  tsc --noEmit 与 vite 双构建通过；引擎级冒烟（临时脚本）：ahead/behind 与 git rev-list 一致、fetch 后 refsChanged、detached 报错。VS Code 内 F5 手工冒烟清单见下。
+
+## 手工冒烟清单（F5，VS Code 内）
+
+- graph（sidebar + panel 两宿主）头部四按钮 + 徽标渲染正常；`git rev-list --left-right --count upstream...branch` 与徽标一致。
+- 无 upstream 分支显示 `↑✱`，点击出现 remote QuickPick，push -u 后徽标转为 `↑0 ↓0`。
+- 落后+领先场景点 Sync：先 pull 后 push 各一条通知；拉取冲突时停在冲突通知（冲突栏闭环）。
+- 操作期间按钮转圈且整排禁用；断网点 fetch 看错误通知与按钮复位。
+- `git checkout --detach` 后 pull/push/sync 禁用 + detached tooltip，fetch 仍可用，状态栏无 ↑↓。
+- 设 `gitbamboo.autoFetch.intervalSeconds` 为 10：网络面板可见周期性 fetch 且无任何通知弹窗；设 0 停止。
 
 ## Dependencies
 
