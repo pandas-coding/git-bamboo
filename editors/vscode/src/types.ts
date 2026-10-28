@@ -42,6 +42,23 @@ export interface StatusItem {
  *  conflicts, keeping the file or confirming the deletion. */
 export type ConflictResolution = 'ours' | 'theirs' | 'keep_ours' | 'keep_theirs';
 
+/** Map a UI side ("accept ours/theirs") to the resolution the engine
+ *  accepts for the file's conflict kind: delete/modify kinds have no
+ *  blob on one side, so only the keep_* variants are legal. This
+ *  mirrors the engine's legality table (`action_for`); the engine
+ *  re-validates at execution time, so a stale or forged kind can never
+ *  drive an illegal resolution. Shared by commitView (row buttons,
+ *  context menu) and mergeEditor (binary fast-path). */
+export function sideResolution(
+  kind: ConflictKind | undefined,
+  side: 'ours' | 'theirs',
+): ConflictResolution {
+  const deleteModify =
+    kind === 'deleted_by_us' || kind === 'deleted_by_them' || kind === 'both_deleted';
+  if (side === 'ours') return deleteModify ? 'keep_ours' : 'ours';
+  return deleteModify ? 'keep_theirs' : 'theirs';
+}
+
 export interface Commit {
   id: string;
   message: string;

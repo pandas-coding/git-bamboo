@@ -544,7 +544,8 @@ pub fn read_refs(session: &Session) -> anyhow::Result<Vec<Ref>> {
 ///
 /// Stage revisions `:1`/`:2`/`:3` are served from the unmerged index
 /// entries of `path` (base/ours/theirs of a conflict) instead of a
-/// commit — the merge-editor flow needs all three sides.
+/// commit — the merge-editor flow needs all three sides. An absent
+/// stage resolves to the same empty string as an absent path.
 pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Result<String> {
     if revision.is_empty()
         || revision.starts_with('-')
@@ -596,29 +597,29 @@ fn parse_stage_revision(revision: &str) -> Option<gix::index::entry::Stage> {
     }
 }
 
-/// Blob content of `path` at the given unmerged index stage. Missing
+/// Blob content of `path` at the given unmerged index stage. A missing
 /// stage (e.g. `:1` for a both-added conflict, `:3` for a deleted-by-
-/// them conflict) → empty string, matching the absent-path convention
-/// the diff/merge views already rely on.
+/// them conflict) — and a non-conflicted path, which has no unmerged
+/// entries at all — resolves to an empty string, matching the
+/// absent-path convention the normal-revision `read_blob` path (and the
+/// diff/merge views) already rely on. Real failures (index read, blob
+/// lookup) stay errors so callers can tell "that side is legitimately
+/// absent" from "the engine failed".
 fn read_conflict_stage_blob(
     repo: &gix::Repository,
     path: &str,
     stage: gix::index::entry::Stage,
 ) -> anyhow::Result<String> {
     let index = repo.index()?;
-    let entry = index
+    let Some(entry) = index
         .entries()
         .iter()
         .find(|entry| {
             entry.stage() == stage && entry.path_in(index.path_backing()) == path.as_bytes()
         })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no stage {revision} entry for {path:?} — the file may not be \
-                 conflicted (or that side is absent)",
-                revision = stage as u32
-            )
-        })?;
+    else {
+        return Ok(String::new());
+    };
     let blob = repo.find_blob(entry.id)?;
     Ok(String::from_utf8_lossy(&blob.data).into_owned())
 }

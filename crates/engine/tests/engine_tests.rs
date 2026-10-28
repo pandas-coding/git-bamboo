@@ -2510,6 +2510,68 @@ async fn resolve_conflict_rejects_mismatches_and_stale_paths() -> anyhow::Result
     Ok(())
 }
 
+/// both-modified conflict on `sub/f.txt` — the conflict lives in a
+/// subdirectory, so a directory-shaped resolve request ("sub") can be
+/// exercised: its pathspec would recursively match every file under `sub/`.
+fn subdir_conflict_repo() -> anyhow::Result<tempfile::TempDir> {
+    let dir = test_repo()?;
+    std::fs::create_dir(dir.path().join("sub"))?;
+    std::fs::write(dir.path().join("sub/f.txt"), "base\n")?;
+    gitq(dir.path(), &["add", "sub"])?;
+    gitq(dir.path(), &["commit", "-q", "-m", "base f"])?;
+    gitq(dir.path(), &["checkout", "-q", "-b", "side"])?;
+    std::fs::write(dir.path().join("sub/f.txt"), "side\n")?;
+    gitq(dir.path(), &["commit", "-q", "-am", "side f"])?;
+    gitq(dir.path(), &["checkout", "-q", "main"])?;
+    std::fs::write(dir.path().join("sub/f.txt"), "main\n")?;
+    gitq(dir.path(), &["commit", "-q", "-am", "main f"])?;
+    let merge = Command::new("git")
+        .args(["merge", "side"])
+        .current_dir(dir.path())
+        .output()?;
+    assert!(
+        !merge.status.success(),
+        "expected merge to conflict, got: {}",
+        String::from_utf8_lossy(&merge.stdout)
+    );
+    Ok(dir)
+}
+
+#[tokio::test]
+async fn resolve_conflict_rejects_directory_shaped_paths() -> anyhow::Result<()> {
+    let dir = subdir_conflict_repo()?;
+    let session = open_session(&dir).await?;
+
+    // "sub" is a valid repo path with exactly one conflicted file under
+    // it, so a pathspec-only guard would pass — and the follow-up
+    // `git checkout --ours -- sub` would revert uncommitted sibling
+    // changes under sub/, `git add -- sub` would stage the whole
+    // directory. The exact-path classification must reject it.
+    let err = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "sub".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::Ours,
+        })
+        .await
+        .expect_err("directory-shaped resolve path must fail");
+    assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+
+    // The conflict is untouched: markers still in the worktree file, and
+    // the file (not the directory) still resolves normally afterwards.
+    assert!(std::fs::read_to_string(dir.path().join("sub/f.txt"))?.contains("<<<<<<<"));
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::ResolveConflict {
+            path: "sub/f.txt".to_string(),
+            resolution: bamboo_protocol::ConflictResolution::Theirs,
+        })
+        .await?;
+    settle().await;
+    let items = bamboo_engine::gix_read::read_status(&session, None)?;
+    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert_eq!(std::fs::read_to_string(dir.path().join("sub/f.txt"))?, "side\n");
+    Ok(())
+}
+
 #[tokio::test]
 async fn resolve_deleted_by_them_conflict() -> anyhow::Result<()> {
     let dir = deleted_by_them_repo()?;
@@ -2640,17 +2702,25 @@ async fn read_blob_serves_conflict_stages() -> anyhow::Result<()> {
     assert_eq!(theirs, "side\n");
 
     // A missing stage (delete/modify conflicts have no :3/:2 on the
-    // deleted side... deleted-by-them still stages ours at :2) errors
-    // clearly rather than serving wrong content.
+    // deleted side... deleted-by-them still stages ours at :2) resolves
+    // to an empty string — that side is legitimately absent, not an
+    // error, so the TS side can distinguish it from engine failures.
     let dir = deleted_by_them_repo()?;
     let session = open_session(&dir).await?;
-    assert!(
-        bamboo_engine::gix_read::read_blob(&session, ":2", "b.txt").is_ok(),
+    assert_eq!(
+        bamboo_engine::gix_read::read_blob(&session, ":2", "b.txt")?,
+        "ours\n",
         "ours stage should exist for deleted-by-them"
     );
-    assert!(
-        bamboo_engine::gix_read::read_blob(&session, ":3", "b.txt").is_err(),
-        "theirs stage should be absent when they deleted the file"
+    assert_eq!(
+        bamboo_engine::gix_read::read_blob(&session, ":3", "b.txt")?,
+        "",
+        "theirs stage should be absent (empty) when they deleted the file"
+    );
+    assert_eq!(
+        bamboo_engine::gix_read::read_blob(&session, ":2", "a.txt")?,
+        "",
+        "a non-conflicted path has no unmerged entries — absent, not an error"
     );
     Ok(())
 }

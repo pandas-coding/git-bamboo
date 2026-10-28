@@ -1267,11 +1267,15 @@ async fn classify_conflict_path(session: &Session, path: &str) -> Result<Conflic
     .await
     .map_err(|e| BambooError::git_error(e.to_string()))?;
     let entries = parse_porcelain_z(&out);
-    // The pathspec filter limits records to this path (component-aware);
-    // a directory-shaped pathspec could match several files, so require
-    // exactly one and require it to be a conflict.
+    // The pathspec filter limits records to this path — but a directory-
+    // shaped request ("sub") matches every file under it recursively, so
+    // require exactly one entry AND require its path to equal the request.
+    // The exact match rejects directory-shaped requests outright, keeping
+    // the follow-up checkout/add/rm scoped to the single conflicted file
+    // (a directory pathspec would otherwise also revert/stage uncommitted
+    // sibling changes under it).
     match entries.as_slice() {
-        [(xy, _)] if porcelain_conflict_kind(xy).is_some() => {
+        [(xy, p)] if p == path && porcelain_conflict_kind(xy).is_some() => {
             Ok(porcelain_conflict_kind(xy).expect("checked above"))
         }
         _ => Err(BambooError::invalid_argument(format!(

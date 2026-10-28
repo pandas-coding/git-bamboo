@@ -15,30 +15,9 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
 import { STAGE_BASE, STAGE_OURS, STAGE_THEIRS, stageUri } from './headContent';
-import type { ConflictKind, ConflictResolution } from './types';
+import { sideResolution } from './types';
+import type { ConflictKind, StatusItem } from './types';
 import { errorMessage } from './util';
-
-/** Map a UI side to the resolution the engine accepts for the kind —
- *  same rule as commitView.sideResolution (delete/modify conflicts need
- *  the keep_* variants). Duplicated here so the module stays
- *  self-contained for the binary fast-path, which bypasses commitView. */
-function sideResolution(kind: ConflictKind | undefined, side: 'ours' | 'theirs'): ConflictResolution {
-  const deleteModify =
-    kind === 'deleted_by_us' || kind === 'deleted_by_them' || kind === 'both_deleted';
-  if (side === 'ours') return deleteModify ? 'keep_ours' : 'ours';
-  return deleteModify ? 'keep_theirs' : 'theirs';
-}
-
-/** Read one conflict stage's blob; null when that side is absent (e.g.
- *  no :3 for a deleted-by-them conflict) — the merge editor then shows
- *  that side as empty, which is exactly its state. */
-async function stageContent(client: EngineClient, relativePath: string, stage: string): Promise<string | null> {
-  try {
-    return await client.getBlob(stage, relativePath);
-  } catch {
-    return null;
-  }
-}
 
 /** Conflict markers the merge editor may leave behind when regions are
  *  not fully resolved. `=======` alone is legitimate file content
@@ -48,15 +27,34 @@ function hasConflictMarkers(content: string): boolean {
   return /^<{7}|^>{7}/m.test(content);
 }
 
+/** Resolve the repository's git dir: `.git` is a directory in the main
+ *  worktree, but a "gitdir: <path>" pointer file in linked worktrees —
+ *  rebase state dirs live under the real git dir either way. Falls back
+ *  to `.git` itself when it cannot be read (callers treat errors as
+ *  "not rebasing"). */
+async function resolveGitDir(root: vscode.Uri): Promise<vscode.Uri> {
+  const dotGit = vscode.Uri.joinPath(root, '.git');
+  try {
+    const stat = await vscode.workspace.fs.stat(dotGit);
+    if ((stat.type & vscode.FileType.Directory) === 0) {
+      const raw = new TextDecoder().decode(await vscode.workspace.fs.readFile(dotGit));
+      const target = raw.trim().match(/^gitdir:\s*(.+)$/)?.[1];
+      if (target) return vscode.Uri.file(target);
+    }
+  } catch {
+    // unreadable .git — fall through with .git itself
+  }
+  return dotGit;
+}
+
 /** Whether the repository is mid-rebase (rebase-merge for interactive
  *  rebases, rebase-apply for am/legacy). During a rebase the stage
- *  semantics flip for the *user* — "ours" is the upstream side — which
- *  only affects the input titles in phase 3. */
+ *  semantics flip for the *user* — "ours" is the upstream side. */
 async function isRebaseActive(root: vscode.Uri): Promise<boolean> {
-  const dotGit = vscode.Uri.joinPath(root, '.git');
+  const gitDir = await resolveGitDir(root);
   for (const state of ['rebase-merge', 'rebase-apply']) {
     try {
-      await vscode.workspace.fs.stat(vscode.Uri.joinPath(dotGit, state));
+      await vscode.workspace.fs.stat(vscode.Uri.joinPath(gitDir, state));
       return true;
     } catch {
       // absent — try the next state dir
@@ -65,15 +63,30 @@ async function isRebaseActive(root: vscode.Uri): Promise<boolean> {
   return false;
 }
 
-/** One tracked merge-editor session: the result (output) document whose
- *  saves we watch, and the repo-relative path to stage when it resolves. */
-interface TrackedMerge {
-  relativePath: string;
+/** Merge-editor input assignment for one conflicted file. In both orders
+ *  stage :2 (ours) feeds input1 "Current" and :3 (theirs) input2
+ *  "Incoming" — only the *titles* differ, because during a rebase "ours"
+ *  is the upstream side and "theirs" is the user's own replayed change.
+ *  This is the structural hook for the rebase follow-up: deeper rebase
+ *  semantics (flipping the accept-side buttons in the conflicts bucket to
+ *  match these titles) key off `order`, not off openFor internals. */
+type MergeInputOrder = 'merge' | 'rebase';
+
+function mergeInputs(root: vscode.Uri, relativePath: string, order: MergeInputOrder) {
+  const titles =
+    order === 'merge'
+      ? { input1: 'Current (Yours)', input2: 'Incoming (Theirs)' }
+      : { input1: 'Current (Upstream)', input2: 'Incoming (Your change)' };
+  return {
+    input1: { uri: stageUri(root, relativePath, STAGE_OURS), title: titles.input1 },
+    input2: { uri: stageUri(root, relativePath, STAGE_THEIRS), title: titles.input2 },
+  };
 }
 
 export class MergeEditorManager implements vscode.Disposable {
-  /** Result documents of currently open merge editors (worktree file URIs). */
-  private readonly tracked = new Map<string, TrackedMerge>();
+  /** Result documents of currently open merge editors (worktree file URIs)
+   *  mapped to the repo-relative path to stage when they resolve. */
+  private readonly tracked = new Map<string, string>();
   private readonly listener: vscode.Disposable;
   private readonly tabListener: vscode.Disposable;
   private disposed = false;
@@ -109,50 +122,42 @@ export class MergeEditorManager implements vscode.Disposable {
    * (NUL bytes on any side) cannot be merged textually — a quick pick
    * offers taking one side instead.
    *
-   * Rebase handling: during a rebase the "ours" stage holds the upstream
-   * side, so the input titles are relabeled (phase 3 keeps the URIs on
-   * the natural current/incoming mapping; deeper rebase semantics —
-   * swapping which stage feeds which input, and flipping the accept-side
-   * buttons — are a follow-up).
+   * The three sides are fetched up front so real failures (engine down,
+   * transport error) fail loudly here instead of opening an editor with
+   * silently empty sides that a save would then stage. An absent stage
+   * (no :3 for a deleted side, no :1 base for both-added) resolves to
+   * the empty string — that side's actual state — and errors propagate.
    */
   async openFor(relativePath: string, kind: ConflictKind | undefined): Promise<void> {
-    const base = await stageContent(this.client, relativePath, STAGE_BASE);
-    const ours = await stageContent(this.client, relativePath, STAGE_OURS);
-    const theirs = await stageContent(this.client, relativePath, STAGE_THEIRS);
+    const base = await this.client.getBlob(STAGE_BASE, relativePath);
+    const ours = await this.client.getBlob(STAGE_OURS, relativePath);
+    const theirs = await this.client.getBlob(STAGE_THEIRS, relativePath);
 
     // Binary fast-path: 3-way merge of NUL-bearing content is noise.
-    if ([base, ours, theirs].some((c) => c !== null && c.includes('\0'))) {
+    if (base.includes('\0') || ours.includes('\0') || theirs.includes('\0')) {
       await this.offerBinaryResolution(relativePath, kind);
       return;
     }
 
     const output = vscode.Uri.joinPath(this.root, ...relativePath.split('/'));
+    const order: MergeInputOrder = (await isRebaseActive(this.root)) ? 'rebase' : 'merge';
+    const { input1, input2 } = mergeInputs(this.root, relativePath, order);
     const args: Record<string, unknown> = {
       // input1 = current (ours :2), input2 = incoming (theirs :3); the
       // output is the worktree file the editor writes resolutions into.
-      input1: {
-        uri: stageUri(this.root, relativePath, STAGE_OURS),
-        title: 'Current (Yours)',
-      },
-      input2: {
-        uri: stageUri(this.root, relativePath, STAGE_THEIRS),
-        title: 'Incoming (Theirs)',
-      },
+      input1,
+      input2,
       output,
     };
-    // Base is optional: both-added conflicts have no stage 1, and the
-    // merge editor degrades to a two-way diff without it.
-    if (base !== null) {
+    // Base is optional: both-added conflicts have no stage 1 (the engine
+    // serves an absent stage as an empty string), and the merge editor
+    // degrades to a two-way diff without it.
+    if (base !== '') {
       args.base = stageUri(this.root, relativePath, STAGE_BASE);
-    }
-    if (await isRebaseActive(this.root)) {
-      // Rebase: "ours" is the upstream side — relabel, keep the mapping.
-      (args.input1 as { title: string }).title = 'Current (Upstream)';
-      (args.input2 as { title: string }).title = 'Incoming (Your change)';
     }
 
     await vscode.commands.executeCommand('_open.mergeEditor', args);
-    this.tracked.set(output.toString(), { relativePath });
+    this.tracked.set(output.toString(), relativePath);
   }
 
   /** Binary conflicts: take a side directly (engine resolves and stages). */
@@ -179,25 +184,47 @@ export class MergeEditorManager implements vscode.Disposable {
    *  engine's index/worktree notifications then refresh the view. */
   private async onSaved(doc: vscode.TextDocument): Promise<void> {
     if (this.disposed) return;
-    const entry = this.tracked.get(doc.uri.toString());
-    if (!entry) return;
+    const relativePath = this.tracked.get(doc.uri.toString());
+    if (!relativePath) return;
     if (hasConflictMarkers(doc.getText())) {
       vscode.window.setStatusBarMessage(
-        `Git Bamboo: ${path.posix.basename(entry.relativePath)} still has conflict markers — not staged`,
+        `Git Bamboo: ${path.posix.basename(relativePath)} still has conflict markers — not staged`,
         4000,
       );
       return;
     }
+    // Freshness: the user may have resolved this file through another
+    // path (e.g. the Accept Yours button) while the merge-editor tab
+    // stayed open — the session was never untracked then, and staging
+    // here would overwrite the accepted resolution with the merge
+    // editor's (stale) result. Re-check against a fresh status first.
     try {
-      await this.client.request('stage', { paths: [entry.relativePath] });
+      const items = await this.client.request<StatusItem[]>('getStatus', {});
+      const stillConflicted =
+        Array.isArray(items) &&
+        items.some((item) => item.path === relativePath && item.status === 'conflict');
+      if (!stillConflicted) {
+        this.tracked.delete(doc.uri.toString()); // someone else resolved it; stop watching
+        vscode.window.setStatusBarMessage(
+          `Git Bamboo: ${path.posix.basename(relativePath)} was already resolved — not staged`,
+          4000,
+        );
+        return;
+      }
+    } catch {
+      // Status unavailable (engine restarting): fall through and let the
+      // stage RPC itself arbitrate.
+    }
+    try {
+      await this.client.request('stage', { paths: [relativePath] });
       this.tracked.delete(doc.uri.toString()); // resolved; stop watching
       vscode.window.setStatusBarMessage(
-        `Git Bamboo: resolved and staged ${path.posix.basename(entry.relativePath)}`,
+        `Git Bamboo: resolved and staged ${path.posix.basename(relativePath)}`,
         4000,
       );
     } catch (err) {
       vscode.window.showErrorMessage(
-        `Git Bamboo: staging the resolved ${entry.relativePath} failed — ${errorMessage(err)}`,
+        `Git Bamboo: staging the resolved ${relativePath} failed — ${errorMessage(err)}`,
       );
     }
   }

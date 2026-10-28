@@ -23,6 +23,9 @@ import type {
 export const RpcErrorCode = {
   /** Plain git failure (non-zero exit, no structured classification). */
   GIT_ERROR: -32002,
+  /** Rejected request arguments (resolveConflict kind-mismatch /
+   *  stale-snapshot rejection). */
+  INVALID_ARGUMENT: -32005,
   /** Stash pop/apply conflict — the stash entry is retained. */
   STASH_CONFLICT: -32008,
   /** Push rejected (non-fast-forward / stale lease) — recovery is client-side. */
@@ -274,10 +277,15 @@ export class EngineClient {
    * re-classifies the conflict fresh at execution time and rejects a
    * resolution that does not fit the kind (e.g. `theirs` on a
    * deleted-by-them conflict) with INVALID_ARGUMENT. Resolves with the
-   * engine's human-readable summary line.
+   * engine's human-readable summary line — the wire result is an
+   * `OutputResult` object (`{ output }`), unwrapped here.
    */
-  resolveConflict(path: string, resolution: ConflictResolution): Promise<string> {
-    return this.request<string>('resolveConflict', { path, resolution });
+  async resolveConflict(path: string, resolution: ConflictResolution): Promise<string> {
+    const result = await this.request<{ output?: unknown }>('resolveConflict', {
+      path,
+      resolution,
+    });
+    return typeof result?.output === 'string' ? result.output : '';
   }
 
   /** Graceful shutdown request (best-effort, 2s cap), then kill the child. */

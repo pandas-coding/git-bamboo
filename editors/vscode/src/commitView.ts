@@ -11,17 +11,14 @@
  */
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { EngineClient, rpcErrorCode } from './engineClient';
+import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
 import { createContextTargetSlot } from './contextTargetSlot';
 import { isValidRepoPath, openResource } from './headContent';
 import { MergeEditorManager } from './mergeEditor';
-import type { ConflictKind, ConflictResolution, StatusItem } from './types';
+import { sideResolution } from './types';
+import type { ConflictResolution, StatusItem } from './types';
 import { errorMessage } from './util';
 import { buildWebviewHtml } from './webviewHtml';
-
-/** Engine JSON-RPC INVALID_ARGUMENT (see protocol BambooError) — the
- *  resolveConflict kind-mismatch / stale-snapshot rejection. */
-const RPC_INVALID_ARGUMENT = -32005;
 
 /** Debounce for status refreshes (the engine coalesces fs events at 50ms). */
 const REFRESH_DEBOUNCE_MS = 50;
@@ -58,20 +55,6 @@ function bucketOf(item: StatusItem): 'conflicts' | 'staged' | 'changes' | 'untra
   if (item.staged) return 'staged';
   if (item.status === 'untracked') return 'untracked';
   return 'changes';
-}
-
-/** Map a UI side ("accept ours/theirs") to the resolution the engine
- *  accepts for the file's conflict kind: delete/modify kinds need the
- *  keep_* variants (one side has no blob to take). The webview row
- *  buttons apply the same mapping client-side. */
-export function sideResolution(
-  kind: ConflictKind | undefined,
-  side: 'ours' | 'theirs',
-): ConflictResolution {
-  const deleteModify =
-    kind === 'deleted_by_us' || kind === 'deleted_by_them' || kind === 'both_deleted';
-  if (side === 'ours') return deleteModify ? 'keep_ours' : 'ours';
-  return deleteModify ? 'keep_theirs' : 'theirs';
 }
 
 export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -360,7 +343,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     } catch (err) {
       // INVALID_ARGUMENT = kind mismatch or stale path (engine message is
       // user-readable); anything else is a real engine failure.
-      if (rpcErrorCode(err) === RPC_INVALID_ARGUMENT) {
+      if (rpcErrorCode(err) === RpcErrorCode.INVALID_ARGUMENT) {
         vscode.window.showWarningMessage(`Git Bamboo: ${errorMessage(err)}`);
       } else {
         vscode.window.showErrorMessage(
@@ -400,14 +383,16 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     } else {
       await vscode.commands.executeCommand(`${CommitViewProvider.viewId}.focus`);
     }
-    // Send immediately when a view is attached, and flag the request so
-    // the next status push replays it: a freshly resolved view's webview
-    // is not loaded yet (the ready handshake triggers that push), and
-    // would silently drop the message. The replay is idempotent.
-    this.pendingShowConflicts = true;
-    if (this.view) {
-      await this.view.webview.postMessage({ type: 'showConflicts' });
-    }
+    // Send immediately when a view is attached; arm the replay flag only
+    // when that send may have been dropped (no view yet, or the webview
+    // not loaded — postMessage resolves false then). The replay rides on
+    // the next status push: a freshly resolved view's webview is not
+    // loaded yet, and an armed flag would otherwise re-expand the
+    // conflicts section a second time after a successful send.
+    const delivered = this.view
+      ? await this.view.webview.postMessage({ type: 'showConflicts' })
+      : false;
+    this.pendingShowConflicts = !delivered;
   }
 
   /** Returns (and clears) the file targeted by the Commit view's context
