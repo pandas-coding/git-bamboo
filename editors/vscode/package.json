@@ -407,6 +407,13 @@
           "default": true,
           "description": "Show a confirmation modal before every force push.",
           "order": 4
+        },
+        "gitbamboo.autoFetch.intervalSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 0,
+          "description": "Periodically run a silent `git fetch --all` in the background while the window is active; 0 disables auto-fetch.",
+          "order": 5
         }
       }
     }

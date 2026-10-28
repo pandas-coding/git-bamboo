@@ -21,6 +21,11 @@ import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
 
 let activeClient: EngineClient | undefined;
+
+/** Debounce shared by the status-bar branchStatus refresh: refsChanged
+ *  fires in bursts (auto-fetch, pushes) and each refresh costs one RPC.
+ *  Mirrors graphSession's BRANCH_STATUS_DEBOUNCE_MS. */
+const BRANCH_STATUS_DEBOUNCE_MS = 200;
 let activeState: RepoState | undefined;
 let activeCommitView: CommitViewProvider | undefined;
 
@@ -338,20 +343,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   registerGraphPanelSerializer(context, client, state);
 
-  // TODO(ahead-behind): showing ahead/behind counts needs upstream tracking
-  // info, which the engine does not expose yet.
+  // Status bar branch item: branch name plus ahead/behind counts (↑n↓n;
+  // omitted without an upstream, e.g. detached HEAD or an unpublished
+  // branch). getBranchStatus (Phase 1) is the data source; the same
+  // refsChanged/headChanged notifications that refresh the graph drive it.
   const branchItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
   context.subscriptions.push(branchItem);
+  let branchLabel = '';
+  let branchTooltip = '';
+  let aheadBehindText = '';
+  const renderBranchItem = (): void => {
+    branchItem.text = `$(git-branch) ${branchLabel}${aheadBehindText}`;
+    branchItem.tooltip = branchTooltip;
+  };
 
   /** Refreshes current branch + status bar from the engine's getHead RPC. */
   const refreshHead = async (): Promise<void> => {
     try {
       const { head, branch } = await client.getHead();
       state.currentBranch = branch ?? undefined;
-      branchItem.text = `$(git-branch) ${branch ?? head.slice(0, 8)}`;
-      branchItem.tooltip = branch
+      branchLabel = branch ?? head.slice(0, 8);
+      branchTooltip = branch
         ? `Git Bamboo: on branch ${branch}`
         : `Git Bamboo: detached HEAD at ${head}`;
+      renderBranchItem();
       branchItem.show();
     } catch (err) {
       console.error('[git-bamboo] getHead failed:', err);
@@ -359,8 +374,73 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   await refreshHead();
 
+  /** Refreshes the ahead/behind suffix from getBranchStatus. Failures
+   *  (detached HEAD, RPC error) clear the suffix — there are no counts
+   *  to show, and the branch label itself still renders. */
+  const refreshBranchStatus = async (): Promise<void> => {
+    try {
+      const status = await client.getBranchStatus();
+      aheadBehindText = status?.upstream ? ` \u2191${status.ahead}\u2193${status.behind}` : '';
+    } catch {
+      aheadBehindText = '';
+    }
+    renderBranchItem();
+  };
+  let branchStatusTimer: NodeJS.Timeout | undefined;
+  const scheduleBranchStatus = (): void => {
+    if (branchStatusTimer) clearTimeout(branchStatusTimer);
+    branchStatusTimer = setTimeout(() => {
+      branchStatusTimer = undefined;
+      void refreshBranchStatus();
+    }, BRANCH_STATUS_DEBOUNCE_MS);
+  };
+
+  // Auto-fetch: a silent periodic `git fetch --all` (refsChanged then
+  // refreshes the graph/commit view on its own). Completely quiet — no
+  // progress notification, no completion toast; failures log to the
+  // console only. The manual fetch flows keep their notification —
+  // silence distinguishes automatic from user-initiated. Ticks while this
+  // window is inactive are skipped so a backgrounded VS Code stops
+  // hitting the network; `gitbamboo.autoFetch.intervalSeconds` (0 = off)
+  // is read live, so a settings change re-arms the timer.
+  let autoFetchTimer: NodeJS.Timeout | undefined;
+  const autoFetchIntervalMs = (): number => {
+    const seconds = vscode.workspace
+      .getConfiguration('gitbamboo')
+      .get<number>('autoFetch.intervalSeconds');
+    const safe =
+      typeof seconds === 'number' && Number.isFinite(seconds)
+        ? Math.max(0, Math.floor(seconds))
+        : 180;
+    return safe * 1000;
+  };
+  const scheduleAutoFetch = (): void => {
+    if (autoFetchTimer) clearInterval(autoFetchTimer);
+    autoFetchTimer = undefined;
+    const intervalMs = autoFetchIntervalMs();
+    if (intervalMs <= 0) return; // 0 = disabled
+    autoFetchTimer = setInterval(() => {
+      if (!vscode.window.state.active) return; // window backgrounded
+      void client.fetch(null).catch((err) => {
+        console.error('[git-bamboo] auto-fetch failed:', errorMessage(err));
+      });
+    }, intervalMs);
+  };
+  scheduleAutoFetch();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('gitbamboo.autoFetch.intervalSeconds')) {
+        scheduleAutoFetch();
+      }
+    }),
+    { dispose: () => { if (autoFetchTimer) clearInterval(autoFetchTimer); } },
+  );
+
   // Engine notifications drive all UI refreshes.
-  onNotification(client, context, 'refsChanged', () => commitView.refresh());
+  onNotification(client, context, 'refsChanged', () => {
+    commitView.refresh();
+    scheduleBranchStatus();
+  });
   onNotification(client, context, 'worktreeChanged', () => commitView.refresh());
   onNotification(client, context, 'indexChanged', (params) => {
     state.epoch = numberField(params, 'epoch', state.epoch);
@@ -368,6 +448,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   onNotification(client, context, 'headChanged', () => {
     void refreshHead();
+    scheduleBranchStatus();
     commitView.refresh();
   });
 
