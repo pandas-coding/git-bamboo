@@ -84,12 +84,15 @@
     }
 
     if (!branchStatus) {
+      // No data yet (pre-handshake): show nothing rather than an empty pill.
+      aheadBehind.hidden = true;
       aheadBehind.textContent = '';
       aheadBehind.disabled = true;
       aheadBehind.title = '';
       aheadBehind.setAttribute('aria-label', 'Ahead and behind counts');
       return;
     }
+    aheadBehind.hidden = false;
     if (branchStatus.detached) {
       aheadBehind.textContent = 'detached';
       aheadBehind.disabled = true;

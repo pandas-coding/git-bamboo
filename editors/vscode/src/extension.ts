@@ -20,12 +20,12 @@ import { HeadContentProvider } from './headContent';
 import type { InitializeResult, RepoState } from './types';
 import { errorMessage } from './util';
 
-let activeClient: EngineClient | undefined;
-
 /** Debounce shared by the status-bar branchStatus refresh: refsChanged
  *  fires in bursts (auto-fetch, pushes) and each refresh costs one RPC.
  *  Mirrors graphSession's BRANCH_STATUS_DEBOUNCE_MS. */
 const BRANCH_STATUS_DEBOUNCE_MS = 200;
+
+let activeClient: EngineClient | undefined;
 let activeState: RepoState | undefined;
 let activeCommitView: CommitViewProvider | undefined;
 
