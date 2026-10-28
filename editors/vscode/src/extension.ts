@@ -449,6 +449,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Engine notifications drive all UI refreshes.
   onNotification(client, context, 'refsChanged', () => {
     commitView.refresh();
+    // Stash entries live in refs/stash reflog — external `git stash`
+    // commands move it, so keep the Commit view's stash list current.
+    void commitView.refreshStashes();
     scheduleBranchStatus();
   });
   onNotification(client, context, 'worktreeChanged', () => {

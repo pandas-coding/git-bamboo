@@ -28,6 +28,12 @@ export const ICONS = {
   /** Accept one side of a conflict (check with a direction hint). */
   acceptOurs: '<path d="M3 8.5l2.25 2.25L9 6.25"/><path d="M11.75 3.75v3.75h-3.75"/>',
   acceptTheirs: '<path d="M3 8.5l2.25 2.25L9 6.25"/><path d="M4.25 3.75v3.75h3.75"/>',
+  /** Stash section (phase 5): create (save/box), pop (out of box),
+   *  apply (copy from box), drop (delete). */
+  stashCreate: '<path d="M2.5 6h11v7h-11z"/><path d="M5.5 3.5h5V6h-5z"/><path d="M6.75 9.25v1.5M9.25 9.25v1.5"/>',
+  stashPop: '<path d="M2.5 6h11v7h-11z"/><path d="M2.5 8.25h11"/><path d="M8 3.25 6 5.25l2 2"/>',
+  stashApply: '<path d="M2.5 6h11v7h-11z"/><path d="M2.5 8.25h11"/><path d="M5.75 10.75h4.5"/>',
+  stashDrop: '<path d="M3.25 4.5h9.5"/><path d="M6.5 4.5V3h3v1.5"/><path d="M4.75 4.5l.5 8.25h5.5l.5-8.25"/><path d="M6.75 7.25v3.5M9.25 7.25v3.5"/>',
 };
 
 /** Wraps an ICONS body in the shared 16x16 stroke SVG element markup. */

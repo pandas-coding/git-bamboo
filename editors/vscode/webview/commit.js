@@ -10,7 +10,12 @@
  *             { type: 'resolveConflict', path, resolution }
  *             { type: 'commit', message, amend }
  *             { type: 'contextTarget', file: { path, status, bucket } | null }
+ *             { type: 'stashCreate', message, include_untracked, staged_only }
+ *             { type: 'stashPop' | 'stashApply', ref, reinstate_index }
+ *             { type: 'stashDrop', ref }
+ *             { type: 'stashRefresh' }
  *   inbound:  { type: 'status', items }  — raw engine StatusItem[], bucketed here
+ *             { type: 'stashes', entries } — raw engine StashEntry[]
  *             { type: 'committed' }      — clear the message box
  *             { type: 'showConflicts' }  — expand + reveal the conflicts section
  */
@@ -72,6 +77,20 @@ const els = {
     staged: document.getElementById('staged-bulk'),
     changes: document.getElementById('changes-bulk'),
     untracked: document.getElementById('untracked-bulk'),
+  },
+  stashes: {
+    section: document.getElementById('stashes-section'),
+    count: document.getElementById('stashes-count'),
+    body: document.getElementById('stashes-body'),
+    list: document.getElementById('stash-list'),
+    empty: document.getElementById('stash-empty'),
+    form: document.getElementById('stash-form'),
+    createToggle: document.getElementById('stash-create-toggle'),
+    message: document.getElementById('stash-message'),
+    untracked: document.getElementById('stash-untracked'),
+    stagedOnly: document.getElementById('stash-staged-only'),
+    create: document.getElementById('stash-create'),
+    reinstateIndex: document.getElementById('stash-index'),
   },
   fileList: document.getElementById('file-list'),
   btnCommit: document.getElementById('btn-commit'),
@@ -294,6 +313,102 @@ for (const key of BULK_BUCKETS) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Stashes section (phase 5)
+// ---------------------------------------------------------------------------
+
+/** @typedef {{ ref: string, message: string, date: string }} StashEntry */
+
+/** Coarse relative time for a stash entry (ISO date → "3h ago" style,
+ *  mirroring the host util's granularity). */
+function relativeTimeLabel(isoDate) {
+  const then = Date.parse(isoDate);
+  if (!Number.isFinite(then)) return '';
+  const seconds = Math.max(0, (Date.now() - then) / 1000);
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  return `${months}mo ago`;
+}
+
+function createStashRow(entry) {
+  const row = document.createElement('div');
+  row.className = 'stash-row';
+  row.dataset.ref = entry.ref;
+  row.title = `${entry.ref}: ${entry.message}`;
+
+  const message = document.createElement('span');
+  message.className = 'stash-message';
+  message.textContent = entry.message;
+  row.appendChild(message);
+
+  const time = document.createElement('span');
+  time.className = 'stash-time';
+  time.textContent = relativeTimeLabel(entry.date);
+  row.appendChild(time);
+
+  // Pop removes the entry, apply keeps it; drop is destructive and the
+  // host confirms with a modal before calling the engine.
+  const actions = document.createElement('span');
+  actions.className = 'actions';
+  actions.appendChild(createButton('stashPop', 'Pop Stash (apply and remove)', () => {
+    vscode.postMessage({ type: 'stashPop', ref: entry.ref, reinstate_index: els.stashes.reinstateIndex.checked });
+  }));
+  actions.appendChild(createButton('stashApply', 'Apply Stash (keep the entry)', () => {
+    vscode.postMessage({ type: 'stashApply', ref: entry.ref, reinstate_index: els.stashes.reinstateIndex.checked });
+  }));
+  actions.appendChild(createButton('stashDrop', 'Drop Stash (irreversible)', () => {
+    vscode.postMessage({ type: 'stashDrop', ref: entry.ref });
+  }));
+  row.appendChild(actions);
+
+  return row;
+}
+
+function renderStashes(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  els.stashes.count.textContent = String(list.length);
+  els.stashes.list.replaceChildren(...list.map(createStashRow));
+  els.stashes.empty.style.display = list.length === 0 ? '' : 'none';
+}
+
+// Create-stash form: the header + button toggles it; submit sends the
+// options (host/engine validate the message text).
+els.stashes.createToggle.addEventListener('click', (event) => {
+  event.stopPropagation();
+  els.stashes.form.classList.toggle('open');
+  if (els.stashes.form.classList.contains('open')) els.stashes.message.focus();
+});
+els.stashes.create.addEventListener('click', () => {
+  vscode.postMessage({
+    type: 'stashCreate',
+    message: els.stashes.message.value.trim(),
+    include_untracked: els.stashes.untracked.checked,
+    staged_only: els.stashes.stagedOnly.checked,
+  });
+  els.stashes.form.classList.remove('open');
+  els.stashes.message.value = '';
+});
+els.stashes.message.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    els.stashes.create.click();
+  }
+});
+
+// Stashes collapse follows the same section-header pattern as the file
+// buckets (the create form lives inside the collapsible body).
+els.stashes.section.querySelector('.section-header').addEventListener('click', () => {
+  if (collapsed.has('stashes')) collapsed.delete('stashes');
+  else collapsed.add('stashes');
+  applyCollapsed('stashes');
+});
+
 // Fires before the native webview/context menu opens: report the
 // right-clicked file so the host can park it for the menu commands
 // (contextmenu -> menu command is the hand-off path; command arguments
@@ -313,9 +428,10 @@ els.fileList.addEventListener('contextmenu', (e) => {
 /** Syncs a section's collapsed state to the DOM (shared by render() and
  *  the header click handler). */
 function applyCollapsed(key) {
-  const header = els.sections[key].querySelector('.section-header');
-  header.classList.toggle('collapsed', collapsed.has(key));
-  els.bodies[key].style.display = collapsed.has(key) ? 'none' : '';
+  const section = key === 'stashes' ? els.stashes.section : els.sections[key];
+  const body = key === 'stashes' ? els.stashes.body : els.bodies[key];
+  section.querySelector('.section-header').classList.toggle('collapsed', collapsed.has(key));
+  body.style.display = collapsed.has(key) ? 'none' : '';
 }
 
 window.addEventListener('message', (event) => {
@@ -323,6 +439,8 @@ window.addEventListener('message', (event) => {
   if (!message || typeof message.type !== 'string') return;
   if (message.type === 'status' && Array.isArray(message.items)) {
     render(message.items);
+  } else if (message.type === 'stashes' && Array.isArray(message.entries)) {
+    renderStashes(message.entries);
   } else if (message.type === 'committed') {
     els.message.value = '';
     autoGrow(); // programmatic clears don't fire the input event

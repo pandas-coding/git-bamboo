@@ -241,6 +241,114 @@
     #empty-state.visible {
       display: block;
     }
+    /* Stashes section (phase 5): entry rows + create form. */
+    .stash-row {
+      display: flex;
+      align-items: center;
+      padding: 3px 12px 3px 28px;
+      height: 22px;
+      box-sizing: border-box;
+    }
+    .stash-row:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .stash-row .stash-message {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .stash-row .stash-time {
+      flex: 0 0 auto;
+      margin-left: 6px;
+      color: var(--vscode-descriptionForeground);
+      font-size: 10px;
+    }
+    .stash-row .actions {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 2px;
+      margin-left: 4px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .stash-row:hover .actions,
+    .stash-row:focus-within .actions {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .stash-empty {
+      padding: 2px 12px 2px 28px;
+      color: var(--vscode-descriptionForeground);
+      font-style: italic;
+      font-size: 11px;
+    }
+    /* Create-stash inline form (revealed by the header + button). */
+    #stash-form {
+      display: none;
+      padding: 4px 12px 4px 28px;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #stash-form.open {
+      display: flex;
+    }
+    #stash-form input[type='text'] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 3px 6px;
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size, 13px);
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 3px;
+      outline: none;
+    }
+    #stash-form input[type='text']:focus {
+      border-color: var(--vscode-focusBorder);
+    }
+    #stash-form .stash-options {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+    }
+    #stash-form label {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      cursor: pointer;
+      user-select: none;
+    }
+    #stash-form .btn,
+    .stash-index-row {
+      align-self: flex-start;
+    }
+    #stash-form .btn {
+      padding: 2px 10px;
+      font-size: 11px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: 1px solid var(--vscode-button-border, transparent);
+      border-radius: 2px;
+      cursor: pointer;
+    }
+    #stash-form .btn:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+    /* --index toggle for pop/apply, one shared control above the rows. */
+    .stash-index-row {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      padding: 2px 12px 2px 28px;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      user-select: none;
+    }
   </style>
 </head>
 <body>
@@ -289,6 +397,36 @@
         </button>
       </div>
       <div class="section-body" id="untracked-body"></div>
+    </div>
+    <!-- Stashes (phase 5): always visible (empty state offers create),
+         entries newest first. -->
+    <div id="stashes-section" class="section">
+      <div class="section-header" data-section="stashes">
+        <span class="arrow"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.25 4.5 6 7.25 8.75 4.5"/></svg></span>
+        <span>Stashes</span>
+        <span class="count" id="stashes-count">0</span>
+        <button id="stash-create-toggle" class="action-btn" title="Create Stash" aria-label="Create Stash">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3.25v9.5M3.25 8h9.5"/></svg>
+        </button>
+      </div>
+      <div class="section-body" id="stashes-body">
+        <!-- Create form (revealed by the header + button) -->
+        <div id="stash-form">
+          <input type="text" id="stash-message" placeholder="Stash message (optional — defaults to WIP on <branch>)" maxlength="500">
+          <div class="stash-options">
+            <label><input type="checkbox" id="stash-untracked"> Include untracked</label>
+            <label><input type="checkbox" id="stash-staged-only"> Staged only</label>
+          </div>
+          <button id="stash-create" class="btn">Create Stash</button>
+        </div>
+        <!-- --index toggle shared by Pop/Apply (default on) -->
+        <div class="stash-index-row" id="stash-index-row">
+          <input type="checkbox" id="stash-index" checked>
+          <span title="Restore the staged/unstaged split when popping or applying (git stash --index)">Pop/Apply restore index</span>
+        </div>
+        <div id="stash-list"></div>
+        <div class="stash-empty" id="stash-empty">No stashes</div>
+      </div>
     </div>
   </div>
   <div id="bottom-bar">

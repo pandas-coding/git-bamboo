@@ -16,7 +16,7 @@ import { createContextTargetSlot } from './contextTargetSlot';
 import { isValidRepoPath, openResource, type CommitBucket } from './headContent';
 import { MergeEditorManager } from './mergeEditor';
 import { sideResolution } from './types';
-import type { ConflictResolution, StatusItem } from './types';
+import type { ConflictResolution, StashEntry, StatusItem } from './types';
 import { errorMessage } from './util';
 import { buildWebviewHtml } from './webviewHtml';
 
@@ -25,6 +25,15 @@ const REFRESH_DEBOUNCE_MS = 50;
 
 /** Valid context-menu buckets (mirror of the webview's BUCKETS). */
 const CONTEXT_BUCKETS = new Set(['conflicts', 'staged', 'changes', 'untracked']);
+
+/** Stash reflog selectors the host accepts (the engine re-validates
+ *  the ref at execution time; this gate keeps malformed webview payloads
+ *  from reaching the RPC at all). */
+const STASH_REF_RE = /^stash@\{\d{1,9}\}$/;
+
+/** Host-side stash message bound — mirrors the engine's limit so an
+ *  over-long message is rejected before the write queue is involved. */
+const MAX_STASH_MESSAGE_LEN = 500;
 
 interface CommitViewMessage {
   type?: string;
@@ -38,6 +47,11 @@ interface CommitViewMessage {
   message?: string;
   amend?: boolean;
   resolution?: string;
+  /** Stash section (phase 5). */
+  include_untracked?: boolean;
+  staged_only?: boolean;
+  ref?: string;
+  reinstate_index?: boolean;
   /** contextTarget payload: the file under the webview's context menu
    *  (null = right-click landed on a non-file row; clears any target). */
   file?: { path?: unknown; status?: unknown; bucket?: unknown } | null;
@@ -156,6 +170,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     switch (message.type) {
       case 'ready':
         void this.doRefresh();
+        void this.refreshStashes();
         break;
       case 'stage':
       case 'unstage':
@@ -193,6 +208,27 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
         } else if (message.file) {
           this.parkContextTarget(message.file);
         }
+        break;
+      case 'stashCreate':
+        void this.stashCreate(
+          typeof message.message === 'string' ? message.message : '',
+          message.include_untracked === true,
+          message.staged_only === true,
+        );
+        break;
+      case 'stashPop':
+      case 'stashApply':
+        void this.stashPop(
+          message.type === 'stashApply',
+          typeof message.ref === 'string' ? message.ref : '',
+          message.reinstate_index !== false,
+        );
+        break;
+      case 'stashDrop':
+        void this.stashDrop(typeof message.ref === 'string' ? message.ref : '');
+        break;
+      case 'stashRefresh':
+        void this.refreshStashes();
         break;
     }
   }
@@ -521,5 +557,140 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     } finally {
       this.committing = false;
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Stashes section (phase 5)
+  //
+  // Webview payloads are untrusted: refs are checked against STASH_REF_RE
+  // and re-verified against a freshly fetched list before any mutating
+  // RPC (stash indices shift as entries are pushed/dropped, so a stale
+  // ref would target the wrong entry). The engine re-validates again.
+  // -------------------------------------------------------------------------
+
+  /** Pushes the current stash list to the webview (called on ready, after
+   *  every stash operation, and on refsChanged — external `git stash`
+   *  commands move refs/stash, which the engine's watcher reports). */
+  async refreshStashes(): Promise<void> {
+    try {
+      const entries = await this.client.stashList();
+      if (this.disposed) return;
+      await this.view?.webview.postMessage({ type: 'stashes', entries });
+    } catch (err) {
+      // Non-fatal: the stash list is secondary to the status list, so a
+      // transient failure shouldn't surface an error toast every push.
+      console.warn(`Git Bamboo: stash list refresh failed — ${errorMessage(err)}`);
+    }
+  }
+
+  /** Stash message gate — the webview cannot be trusted to send sane
+   *  text (control characters, oversized payloads). Empty is legal and
+   *  becomes the engine's default `WIP on <branch>` message. */
+  private normalizeStashMessage(message: string): string | null | undefined {
+    const trimmed = message.trim();
+    if (trimmed.length === 0) return null;
+    if (trimmed.length > MAX_STASH_MESSAGE_LEN) return undefined;
+    if (/\u0000|[\u0001-\u001f\u007f]/.test(trimmed)) return undefined;
+    return trimmed;
+  }
+
+  async stashCreate(message: string, includeUntracked: boolean, stagedOnly: boolean): Promise<void> {
+    const normalized = this.normalizeStashMessage(message);
+    if (normalized === undefined) {
+      vscode.window.showWarningMessage(
+        `Git Bamboo: stash message rejected (max ${MAX_STASH_MESSAGE_LEN} characters, no control characters)`,
+      );
+      return;
+    }
+    try {
+      await this.client.stashPush(normalized, includeUntracked, stagedOnly);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Bamboo: stash create failed — ${errorMessage(err)}`);
+      return; // keep the list as-is on failure
+    }
+    await this.refreshStashes();
+    await this.doRefresh();
+  }
+
+  /** Fetches the live stash list and returns the entry named by `ref`,
+   *  or undefined (no entry, malformed ref, or RPC failure). */
+  private async resolveStashEntry(ref: string): Promise<StashEntry | undefined> {
+    if (!STASH_REF_RE.test(ref)) return undefined;
+    const entries = await this.client.stashList();
+    return entries.find((entry) => entry.ref === ref);
+  }
+
+  async stashPop(apply: boolean, ref: string, reinstateIndex: boolean): Promise<void> {
+    let entry: StashEntry | undefined;
+    try {
+      entry = await this.resolveStashEntry(ref);
+    } catch {
+      // falls through to the not-found path below
+    }
+    if (!entry) {
+      vscode.window.showWarningMessage(
+        'Git Bamboo: stash entry is no longer current — the list has changed, retry from the view',
+      );
+      await this.refreshStashes();
+      return;
+    }
+    try {
+      await this.client.stashPop(entry.ref, apply, reinstateIndex);
+      vscode.window.setStatusBarMessage(
+        `Git Bamboo: stash ${apply ? 'applied' : 'popped'} — ${entry.message} (${entry.ref})`,
+        4_000,
+      );
+    } catch (err) {
+      // Pop-with-conflicts keeps the stash entry by design (git never
+      // drops a stash that didn't apply cleanly); surface that the
+      // conflicts need resolving and offer the section reveal.
+      if (rpcErrorCode(err) === RpcErrorCode.STASH_CONFLICT) {
+        const action = await vscode.window.showWarningMessage(
+          `Git Bamboo: stash applied with conflicts — the stash entry is kept`,
+          'Open Conflict Files',
+        );
+        if (action === 'Open Conflict Files') await this.showConflicts();
+      } else {
+        vscode.window.showErrorMessage(
+          `Git Bamboo: stash ${apply ? 'apply' : 'pop'} failed — ${errorMessage(err)}`,
+        );
+      }
+    }
+    // Either way the worktree/index moved (or conflicts appeared): the
+    // stash list is unchanged only for apply-without-conflict, but a
+    // refresh is cheap and idempotent.
+    await this.refreshStashes();
+    await this.doRefresh();
+  }
+
+  async stashDrop(ref: string): Promise<void> {
+    let entry: StashEntry | undefined;
+    try {
+      entry = await this.resolveStashEntry(ref);
+    } catch {
+      // falls through to the not-found path below
+    }
+    if (!entry) {
+      vscode.window.showWarningMessage(
+        'Git Bamboo: stash entry is no longer current — the list has changed, retry from the view',
+      );
+      await this.refreshStashes();
+      return;
+    }
+    // Destructive and irreversible: the modal names the entry so the
+    // user knows exactly which stash goes away.
+    const confirm = await vscode.window.showWarningMessage(
+      `Drop ${entry.ref}?`,
+      { modal: true, detail: `${entry.message}\n\nThis permanently removes the stash entry.`, },
+      'Drop Stash',
+    );
+    if (confirm !== 'Drop Stash') return;
+    try {
+      await this.client.stashDrop(entry.ref);
+      vscode.window.setStatusBarMessage(`Git Bamboo: dropped ${entry.ref}`, 4_000);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Git Bamboo: stash drop failed — ${errorMessage(err)}`);
+    }
+    await this.refreshStashes();
   }
 }
