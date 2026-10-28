@@ -132,17 +132,29 @@ export async function runPull(ctx: NetOpsContext, strategyOverride?: PullStrateg
     if (!published) return; // cancelled or failed
     return runPull(ctx, strategyOverride); // upstream now exists — pull
   }
-  const strategy = strategyOverride ?? pullStrategySetting();
-  const autoStash = pullAutoStashSetting();
+  await pullCurrentBranch(ctx, status.branch, strategyOverride ?? pullStrategySetting());
+}
+
+/** Pull of a branch whose upstream is known to exist. Returns true when
+ *  the pull completed cleanly; on failure the error surface (conflict
+ *  notification, network error) has already run. Shared by runPull and
+ *  runSync's pull phase — one implementation, no per-surface copies. */
+async function pullCurrentBranch(
+  ctx: NetOpsContext,
+  branch: string,
+  strategy: PullStrategy,
+): Promise<boolean> {
   try {
-    const output = await withNetworkProgress(`Pulling ${status.branch}…`, () =>
-      ctx.client.pull(strategy, autoStash),
+    const output = await withNetworkProgress(`Pulling ${branch}…`, () =>
+      ctx.client.pull(strategy, pullAutoStashSetting()),
     );
     vscode.window.showInformationMessage(
-      `Git Bamboo: pulled ${status.branch}${outputSummary(output)}`,
+      `Git Bamboo: pulled ${branch}${outputSummary(output)}`,
     );
+    return true;
   } catch (err) {
-    showPullError(ctx, err, status.branch);
+    showPullError(ctx, err, branch);
+    return false;
   }
 }
 
@@ -209,6 +221,14 @@ export async function runPush(ctx: NetOpsContext): Promise<void> {
     await publishBranch(ctx, status.branch);
     return;
   }
+  await pushCurrentBranch(ctx, status);
+}
+
+/** Push of a branch that has an upstream (shared by runPush and runSync's
+ *  push phase): up-to-date / behind branches get the appropriate message
+ *  instead of a pointless RPC; otherwise push with rejection recovery. */
+async function pushCurrentBranch(ctx: NetOpsContext, status: BranchStatus): Promise<void> {
+  if (!status.upstream) return; // callers route unpublished branches to publish
   if (status.ahead === 0) {
     if (status.behind > 0) {
       // Nothing to push, but the branch is behind — offer the pull that
@@ -229,6 +249,63 @@ export async function runPush(ctx: NetOpsContext): Promise<void> {
     return;
   }
   await pushWithRecovery(ctx, status.branch, status.upstream);
+}
+
+// ---------------------------------------------------------------------------
+// Graph toolbar entry points (Phase 4)
+// ---------------------------------------------------------------------------
+
+/** One-click fetch of all remotes (graph toolbar ⟳ button). The palette
+ *  entry keeps the per-remote QuickPick — the command palette stays the
+ *  capability superset; the toolbar button always fetches --all. */
+export async function runFetchAll(ctx: NetOpsContext): Promise<void> {
+  try {
+    await withNetworkProgress('Fetching from all remotes…', () => ctx.client.fetch(null));
+    vscode.window.showInformationMessage('Git Bamboo: fetched from all remotes');
+  } catch (err) {
+    showNetworkError(ctx, err, 'fetch');
+  }
+}
+
+/** Publish flow for the current branch (the graph toolbar's `↑✱` badge
+ *  click on an unpublished branch). Already-published branches just get
+ *  told so — the badge should not have been clickable, this is the
+ *  safety net for a stale click. */
+export async function runPublish(ctx: NetOpsContext): Promise<void> {
+  const status = await currentBranchStatus(ctx);
+  if (!status) return;
+  if (status.upstream) {
+    vscode.window.showInformationMessage(
+      `Git Bamboo: ${status.branch} already tracks ${status.upstream}`,
+    );
+    return;
+  }
+  await publishBranch(ctx, status.branch);
+}
+
+/** Sync flow (graph toolbar ⇧ button): pull, then push. Any failure — a
+ *  pull conflict, a dismissed dialog, a rejected push the user chose not
+ *  to recover — stops the chain; nothing is retried automatically. An
+ *  unpublished branch degrades to the publish flow (same fallback the
+ *  pull and push flows use for upstream-less branches). */
+export async function runSync(ctx: NetOpsContext): Promise<void> {
+  const status = await currentBranchStatus(ctx);
+  if (!status) return;
+  if (!status.upstream) {
+    const choice = await vscode.window.showInformationMessage(
+      `Git Bamboo: branch '${status.branch}' has no upstream`,
+      'Publish Branch…',
+    );
+    if (choice === 'Publish Branch…') await publishBranch(ctx, status.branch);
+    return;
+  }
+  // Pull phase: the shared pull path (progress, conflict surfacing).
+  if (!(await pullCurrentBranch(ctx, status.branch, pullStrategySetting()))) return;
+  // Push phase: re-read the status first — the pull just moved refs, so
+  // ahead/behind (and the up-to-date messaging) must reflect the new state.
+  const fresh = await currentBranchStatus(ctx);
+  if (!fresh || !fresh.upstream) return; // unreachable post-pull; engine says otherwise
+  await pushCurrentBranch(ctx, fresh);
 }
 
 /** Explicit force-push entry (`gitBamboo.forcePush` command or the push
