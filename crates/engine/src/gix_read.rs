@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
-    BambooError, BranchStatus, Commit, GraphPage, GraphViewport, Ref, RefKind, RemoteInfo,
-    StashEntry, StatusCode, StatusItem,
+    BambooError, BranchStatus, Commit, DiffHunk, DiffLine, DiffLineKind, GetDiffResult, GraphPage,
+    GraphViewport, Ref, RefKind, RemoteInfo, StashEntry, StatusCode, StatusItem,
 };
 
 use crate::cache::CachedCommit;
@@ -563,6 +563,14 @@ pub fn read_blob(session: &Session, revision: &str, path: &str) -> anyhow::Resul
         return read_conflict_stage_blob(&repo, path, stage);
     }
 
+    // ":0" serves the stage-0 (normal) index entry — the left side of the
+    // worktree diff and the right side of the staged diff (hunk staging,
+    // phase 5). Missing from the index (untracked, or staged as deleted)
+    // resolves to the same empty string as an absent path.
+    if revision == INDEX_REVISION {
+        return read_index_blob(&repo, path);
+    }
+
     let id = repo
         .rev_parse_single(revision.as_bytes())
         .map_err(|e| anyhow::anyhow!("revision {revision:?} not found: {e}"))?;
@@ -616,6 +624,30 @@ fn read_conflict_stage_blob(
         .iter()
         .find(|entry| {
             entry.stage() == stage && entry.path_in(index.path_backing()) == path.as_bytes()
+        })
+    else {
+        return Ok(String::new());
+    };
+    let blob = repo.find_blob(entry.id)?;
+    Ok(String::from_utf8_lossy(&blob.data).into_owned())
+}
+
+/// The stage-0 (normal) index revision, served by `read_blob` from the
+/// index (see the diff/openResource flow in the extension: the left side
+/// of a worktree diff, the right side of a staged diff). Distinct from the
+/// `:1`/`:2`/`:3` conflict stages.
+pub(crate) const INDEX_REVISION: &str = ":0";
+
+/// Blob content of `path`'s stage-0 index entry (lossy UTF-8, like every
+/// read_blob variant). An absent entry resolves to an empty string.
+fn read_index_blob(repo: &gix::Repository, path: &str) -> anyhow::Result<String> {
+    let index = repo.index()?;
+    let Some(entry) = index
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.stage() == gix::index::entry::Stage::Unconflicted
+                && entry.path_in(index.path_backing()) == path.as_bytes()
         })
     else {
         return Ok(String::new());
@@ -1094,4 +1126,245 @@ pub fn read_stash_list(session: &Session) -> anyhow::Result<Vec<StashEntry>> {
     }
     info!(count = entries.len(), "stash list read");
     Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Unified diff parsing / getDiff (hunk-level staging, phase 5)
+// ---------------------------------------------------------------------------
+
+/// A parsed `git diff -U3` output for ONE path: the hunk list with exact
+/// old/new line positions. Byte-level (not `String`) so the write path can
+/// reconstruct index blobs byte-exactly — lossy UTF-8 conversion would
+/// corrupt non-UTF-8 file content on re-hash.
+#[derive(Debug, Default)]
+pub(crate) struct RawFileDiff {
+    pub binary: bool,
+    pub hunks: Vec<RawHunk>,
+}
+
+/// One hunk, as emitted by git. `old_*` describe the old side (index for
+/// the worktree diff, HEAD for the staged diff); `new_*` the new side.
+#[derive(Debug)]
+pub(crate) struct RawHunk {
+    pub old_start: u64,
+    pub old_count: u64,
+    pub new_start: u64,
+    pub new_count: u64,
+    /// Hunk body lines with their origin marker (` ` context, `-` old,
+    /// `+` new); `text` excludes the marker byte.
+    pub lines: Vec<RawDiffLine>,
+    /// `\ No newline at end of file` appeared after the LAST old-side
+    /// line of this hunk (the old side's final line lacks a newline).
+    pub old_no_newline: bool,
+    /// Same, for the new side's last line.
+    pub new_no_newline: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RawDiffLine {
+    pub origin: u8,
+    pub text: Vec<u8>,
+}
+
+impl RawHunk {
+    /// The action interval this hunk occupies on the NEW side, as the
+    /// shared host/engine contract for `stageRanges`/`unstageRanges`:
+    /// 1-based inclusive, with a floor of line 1 and a minimum width of
+    /// one line so empty hunks (whole-file deletions, `+0,0`) still have
+    /// an addressable position. Any client range overlapping this
+    /// interval selects the whole hunk.
+    pub fn new_side_interval(&self) -> (u64, u64) {
+        let start = self.new_start.max(1);
+        (start, start + self.new_count.max(1) - 1)
+    }
+}
+
+/// Common diff flags: reproducible, engine-parseable output regardless of
+/// the user's git config (external diff drivers, textconv, color) or the
+/// diff.renames default — renames are deliberately off so a rename shows
+/// as delete+add and every hunk belongs to exactly one path.
+pub(crate) const DIFF_FLAGS: [&str; 5] = [
+    "-U3",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+];
+
+/// Parse one file's `git diff` output into hunks. Headers
+/// (`diff --git`, `index`, `new file mode`, `---`, `+++`) are skipped;
+/// `@@` starts a hunk; `\` marks the no-newline-at-EOF state of the
+/// preceding line's side. `Binary files … differ` / `GIT binary patch`
+/// mark the whole diff binary (no hunks).
+pub(crate) fn parse_unified_diff(out: &[u8]) -> RawFileDiff {
+    let mut diff = RawFileDiff::default();
+    let mut hunk: Option<RawHunk> = None;
+
+    // Include a final line without trailing newline (git always ends its
+    // output with \n, but stay defensive — the parser must never silently
+    // drop a content line).
+    for line in split_bytes_lines(out) {
+        if line.starts_with(b"@@") {
+            if let Some(done) = hunk.take() {
+                diff.hunks.push(done);
+            }
+            hunk = parse_hunk_header(line);
+        } else if let Some(h) = hunk.as_mut() {
+            if line.first() == Some(&b'\\') {
+                // The marker follows the last line of one side: '+' marks
+                // the new side, '-' the old side, a shared context line
+                // marks both (identical content ⇒ identical newline state).
+                match h.lines.last().map(|l| l.origin) {
+                    Some(b'+') => h.new_no_newline = true,
+                    Some(b'-') => h.old_no_newline = true,
+                    Some(b' ') => {
+                        h.old_no_newline = true;
+                        h.new_no_newline = true;
+                    }
+                    _ => {}
+                }
+            } else if line.is_empty() {
+                // Defensive: a bare empty line inside a hunk body is a
+                // context line of empty content.
+                h.lines.push(RawDiffLine {
+                    origin: b' ',
+                    text: Vec::new(),
+                });
+            } else {
+                let origin = line[0];
+                if origin == b' ' || origin == b'+' || origin == b'-' {
+                    h.lines.push(RawDiffLine {
+                        origin,
+                        text: line[1..].to_vec(),
+                    });
+                } else {
+                    // A header line inside what we thought was a hunk:
+                    // end the hunk (malformed input degrades to fewer
+                    // hunks, never to wrong ones).
+                    if let Some(done) = hunk.take() {
+                        diff.hunks.push(done);
+                    }
+                }
+            }
+        } else if line.starts_with(b"Binary files ") || line.starts_with(b"GIT binary patch") {
+            diff.binary = true;
+        }
+    }
+    if let Some(done) = hunk.take() {
+        diff.hunks.push(done);
+    }
+    diff
+}
+
+/// Split bytes into lines (without terminators), keeping a final line
+/// that lacks a trailing newline.
+fn split_bytes_lines(out: &[u8]) -> Vec<&[u8]> {
+    if out.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&[u8]> = out.split(|b| *b == b'\n').collect();
+    if let Some(last) = lines.last() {
+        if last.is_empty() {
+            lines.pop();
+        }
+    }
+    lines
+}
+
+/// Parse `@@ -a[,b] +c[,d] @@ …` into a hunk skeleton. A missing count
+/// means 1 (unified-diff convention); `-0,0`/`+0,0` mark empty sides.
+fn parse_hunk_header(line: &[u8]) -> Option<RawHunk> {
+    let text = String::from_utf8_lossy(line);
+    // Spec lives between the first '@@' and the next '@@'.
+    let spec = text.split("@@").nth(1)?.trim();
+    let mut parts = spec.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let (old_start, old_count) = parse_range_spec(old)?;
+    let (new_start, new_count) = parse_range_spec(new)?;
+    Some(RawHunk {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        lines: Vec::new(),
+        old_no_newline: false,
+        new_no_newline: false,
+    })
+}
+
+/// `a,b` → (start, count); bare `a` → (a, 1).
+fn parse_range_spec(s: &str) -> Option<(u64, u64)> {
+    match s.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((s.parse().ok()?, 1)),
+    }
+}
+
+/// `getDiff` read RPC: the hunk list of one path. `staged=false` diffs
+/// the worktree against the index, `staged=true` the index against HEAD.
+/// The engine is the only hunk source — the extension renders hunks from
+/// this response and echoes only line RANGES back, which the write path
+/// re-validates against a freshly computed diff (see
+/// `write_queue::stage_ranges`).
+pub fn read_diff(session: &Session, path: &str, staged: bool) -> anyhow::Result<GetDiffResult> {
+    if path.is_empty() || path.starts_with('-') || path.chars().any(|c| c.is_ascii_control()) {
+        anyhow::bail!("invalid path: {path:?}");
+    }
+
+    let mut args: Vec<&str> = vec!["diff"];
+    args.extend(DIFF_FLAGS.iter().copied());
+    if staged {
+        args.push("--cached");
+    }
+    args.push("--");
+    let literal = format!(":(literal){path}");
+    args.push(&literal);
+
+    let (ok, stdout, stderr) = git_output(&session.repo_path, &args)?;
+    if !ok {
+        return Err(BambooError::git_error(format!(
+            "git diff failed for {path:?}: {}",
+            redact_credentials(&stderr).trim()
+        ))
+        .into());
+    }
+
+    let raw = parse_unified_diff(stdout.as_bytes());
+    let hunks: Vec<_> = raw
+        .hunks
+        .iter()
+        .map(|h| DiffHunk {
+            old_start: u32::try_from(h.old_start).unwrap_or(u32::MAX),
+            old_lines: u32::try_from(h.old_count).unwrap_or(u32::MAX),
+            new_start: u32::try_from(h.new_start).unwrap_or(u32::MAX),
+            new_lines: u32::try_from(h.new_count).unwrap_or(u32::MAX),
+            lines: h
+                .lines
+                .iter()
+                .map(|l| DiffLine {
+                    kind: match l.origin {
+                        b'+' => DiffLineKind::Added,
+                        b'-' => DiffLineKind::Removed,
+                        _ => DiffLineKind::Context,
+                    },
+                    // Lossy UTF-8 is display-only here: the write path
+                    // re-runs git diff itself and works on raw bytes.
+                    text: String::from_utf8_lossy(&l.text).into_owned(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    info!(
+        path,
+        staged,
+        hunks = hunks.len(),
+        binary = raw.binary,
+        "diff read"
+    );
+    Ok(GetDiffResult {
+        binary: raw.binary,
+        hunks,
+    })
 }

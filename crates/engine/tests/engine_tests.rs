@@ -2724,3 +2724,423 @@ async fn read_blob_serves_conflict_stages() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// getDiff / stageRanges / unstageRanges (hunk-level staging, phase 5)
+// ---------------------------------------------------------------------------
+
+/// A 12-line file committed to HEAD, then dirtied by the test. Two
+/// separated edits (line 2 and line 12) produce exactly two hunks under
+/// `-U3`, the canonical hunk-staging shape.
+fn hunk_repo() -> anyhow::Result<tempfile::TempDir> {
+    let dir = test_repo()?;
+    let body: String = (1..=12).map(|n| format!("line{n}\n")).collect();
+    std::fs::write(dir.path().join("d.txt"), body)?;
+    gitq(dir.path(), &["add", "--", "d.txt"])?;
+    gitq(dir.path(), &["commit", "-q", "-m", "add d.txt"])?;
+    Ok(dir)
+}
+
+/// Rewrite d.txt with `line2` → `l2-dirty` and `line12` → `l12-dirty`.
+fn dirty_two_hunks(dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut body = String::new();
+    for n in 1..=12 {
+        match n {
+            2 => body.push_str("l2-dirty\n"),
+            12 => body.push_str("l12-dirty\n"),
+            _ => body.push_str(&format!("line{n}\n")),
+        }
+    }
+    std::fs::write(dir.join("d.txt"), body)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_diff_lists_unstaged_and_staged_hunks() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+
+    // Worktree-vs-index: two hunks, correctly positioned.
+    let unstaged = bamboo_engine::gix_read::read_diff(&session, "d.txt", false)?;
+    assert!(!unstaged.binary);
+    assert_eq!(unstaged.hunks.len(), 2);
+    let h1 = &unstaged.hunks[0];
+    let h2 = &unstaged.hunks[1];
+    assert_eq!((h1.old_start, h1.old_lines), (1, 5));
+    assert_eq!((h1.new_start, h1.new_lines), (1, 5));
+    assert_eq!((h2.old_start, h2.old_lines), (9, 4));
+    assert_eq!((h2.new_start, h2.new_lines), (9, 4));
+    // Hunk 1 body: context around the edit — `line1`, `-line2`,
+    // `+l2-dirty`, `line3`..`line5`.
+    let removed: Vec<&str> = h1
+        .lines
+        .iter()
+        .filter(|l| l.kind == bamboo_protocol::DiffLineKind::Removed)
+        .map(|l| l.text.as_str())
+        .collect();
+    let added: Vec<&str> = h1
+        .lines
+        .iter()
+        .filter(|l| l.kind == bamboo_protocol::DiffLineKind::Added)
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(removed, ["line2"]);
+    assert_eq!(added, ["l2-dirty"]);
+    // old/new line counts must equal header counts (the invariant the
+    // blob reconstruction relies on).
+    for h in &unstaged.hunks {
+        let old_side = h
+            .lines
+            .iter()
+            .filter(|l| l.kind != bamboo_protocol::DiffLineKind::Added)
+            .count() as u32;
+        let new_side = h
+            .lines
+            .iter()
+            .filter(|l| l.kind != bamboo_protocol::DiffLineKind::Removed)
+            .count() as u32;
+        assert_eq!(old_side, h.old_lines, "old-side count mismatch");
+        assert_eq!(new_side, h.new_lines, "new-side count mismatch");
+    }
+
+    // Nothing staged yet → staged diff is empty.
+    let staged = bamboo_engine::gix_read::read_diff(&session, "d.txt", true)?;
+    assert!(staged.hunks.is_empty());
+
+    // After git add: staged diff has the two hunks, worktree diff is empty.
+    gitq(dir.path(), &["add", "--", "d.txt"])?;
+    let staged = bamboo_engine::gix_read::read_diff(&session, "d.txt", true)?;
+    assert_eq!(staged.hunks.len(), 2);
+    let unstaged = bamboo_engine::gix_read::read_diff(&session, "d.txt", false)?;
+    assert!(unstaged.hunks.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_diff_flags_binary_files() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    std::fs::write(dir.path().join("d.txt"), [0u8, 159, 146, 150, 0, 1, 2])?;
+
+    let unstaged = bamboo_engine::gix_read::read_diff(&session, "d.txt", false)?;
+    assert!(unstaged.binary);
+    assert!(unstaged.hunks.is_empty());
+    Ok(())
+}
+
+fn stage_cmd(path: &str, ranges: &[(u32, u32)]) -> WriteCommand {
+    WriteCommand::StageRanges {
+        path: path.to_string(),
+        ranges: ranges.iter().map(|(s, e)| (*s, *e)).collect(),
+    }
+}
+
+fn unstage_cmd(path: &str, ranges: &[(u32, u32)]) -> WriteCommand {
+    WriteCommand::UnstageRanges {
+        path: path.to_string(),
+        ranges: ranges.iter().map(|(s, e)| (*s, *e)).collect(),
+    }
+}
+
+#[tokio::test]
+async fn stage_ranges_stages_one_hunk_of_two() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+
+    // Hunk 1 occupies new-side lines [1,5] (edit + context); a range
+    // anywhere inside selects it.
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(2, 2)]))
+        .await?;
+
+    // Worktree untouched; index holds line2 but NOT line12.
+    let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
+    assert!(index.contains("l2-dirty"));
+    assert!(!index.contains("l12-dirty"));
+    let worktree = std::fs::read_to_string(dir.path().join("d.txt"))?;
+    assert!(worktree.contains("l12-dirty"));
+    // Status: staged modification + further unstaged modification.
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains("MM d.txt"), "status: {status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_incremental_does_not_lose_earlier_hunks() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+
+    // Stage hunk 1, then hunk 2 — the second call must EXTEND the index
+    // content, not clobber it (this is why the base is the index blob,
+    // not HEAD).
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(2, 2)]))
+        .await?;
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(12, 12)]))
+        .await?;
+
+    let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
+    assert!(index.contains("l2-dirty"));
+    assert!(index.contains("l12-dirty"));
+    // Everything staged now → clean against the worktree.
+    let unstaged = bamboo_engine::gix_read::read_diff(&session, "d.txt", false)?;
+    assert!(unstaged.hunks.is_empty());
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains("M  d.txt"), "status: {status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_stale_selection_is_invalid_argument() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+
+    // Range 7..8 intersects neither hunk (hunk intervals [1,5] and [9,12]
+    // — wait, hunk 2 covers new lines 9..12; pick a true gap: 7..8).
+    let err = session
+        .enqueue_write(stage_cmd("d.txt", &[(7, 8)]))
+        .await
+        .expect_err("a range hitting no hunk must be rejected");
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    // Nothing was written.
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains(" M d.txt"), "status: {status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_rejects_bad_ranges_and_paths() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+
+    // Empty range list.
+    let err = session
+        .enqueue_write(stage_cmd("d.txt", &[]))
+        .await
+        .expect_err("empty range list must be rejected");
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    // Zero / inverted / out-of-bounds ranges.
+    for ranges in [[(0, 1)], [(5, 2)], [(1, 99_999_999)]] {
+        let err = session
+            .enqueue_write(stage_cmd("d.txt", &ranges))
+            .await
+            .expect_err("malformed range must be rejected");
+        assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    }
+    // Untracked path: no hunks, so selection is empty → stale rejection.
+    std::fs::write(dir.path().join("new.txt"), "n\n")?;
+    let err = session
+        .enqueue_write(stage_cmd("new.txt", &[(1, 1)]))
+        .await
+        .expect_err("untracked path must be rejected");
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_rejects_conflicted_path() -> anyhow::Result<()> {
+    let (work, origin) = test_repo_with_origin()?;
+    let session = open_session(&work).await?;
+
+    // Manufacture a conflict (both sides touch a.txt differently).
+    // Clone BEFORE the local commit so the histories diverge.
+    let clone = tempfile::tempdir()?;
+    gitq(clone.path(), &["clone", "-q", origin.path().to_str().unwrap(), "."])?;
+    std::fs::write(work.path().join("a.txt"), "ours\n")?;
+    gitq(work.path(), &["add", "--", "a.txt"])?;
+    gitq(work.path(), &["commit", "-q", "-m", "ours"])?;
+    std::fs::write(clone.path().join("a.txt"), "theirs\n")?;
+    gitq(clone.path(), &["commit", "-qam", "theirs"])?;
+    gitq(clone.path(), &["push", "-q", "origin", "main"])?;
+    let pull = Command::new("git")
+        .args(["pull", "-q", "--no-rebase", "origin", "main"])
+        .current_dir(work.path())
+        .output()?;
+    assert!(!pull.status.success(), "pull must conflict");
+    let status = gitq(work.path(), &["status", "--porcelain"])?;
+    assert!(status.contains("UU a.txt"), "status: {status}");
+
+    let err = session
+        .enqueue_write(stage_cmd("a.txt", &[(1, 1)]))
+        .await
+        .expect_err("conflicted path must be rejected");
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    assert!(err.message.contains("conflict"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_stages_whole_file_deletion() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    std::fs::remove_file(dir.path().join("d.txt"))?;
+
+    // The deletion hunk's new-side interval is [1,1] (empty new side).
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(1, 1)]))
+        .await?;
+
+    // Index entry removed (not an empty blob!), worktree still absent.
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains("D  d.txt"), "status: {status}");
+    assert!(!dir.path().join("d.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_preserves_missing_trailing_newline() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Rewrite d.txt so it ends WITHOUT a newline, changing the last line.
+    let body: String = (1..=11).map(|n| format!("line{n}\n")).collect::<Vec<_>>().join("")
+        + "l12-dirty";
+    std::fs::write(dir.path().join("d.txt"), body)?;
+
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(12, 12)]))
+        .await?;
+
+    // The index blob must end without a trailing newline, byte-exactly.
+    let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
+    let expected: String = (1..=11).map(|n| format!("line{n}\n")).collect::<Vec<_>>().join("")
+        + "l12-dirty";
+    assert_eq!(index, expected);
+    // And the worktree diff is now empty (fully staged).
+    let unstaged = bamboo_engine::gix_read::read_diff(&session, "d.txt", false)?;
+    assert!(unstaged.hunks.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_preserves_executable_bit() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    gitq(dir.path(), &["update-index", "--chmod=+x", "d.txt"])?;
+    gitq(dir.path(), &["commit", "-q", "-m", "chmod d.txt"])?;
+    dirty_two_hunks(dir.path())?;
+
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(2, 2)]))
+        .await?;
+
+    // The reconstructed index entry keeps mode 100755 (via ls-files).
+    let ls = gitq(dir.path(), &["ls-files", "-s", "--", "d.txt"])?;
+    assert!(ls.starts_with("100755"), "ls-files: {ls}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unstage_ranges_reverts_one_hunk_of_two() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+    gitq(dir.path(), &["add", "--", "d.txt"])?;
+
+    // Unstage hunk 2 (new-side interval [9,12] in the staged diff).
+    session
+        .enqueue_write(unstage_cmd("d.txt", &[(12, 12)]))
+        .await?;
+
+    // Index now matches HEAD for line 12 but keeps line 2's change.
+    let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
+    assert!(index.contains("l2-dirty"));
+    assert!(index.contains("line12"));
+    // The reverted change reappears as an unstaged worktree change.
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains("MM d.txt"), "status: {status}");
+    let unstaged = bamboo_engine::gix_read::read_diff(&session, "d.txt", false)?;
+    assert_eq!(unstaged.hunks.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unstage_ranges_new_file_back_to_untracked() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    std::fs::write(dir.path().join("n.txt"), "new\n")?;
+    gitq(dir.path(), &["add", "--", "n.txt"])?;
+
+    // The whole-file hunk's interval is [1,1].
+    session
+        .enqueue_write(unstage_cmd("n.txt", &[(1, 1)]))
+        .await?;
+
+    // Removed from the index entirely (untracked again, file preserved).
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains("?? n.txt"), "status: {status}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("n.txt"))?,
+        "new\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unstage_ranges_staged_deletion_restores_index_entry() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    gitq(dir.path(), &["rm", "-q", "d.txt"])?;
+
+    // The staged deletion hunk's new-side interval is [1,1].
+    session
+        .enqueue_write(unstage_cmd("d.txt", &[(1, 1)]))
+        .await?;
+
+    // Index restored to HEAD; the worktree stays deleted → unstaged " D".
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains(" D d.txt"), "status: {status}");
+    assert!(
+        !dir.path().join("d.txt").exists(),
+        "unstage must not touch the worktree"
+    );
+    // Mode restored from the HEAD tree, not defaulted.
+    let ls = gitq(dir.path(), &["ls-files", "-s", "--", "d.txt"])?;
+    assert!(ls.starts_with("100644"), "ls-files: {ls}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_then_unstage_round_trip_leaves_index_at_head() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    dirty_two_hunks(dir.path())?;
+
+    // Stage both hunks, then unstage both: index must equal HEAD again
+    // while the worktree keeps both changes.
+    session
+        .enqueue_write(stage_cmd("d.txt", &[(2, 2), (12, 12)]))
+        .await?;
+    let staged = bamboo_engine::gix_read::read_diff(&session, "d.txt", true)?;
+    assert_eq!(staged.hunks.len(), 2);
+    session
+        .enqueue_write(unstage_cmd("d.txt", &[(2, 2), (12, 12)]))
+        .await?;
+
+    let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
+    let head = gitq(dir.path(), &["show", "HEAD:d.txt"])?;
+    assert_eq!(index, head);
+    let status = gitq(dir.path(), &["status", "--porcelain"])?;
+    assert!(status.contains(" M d.txt"), "status: {status}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn stage_ranges_rejects_binary_files() -> anyhow::Result<()> {
+    let dir = hunk_repo()?;
+    let session = open_session(&dir).await?;
+    std::fs::write(dir.path().join("d.txt"), [0u8, 159, 146, 150, 0, 1, 2])?;
+
+    let err = session
+        .enqueue_write(stage_cmd("d.txt", &[(1, 1)]))
+        .await
+        .expect_err("binary file must be rejected");
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    Ok(())
+}

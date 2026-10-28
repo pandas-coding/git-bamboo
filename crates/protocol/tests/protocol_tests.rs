@@ -329,3 +329,48 @@ fn new_error_code_constructors() {
     let e = BambooError::auth_required("could not read Username");
     assert_eq!(e.code, BambooError::AUTH_REQUIRED);
 }
+
+#[test]
+fn diff_types_wire_shapes() {
+    // LineRange is a flat {start, end} object.
+    let range: LineRange = serde_json::from_str(r#"{"start":2,"end":6}"#).unwrap();
+    assert_eq!((range.start, range.end), (2, 6));
+    assert!(serde_json::from_str::<LineRange>(r#"{"start":0,"end":6}"#).is_ok()); // bounds enforced engine-side
+    assert!(serde_json::from_str::<LineRange>("{}").is_err());
+
+    // GetDiff roundtrips with snake_case hunk fields and omitted-when-empty optional flavor.
+    let result = GetDiffResult {
+        binary: false,
+        hunks: vec![DiffHunk {
+            old_start: 1,
+            old_lines: 5,
+            new_start: 1,
+            new_lines: 5,
+            lines: vec![
+                DiffLine { kind: DiffLineKind::Context, text: "line1".into() },
+                DiffLine { kind: DiffLineKind::Removed, text: "line2".into() },
+                DiffLine { kind: DiffLineKind::Added, text: "l2-dirty".into() },
+            ],
+        }],
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("\"old_start\":1"));
+    assert!(json.contains("\"new_lines\":5"));
+    assert!(json.contains("\"context\""));
+    assert!(json.contains("\"removed\""));
+    assert!(json.contains("\"added\""));
+    let back: GetDiffResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, result);
+
+    // stageRanges / unstageRanges roundtrip.
+    let stage: StageRanges = serde_json::from_str(
+        r#"{"path":"src/main.rs","ranges":[{"start":1,"end":5}]}"#,
+    )
+    .unwrap();
+    assert_eq!(stage.path, "src/main.rs");
+    let unstage: UnstageRanges = serde_json::from_str(
+        r#"{"path":"src/main.rs","ranges":[{"start":1,"end":5}]}"#,
+    )
+    .unwrap();
+    assert_eq!(unstage.ranges.len(), 1);
+}

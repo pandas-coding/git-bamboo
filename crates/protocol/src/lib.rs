@@ -179,6 +179,98 @@ pub struct GetBlob {
     pub path: String,
 }
 
+/// `getDiff` request: the hunk list for a single path.
+/// `staged=false` diffs the worktree against the index (the unstaged
+/// changes — identical to worktree-vs-HEAD when nothing is staged);
+/// `staged=true` diffs the index against HEAD (the staged changes). The
+/// worktree-vs-index base (not HEAD) is what makes incremental hunk
+/// staging correct: staging hunk B after hunk A must not clobber A's
+/// already-staged content, so `stageRanges` always applies hunks on top
+/// of the CURRENT index blob, not HEAD (see write_queue::stage_ranges).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetDiff {
+    pub path: String,
+    #[serde(default)]
+    pub staged: bool,
+}
+
+/// One hunk of a unified diff (`git diff -U3`), as served by `getDiff`.
+/// The engine is the single source of hunk data — clients never compute
+/// hunks themselves, so `stageRanges`/`unstageRanges` ranges can always
+/// be cross-checked against a freshly computed diff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffHunk {
+    /// First line (1-based) of the hunk on the old side; 0 when the old
+    /// side is empty (new file) or when the file is fully deleted.
+    pub old_start: u32,
+    /// Line count on the old side.
+    pub old_lines: u32,
+    /// First line (1-based) on the new side; 0 when the new side is
+    /// empty (deleted file).
+    pub new_start: u32,
+    /// Line count on the new side.
+    pub new_lines: u32,
+    /// Hunk body: context, removed (old) and added (new) lines, in diff
+    /// order, WITHOUT the leading origin marker.
+    pub lines: Vec<DiffLine>,
+}
+
+/// One line of a diff hunk body. `kind` mirrors the unified-diff origin
+/// marker; `text` is the line content without the marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+/// `getDiff` result. `binary` files carry no hunks — hunk-level staging
+/// is impossible for them and clients fall back to whole-file staging.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GetDiffResult {
+    pub binary: bool,
+    pub hunks: Vec<DiffHunk>,
+}
+
+/// Inclusive line range on the NEW side of a diff (the side the client
+/// sees on the right of the diff editor). Used by `stageRanges` (new
+/// side = worktree lines) and `unstageRanges` (new side = index lines):
+/// the engine intersects the ranges with a freshly computed diff's hunks
+/// and applies the intersecting hunks — hunk granularity, arbitrary line
+/// granularity is a later phase (the blob-construction approach below
+/// already supports it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// `stageRanges`: stage selected hunks of one path by reconstructing the
+/// index blob ("index + selected hunks"), never `git apply --cached`
+/// (a client-supplied patch can hit "patch does not apply" when its
+/// context has drifted; engine-side blob construction on a fresh diff
+/// cannot).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageRanges {
+    pub path: String,
+    pub ranges: Vec<LineRange>,
+}
+
+/// `unstageRanges`: symmetric — revert selected staged hunks by
+/// reconstructing the index blob as "HEAD + remaining staged hunks".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnstageRanges {
+    pub path: String,
+    pub ranges: Vec<LineRange>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetCommitDetail {
     pub id: String,

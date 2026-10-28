@@ -9,10 +9,11 @@ use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
     BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
-    Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetGraph, GetHeadResult, GetRemotes,
-    GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
-    OutputResult, Pull, Push, RefsChanged, RemoteInfo, ResolveConflict, StashDrop, StashEntry, StashPop, StashPush,
-    Stage, StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, WorktreeChanged,
+    Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetDiff, GetGraph, GetHeadResult,
+    GetRemotes, GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult,
+    ListUndoStack, OutputResult, Pull, Push, RefsChanged, RemoteInfo, ResolveConflict, StashDrop,
+    StashEntry, StashPop, StashPush, Stage, StageRanges, StatusItem, SwitchBranch, Undo,
+    UndoResponse, Unstage, UnstageRanges, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session};
@@ -390,6 +391,43 @@ impl BambooServer {
                 .map_err(|e| BambooError::git_error(e.to_string()))?;
                 to_json_value(&content)
             }
+            "getDiff" => {
+                // Read RPC — never enters the write queue (hunk data for
+                // the diff view's CodeLens actions).
+                let req: GetDiff = parse_params("getDiff", params)?;
+                let result = spawn_blocking_read(session, move |s| {
+                    crate::gix_read::read_diff(s, &req.path, req.staged)
+                })
+                .await
+                .map_err(|e| {
+                    // Preserve structured errors (INVALID_ARGUMENT for
+                    // unstageable/stale paths degrades to git errors like
+                    // getBlob; kept symmetric with the other blob reads).
+                    e.downcast::<BambooError>()
+                        .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
+                })?;
+                to_json_value(&result)
+            }
+            "stageRanges" => {
+                let req: StageRanges = parse_params("stageRanges", params)?;
+                let output = session
+                    .enqueue_write(WriteCommand::StageRanges {
+                        path: req.path,
+                        ranges: line_ranges_tuple(&req.ranges),
+                    })
+                    .await?;
+                to_json_value(&OutputResult { output })
+            }
+            "unstageRanges" => {
+                let req: UnstageRanges = parse_params("unstageRanges", params)?;
+                let output = session
+                    .enqueue_write(WriteCommand::UnstageRanges {
+                        path: req.path,
+                        ranges: line_ranges_tuple(&req.ranges),
+                    })
+                    .await?;
+                to_json_value(&OutputResult { output })
+            }
             "getCommitDetail" => {
                 let req: GetCommitDetail = parse_params("getCommitDetail", params)?;
                 let detail: CommitDetail = spawn_blocking_read(session, move |s| {
@@ -681,6 +719,13 @@ impl BambooServer {
         let params = params.unwrap_or(Value::Null);
         json!({"jsonrpc": "2.0", "method": method, "params": params})
     }
+}
+
+/// Convert wire line ranges to the write queue's `(start, end)` tuples.
+/// Validation (ordering, bounds) happens engine-side at execution time —
+/// the host clamps earlier as a UX nicety, but the engine never trusts it.
+fn line_ranges_tuple(ranges: &[bamboo_protocol::LineRange]) -> Vec<(u32, u32)> {
+    ranges.iter().map(|r| (r.start, r.end)).collect()
 }
 
 /// Parse typed request params, mapping serde failures to invalid_argument.

@@ -3,12 +3,14 @@ use std::process::Stdio;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use bamboo_protocol::{BambooError, ConflictKind, ConflictResolution, ForceMode, PullStrategy};
 
+use crate::gix_read::{parse_unified_diff, RawFileDiff, RawHunk, DIFF_FLAGS};
 use crate::session::{EngineEvent, Session};
 use crate::undo::{UndoError, UndoOutcome, UndoSummary, UndoErrorKind};
 
@@ -38,6 +40,26 @@ pub enum WriteCommand {
         resolution: ConflictResolution,
     },
     Commit { message: String, amend: bool },
+    /// Hunk-level staging: apply the hunks of `path` that intersect the
+    /// given NEW-side (worktree) line ranges onto the CURRENT index blob
+    /// (`git hash-object -w --stdin` + `git update-index --cacheinfo`),
+    /// never `git apply --cached` — a client patch can hit "patch does
+    /// not apply" once its context drifts, while engine-side blob
+    /// construction on a freshly computed diff cannot. The ranges are
+    /// re-validated against that fresh diff: no intersecting hunk means
+    /// INVALID_ARGUMENT (the diff the user acted on is stale).
+    /// UNDO DECISION: bypasses the undo journal — the undo `Snapshot`
+    /// captures the index as a tree (`index_tree`), but a range-staged
+    /// index is a synthetic blob sequence with no snapshot semantics
+    /// (like Discard, restoring it would need content snapshots the
+    /// journal does not take); it is trivially redoable by re-staging.
+    /// See the StageRanges arm in `run_write_queue`.
+    StageRanges { path: String, ranges: Vec<(u32, u32)> },
+    /// Hunk-level unstaging, symmetric to StageRanges: revert the staged
+    /// hunks of `path` that intersect the given NEW-side (index) line
+    /// ranges by rebuilding the index blob as "HEAD + remaining staged
+    /// hunks". Same freshness re-validation, same UNDO bypass rationale.
+    UnstageRanges { path: String, ranges: Vec<(u32, u32)> },
     CreateBranch { name: String, base: Option<String> },
     DeleteBranch { name: String, force: bool },
     /// UNDO DECISION: journaled (moves HEAD + refs; snapshot-recoverable).
@@ -103,6 +125,12 @@ impl WriteCommand {
                 } else {
                     "Commit".to_string()
                 }
+            }
+            WriteCommand::StageRanges { ranges, .. } => {
+                format!("StageRanges({} range(s))", ranges.len())
+            }
+            WriteCommand::UnstageRanges { ranges, .. } => {
+                format!("UnstageRanges({} range(s))", ranges.len())
             }
             WriteCommand::CreateBranch { .. } => "CreateBranch".to_string(),
             WriteCommand::DeleteBranch { force, .. } => {
@@ -341,6 +369,44 @@ pub async fn run_write_queue(
                     Err(e) => (WriteResult::Err(BambooError::git_error(e.to_string())), 0),
                 }
             }
+            // StageRanges/UnstageRanges bypass the undo journal: the undo
+            // snapshot captures the index as a tree id, but range staging
+            // produces synthetic index blobs whose intermediate states no
+            // snapshot can represent — an "undo" could only restore the
+            // pre-stage index tree, which the whole-file Unstage command
+            // already covers, and staging is trivially redoable. The ranges
+            // are re-validated against a fresh diff at execution time, so a
+            // stale client snapshot can never drive a wrong blob. Like
+            // Discard it still runs serialized on this queue, bumps the
+            // epoch on success, and is audit-logged — only the undo tx
+            // begin/commit is skipped. Structured errors (INVALID_ARGUMENT
+            // for stale ranges) reach the RPC surface intact.
+            WriteCommand::StageRanges { path, ranges } => {
+                let result = stage_ranges(&session, path, ranges).await;
+                match result {
+                    Ok(output) => (WriteResult::Ok(output), 0),
+                    Err(e) => {
+                        let mapped = match e.downcast::<BambooError>() {
+                            Ok(structured) => structured,
+                            Err(e) => BambooError::git_error(e.to_string()),
+                        };
+                        (WriteResult::Err(mapped), 0)
+                    }
+                }
+            }
+            WriteCommand::UnstageRanges { path, ranges } => {
+                let result = unstage_ranges(&session, path, ranges).await;
+                match result {
+                    Ok(output) => (WriteResult::Ok(output), 0),
+                    Err(e) => {
+                        let mapped = match e.downcast::<BambooError>() {
+                            Ok(structured) => structured,
+                            Err(e) => BambooError::git_error(e.to_string()),
+                        };
+                        (WriteResult::Err(mapped), 0)
+                    }
+                }
+            }
             _ => run_write(&session, &cmd).await,
         };
 
@@ -462,6 +528,9 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         }
         WriteCommand::ResolveConflict { .. } => {
             unreachable!("resolveConflict is routed in run_write_queue")
+        }
+        WriteCommand::StageRanges { .. } | WriteCommand::UnstageRanges { .. } => {
+            unreachable!("stageRanges/unstageRanges are routed in run_write_queue")
         }
         WriteCommand::SwitchBranch { name, auto_stash } => {
             return switch_branch(session, name, *auto_stash).await;
@@ -913,6 +982,456 @@ async fn run_pull(
         },
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Hunk-level staging (stageRanges/unstageRanges, phase 5)
+// ---------------------------------------------------------------------------
+
+/// Upper bound for line-range endpoints (a diff of a real text file never
+/// exceeds this; the bound keeps absurd numbers out of the hunk math).
+const MAX_LINE_RANGE: u32 = 10_000_000;
+
+/// Upper bound for the number of ranges per request (one CodeLens click
+/// sends exactly one; anything larger is a malformed client).
+const MAX_RANGE_COUNT: usize = 64;
+
+/// Engine-side range validation — the host clamps as a UX nicety, but the
+/// engine never trusts it: 1-based, ordered, bounded.
+fn validate_line_ranges(ranges: &[(u32, u32)]) -> Result<(), BambooError> {
+    if ranges.is_empty() || ranges.len() > MAX_RANGE_COUNT {
+        return Err(BambooError::invalid_argument(format!(
+            "stageRanges/unstageRanges: 1..{MAX_RANGE_COUNT} ranges required"
+        )));
+    }
+    for (start, end) in ranges {
+        if *start < 1 || start > end || *end > MAX_LINE_RANGE {
+            return Err(BambooError::invalid_argument(format!(
+                "invalid line range {start}..{end} (1-based, start <= end, \u{2264} {MAX_LINE_RANGE})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Hunk selection: a hunk is selected when any requested range overlaps
+/// the hunk's new-side interval (see `RawHunk::new_side_interval` for the
+/// shared host/engine formula). Whole-hunk granularity — partial overlap
+/// stages the whole hunk; per-line granularity is a later phase that will
+/// reuse this exact intersection.
+fn select_hunks<'a>(hunks: &'a [RawHunk], ranges: &[(u32, u32)]) -> Vec<&'a RawHunk> {
+    hunks
+        .iter()
+        .filter(|h| {
+            let (hunk_start, hunk_end) = h.new_side_interval();
+            ranges
+                .iter()
+                .any(|(rs, re)| (*rs as u64) <= hunk_end && (*re as u64) >= hunk_start)
+        })
+        .collect()
+}
+
+/// Reject unmerged paths before any hunk math: `git diff` renders them as
+/// combined diffs (`@@@`, conflict markers) that the unified parser must
+/// never be asked to apply.
+async fn assert_path_not_conflicted(session: &Session, path: &str) -> Result<(), BambooError> {
+    let out = run_git_checked(
+        &session.repo_path,
+        &["status", "--porcelain", "-z"],
+        &[path.to_string()],
+    )
+    .await
+    .map_err(|e| BambooError::git_error(e.to_string()))?;
+    if parse_porcelain_z(&out)
+        .iter()
+        .any(|(xy, _)| porcelain_conflict_kind(xy).is_some())
+    {
+        return Err(BambooError::invalid_argument(format!(
+            "cannot stage ranges for {path:?}: the file has merge conflicts \u{2014} resolve them first"
+        )));
+    }
+    Ok(())
+}
+
+/// The diff for one path, freshly computed by the engine at execution
+/// time (the freshness basis: ranges the client derived from an older
+/// diff are re-checked against THIS output before anything is written).
+async fn current_path_diff(
+    session: &Session,
+    path: &str,
+    staged: bool,
+) -> anyhow::Result<RawFileDiff> {
+    let mut argv: Vec<String> = vec!["diff".to_string()];
+    argv.extend(DIFF_FLAGS.iter().map(|f| f.to_string()));
+    if staged {
+        argv.push("--cached".to_string());
+    }
+    argv.push("--".to_string());
+    argv.push(format!(":(literal){path}"));
+    let (ok, stdout, stderr) = run_git_raw_bytes(&session.repo_path, &argv).await?;
+    if !ok {
+        anyhow::bail!(
+            "git diff failed for {path:?}: {}",
+            redact_credentials(&stderr).trim()
+        );
+    }
+    Ok(parse_unified_diff(&stdout))
+}
+
+/// Byte-exact blob content of `rev:path` (`:0` = index, `HEAD` = HEAD).
+/// A path absent from that rev resolves to `None` (an empty base); other
+/// failures stay errors. Bytes, not String: lossy UTF-8 would corrupt
+/// non-UTF-8 content when the reconstructed blob is re-hashed.
+async fn read_blob_bytes(
+    repo_path: &std::path::Path,
+    rev: &str,
+    path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let spec = format!("{rev}:{path}");
+    let argv = ["cat-file".to_string(), "blob".to_string(), spec];
+    let (ok, stdout, stderr) = run_git_raw_bytes(repo_path, &argv).await?;
+    if !ok {
+        // Both messages mean "absent from that revision": a path that is
+        // not in HEAD at all (git's wording differs when it exists on
+        // disk, e.g. a newly added file).
+        if stderr.contains("does not exist")
+            || stderr.contains("exists on disk, but not in")
+        {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "git cat-file failed: {}",
+            redact_credentials(&stderr).trim()
+        );
+    }
+    Ok(Some(stdout))
+}
+
+/// Apply selected hunks onto `base` content, byte-exactly. Hunk old-side
+/// line positions refer to the ORIGINAL base; `offset` carries the line
+/// delta of previously applied hunks so later hunks land correctly.
+/// Trailing-newline state is reconstructed from the `\ No newline at end
+/// of file` markers: the last line of the output keeps its newline iff
+/// the side it came from ended with one.
+fn apply_hunks(base: &[u8], hunks: &[&RawHunk]) -> anyhow::Result<Vec<u8>> {
+    // Header-vs-body sanity check: if the parser ever disagrees with git's
+    // own counts, refuse rather than construct a corrupt index blob.
+    for h in hunks {
+        let old_side = h.lines.iter().filter(|l| l.origin != b'+').count() as u64;
+        let new_side = h.lines.iter().filter(|l| l.origin != b'-').count() as u64;
+        if old_side != h.old_count || new_side != h.new_count {
+            anyhow::bail!(
+                "parsed hunk line counts disagree with the {} header \u{2014} refusing to construct a blob",
+                "diff"
+            );
+        }
+    }
+
+    let (base_lines, base_has_nl) = split_content_lines(base);
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    // Whether the final output line carries a trailing newline; updated
+    // as each potential last-line source emits.
+    let mut trailing_nl = base_has_nl;
+    let mut cursor = 0usize; // next base line still to be copied
+    let mut offset: i64 = 0; // cumulative new-side line delta of applied hunks
+
+    for h in hunks {
+        let old_idx = if h.old_start == 0 {
+            0
+        } else {
+            (h.old_start - 1) as usize
+        };
+        let old_len = h.old_count as usize;
+        // Defensive clamps (well-formed diffs never need them): never go
+        // backwards, never past the base end.
+        let skip = (((old_idx as i64) + offset).max(0) as usize)
+            .max(cursor)
+            .min(base_lines.len());
+        while cursor < skip {
+            out.push(base_lines[cursor].to_vec());
+            trailing_nl = base_has_nl;
+            cursor += 1;
+        }
+        for line in &h.lines {
+            if line.origin != b'-' {
+                out.push(line.text.clone());
+            }
+        }
+        let ends_at_eof = old_idx + old_len >= base_lines.len();
+        if ends_at_eof {
+            // The hunk's new side supplies the file's final line: git emits
+            // the no-newline marker exactly when that line ends without
+            // a newline.
+            trailing_nl = !h.new_no_newline;
+        }
+        offset += h.new_count as i64 - h.old_count as i64;
+        cursor = (old_idx + old_len).max(cursor).min(base_lines.len());
+    }
+
+    while cursor < base_lines.len() {
+        out.push(base_lines[cursor].to_vec());
+        trailing_nl = base_has_nl;
+        cursor += 1;
+    }
+
+    let mut result = Vec::new();
+    for (i, line) in out.iter().enumerate() {
+        if i > 0 {
+            result.push(b'\n');
+        }
+        result.extend_from_slice(line);
+    }
+    if trailing_nl && !out.is_empty() {
+        result.push(b'\n');
+    }
+    Ok(result)
+}
+
+/// Split blob content into lines (no terminators) plus whether the
+/// content ends with a newline. Empty content is zero lines.
+fn split_content_lines(content: &[u8]) -> (Vec<&[u8]>, bool) {
+    if content.is_empty() {
+        return (Vec::new(), true);
+    }
+    let (body, has_nl) = match content.strip_suffix(b"\n") {
+        Some(body) => (body, true),
+        None => (content, false),
+    };
+    (body.split(|b| *b == b'\n').collect(), has_nl)
+}
+
+/// Index-entry mode for `update-index --cacheinfo`: the existing index
+/// entry's mode first (authoritative), then the HEAD tree entry (staged
+/// deletions have no index entry), then the worktree file's exec bit,
+/// else the plain 100644 default.
+async fn resolve_index_mode(
+    repo_path: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<String> {
+    let literal = format!(":(literal){path}");
+    let ls_files = run_git_raw_bytes(
+        repo_path,
+        &[
+            "ls-files".to_string(),
+            "-s".to_string(),
+            "--".to_string(),
+            literal.clone(),
+        ],
+    )
+    .await?;
+    if ls_files.0 {
+        if let Some(mode) = ls_files
+            .1
+            .split(|b| *b == b'\n')
+            .next()
+            .and_then(|l| l.split(|b| *b == b' ').next())
+            .filter(|m| !m.is_empty() && m != b"000000")
+        {
+            return Ok(String::from_utf8_lossy(mode).into_owned());
+        }
+    }
+    let ls_tree = run_git_raw_bytes(
+        repo_path,
+        &[
+            "ls-tree".to_string(),
+            "HEAD".to_string(),
+            "--".to_string(),
+            literal,
+        ],
+    )
+    .await?;
+    if ls_tree.0 {
+        if let Some(mode) = ls_tree
+            .1
+            .split(|b| *b == b'\n')
+            .next()
+            .and_then(|l| l.split(|b| *b == b' ').next())
+            .filter(|m| !m.is_empty())
+        {
+            return Ok(String::from_utf8_lossy(mode).into_owned());
+        }
+    }
+    let executable = repo_path
+        .join(path)
+        .metadata()
+        .map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o111 != 0
+        })
+        .unwrap_or(false);
+    Ok(if executable { "100755" } else { "100644" }.to_string())
+}
+
+/// `git hash-object -w --stdin --path <path>`: write the constructed
+/// content as a blob and return its object id. `--path` makes git apply
+/// the path's checkin filters, matching how the diff content was
+/// produced (VS Code's staging does the same).
+async fn hash_object(
+    repo_path: &std::path::Path,
+    path: &str,
+    content: &[u8],
+) -> anyhow::Result<String> {
+    let mut cmd = base_git_command(repo_path);
+    // base_git_command closes stdin; this one command needs it.
+    cmd.stdin(Stdio::piped());
+    cmd.args(["hash-object", "-w", "--stdin", "--path", path]);
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(content).await?;
+        // Dropping the handle closes the pipe → EOF → git hashes and exits.
+    }
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git hash-object failed: {}",
+            redact_credentials(&String::from_utf8_lossy(&out.stderr)).trim()
+        );
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.len() != 40 && sha.len() != 64 {
+        anyhow::bail!("unexpected git hash-object output: {sha:?}");
+    }
+    Ok(sha)
+}
+
+/// Point the index entry of `path` at a freshly written blob (the
+/// VS Code approach: `hash-object -w` + `update-index --add --cacheinfo`),
+/// or remove the entry when `remove` is set (staging a whole-file
+/// deletion / unstaging everything of a newly added file).
+async fn write_index_blob(
+    session: &Session,
+    path: &str,
+    content: &[u8],
+    remove: bool,
+) -> anyhow::Result<()> {
+    let argv: Vec<String> = if remove {
+        vec![
+            "update-index".to_string(),
+            "--force-remove".to_string(),
+            "--".to_string(),
+            path.to_string(),
+        ]
+    } else {
+        let mode = resolve_index_mode(&session.repo_path, path).await?;
+        let sha = hash_object(&session.repo_path, path, content).await?;
+        vec![
+            "update-index".to_string(),
+            "--add".to_string(),
+            "--cacheinfo".to_string(),
+            format!("{mode},{sha},{path}"),
+        ]
+    };
+    let (ok, _, stderr) = run_git_raw(&session.repo_path, &argv).await?;
+    if !ok {
+        anyhow::bail!(
+            "git update-index failed: {}",
+            redact_credentials(&stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// `git diff` stdout as raw bytes (run_git_raw's lossy String would
+/// corrupt non-UTF-8 content lines during blob reconstruction).
+async fn run_git_raw_bytes(
+    repo_path: &std::path::Path,
+    argv: &[String],
+) -> anyhow::Result<(bool, Vec<u8>, String)> {
+    let result = base_git_command(repo_path).args(argv).output().await?;
+    Ok((
+        result.status.success(),
+        result.stdout,
+        String::from_utf8_lossy(&result.stderr).into_owned(),
+    ))
+}
+
+/// `stageRanges`: apply the intersecting worktree hunks of `path` onto
+/// the CURRENT index blob. Basing the reconstruction on the index (not
+/// HEAD) is what makes incremental staging correct: staging hunk B
+/// after hunk A must extend A's staged content, not clobber it — when
+/// nothing is staged the index equals HEAD, so this also IS "HEAD +
+/// selected hunks" in the single-change case.
+async fn stage_ranges(
+    session: &Session,
+    path: &str,
+    ranges: &[(u32, u32)],
+) -> anyhow::Result<String> {
+    validate_path_arg(path)?;
+    validate_line_ranges(ranges)?;
+    assert_path_not_conflicted(session, path).await?;
+
+    let diff = current_path_diff(session, path, false).await?;
+    if diff.binary {
+        return Err(BambooError::invalid_argument(format!(
+            "{path:?} is a binary file \u{2014} hunk-level staging is not possible"
+        ))
+        .into());
+    }
+    let selected = select_hunks(&diff.hunks, ranges);
+    if selected.is_empty() {
+        return Err(BambooError::invalid_argument(format!(
+            "no unstaged hunk of {path:?} intersects lines \u{2014} the diff may be stale; refresh and retry"
+        ))
+        .into());
+    }
+
+    let base = read_blob_bytes(&session.repo_path, ":0", path)
+        .await?
+        .unwrap_or_default();
+    let content = apply_hunks(&base, &selected)?;
+
+    // Staging the whole-file deletion of a worktree-deleted file removes
+    // the index entry (an empty blob would stage an empty FILE instead).
+    let worktree_exists = session.repo_path.join(path).is_file();
+    let remove = !worktree_exists && content.is_empty();
+    write_index_blob(session, path, &content, remove).await?;
+
+    Ok(format!("staged {} hunk(s) of {path:?}", selected.len()))
+}
+
+/// `unstageRanges`: revert the intersecting staged hunks of `path` by
+/// rebuilding the index blob as "HEAD + the staged hunks that were NOT
+/// selected" — symmetric to stage_ranges' construction.
+async fn unstage_ranges(
+    session: &Session,
+    path: &str,
+    ranges: &[(u32, u32)],
+) -> anyhow::Result<String> {
+    validate_path_arg(path)?;
+    validate_line_ranges(ranges)?;
+    assert_path_not_conflicted(session, path).await?;
+
+    let diff = current_path_diff(session, path, true).await?;
+    if diff.binary {
+        return Err(BambooError::invalid_argument(format!(
+            "{path:?} is a binary file \u{2014} hunk-level unstaging is not possible"
+        ))
+        .into());
+    }
+    let selected = select_hunks(&diff.hunks, ranges);
+    if selected.is_empty() {
+        return Err(BambooError::invalid_argument(format!(
+            "no staged hunk of {path:?} intersects lines \u{2014} the diff may be stale; refresh and retry"
+        ))
+        .into());
+    }
+
+    let head_blob = read_blob_bytes(&session.repo_path, "HEAD", path).await?;
+    let base = head_blob.clone().unwrap_or_default();
+    let kept: Vec<&RawHunk> = diff
+        .hunks
+        .iter()
+        .filter(|h| !selected.iter().any(|s| std::ptr::eq(*s, *h)))
+        .collect();
+    let content = apply_hunks(&base, &kept)?;
+
+    // Unstaging everything of a newly added (HEAD-absent) file removes it
+    // from the index; everything else re-points the entry at the
+    // reconstructed blob.
+    let remove = content.is_empty() && head_blob.is_none();
+    write_index_blob(session, path, &content, remove).await?;
+
+    Ok(format!("unstaged {} hunk(s) of {path:?}", selected.len()))
 }
 
 // ---------------------------------------------------------------------------
