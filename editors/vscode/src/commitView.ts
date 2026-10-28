@@ -13,7 +13,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
 import { createContextTargetSlot } from './contextTargetSlot';
-import { isValidRepoPath, openResource } from './headContent';
+import { isValidRepoPath, openResource, type CommitBucket } from './headContent';
 import { MergeEditorManager } from './mergeEditor';
 import { sideResolution } from './types';
 import type { ConflictResolution, StatusItem } from './types';
@@ -31,6 +31,10 @@ interface CommitViewMessage {
   paths?: string[];
   path?: string;
   status?: string;
+  /** Commit-view bucket of the row that requested the open (staged →
+   *  index-vs-HEAD diff, changes → worktree-vs-index diff, which hunk
+   *  staging's CodeLens actions target). Optional for legacy rows. */
+  bucket?: string;
   message?: string;
   amend?: boolean;
   resolution?: string;
@@ -55,6 +59,13 @@ function bucketOf(item: StatusItem): 'conflicts' | 'staged' | 'changes' | 'untra
   if (item.staged) return 'staged';
   if (item.status === 'untracked') return 'untracked';
   return 'changes';
+}
+
+/** Parse a webview-supplied bucket label — webview data is a trust
+ *  boundary, so unknown values degrade to the legacy (bucket-less)
+ *  openResource behavior instead of being forwarded. */
+function parseBucket(value: unknown): CommitBucket | undefined {
+  return typeof value === 'string' && CONTEXT_BUCKETS.has(value) ? (value as CommitBucket) : undefined;
 }
 
 export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -152,7 +163,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
         break;
       case 'openResource':
         if (typeof message.path === 'string') {
-          void this.openResource(message.path, message.status ?? '');
+          void this.openResource(message.path, message.status ?? '', parseBucket(message.bucket));
         }
         break;
       case 'resolveConflict':
@@ -306,9 +317,13 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     return confirmed === action;
   }
 
-  private async openResource(relativePath: string, status: string): Promise<void> {
+  private async openResource(
+    relativePath: string,
+    status: string,
+    bucket: CommitBucket | undefined,
+  ): Promise<void> {
     try {
-      await openResource(this.root, relativePath, status);
+      await openResource(this.root, relativePath, status, bucket);
     } catch (err) {
       vscode.window.showErrorMessage(`Git Bamboo: opening ${relativePath} failed — ${errorMessage(err)}`);
     }
@@ -436,7 +451,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
       return false;
     }
     if (action === 'openChanges') {
-      await this.openResource(target.path, target.status);
+      await this.openResource(target.path, target.status, target.bucket);
     } else if (action === 'openMergeEditor') {
       await this.openMergeEditor(target.path);
     } else if (action === 'resolveConflict') {

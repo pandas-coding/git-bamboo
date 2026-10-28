@@ -24,19 +24,47 @@ export const STAGE_BASE = ':1';
 export const STAGE_OURS = ':2';
 export const STAGE_THEIRS = ':3';
 
+/** Stage-0 (normal) index revision, served by the provider via engine
+ *  getBlob ":0": the left side of a worktree diff and the right side of
+ *  a staged diff (hunk staging). An absent index entry resolves to the
+ *  empty diff side, like any missing path. */
+export const INDEX_REVISION = ':0';
+
+/** Which bucket of the Commit view a file row sits in — decides the diff
+ *  sides openResource picks (staged → index vs HEAD, changes → worktree
+ *  vs index). */
+export type CommitBucket = 'conflicts' | 'staged' | 'changes' | 'untracked';
+
 export class HeadContentProvider implements vscode.Disposable {
   private readonly registration: vscode.Disposable;
+  /** Fired for every OPEN index-side (`:0`) document when the engine
+   *  reports an index change: VS Code re-requests content for those URIs,
+   * so open staged diffs reflect hunk staging/unstaging without a reopen
+   * (the worktree side refreshes itself via the file watcher). */
+  private readonly indexChanged = new vscode.EventEmitter<vscode.Uri>();
 
   constructor(private readonly client: EngineClient, private readonly root: vscode.Uri) {
     // Revision content for diffs: "git-bamboo:/abs/path?ref" URIs.
     const contentProvider: vscode.TextDocumentContentProvider = {
       provideTextDocumentContent: (uri) => this.readRevisionContent(uri),
+      onDidChange: this.indexChanged.event,
     };
     this.registration = vscode.workspace.registerTextDocumentContentProvider(ENGINE_SCHEME, contentProvider);
   }
 
   dispose(): void {
+    this.indexChanged.dispose();
     this.registration.dispose();
+  }
+
+  /** Fire change events for the `:0` (index) sides currently open in
+   *  editors — call on the engine's `indexChanged` notification. */
+  notifyIndexChanged(): void {
+    for (const doc of vscode.workspace.textDocuments) {
+      if (doc.uri.scheme === ENGINE_SCHEME && doc.uri.query === INDEX_REVISION) {
+        this.indexChanged.fire(doc.uri);
+      }
+    }
   }
 
   /** Engine `getBlob` RPC: blob content at the revision named by the URI's
@@ -77,9 +105,17 @@ export class HeadContentProvider implements vscode.Disposable {
 function parseRevisionQuery(query: string): string | null {
   if (query === 'HEAD') return 'HEAD';
   if (query === EMPTY_REVISION) return '';
-  // Conflict stages (base/ours/theirs of the unmerged index entries) —
-  // tokens, not rev-parse inputs, same trust posture as 'HEAD'.
-  if (query === STAGE_BASE || query === STAGE_OURS || query === STAGE_THEIRS) return query;
+  // Conflict stages (base/ours/theirs of the unmerged index entries) and
+  // the stage-0 index revision — tokens, not rev-parse inputs, same trust
+  // posture as 'HEAD'.
+  if (
+    query === STAGE_BASE ||
+    query === STAGE_OURS ||
+    query === STAGE_THEIRS ||
+    query === INDEX_REVISION
+  ) {
+    return query;
+  }
   if (COMMIT_ID_RE.test(query)) return query;
   console.error(`[git-bamboo] refusing untrusted revision in URI query: ${query}`);
   return null;
@@ -102,13 +138,46 @@ export function stageUri(root: vscode.Uri, relativePath: string, stage: typeof S
   return commitRevisionUri(root, relativePath, stage);
 }
 
+/** git-bamboo: URI serving the file's stage-0 INDEX entry — the left side
+ *  of a worktree diff, the right side of a staged diff. */
+export function indexUri(root: vscode.Uri, relativePath: string): vscode.Uri {
+  return commitRevisionUri(root, relativePath, INDEX_REVISION);
+}
+
 /**
- * Opens a working-tree change: untracked/added/ignored files have no HEAD
- * revision to diff against, so they open directly; everything else opens
- * the HEAD-vs-working-tree diff.
+ * Opens a working-tree change as a diff. The bucket decides the sides
+ * (VS Code SCM semantics, which hunk staging relies on):
+ *   - `staged`  → index (`:0`) vs HEAD — [Unstage hunk] targets
+ *   - `changes` → worktree vs index (`:0`) — [Stage hunk] targets; the
+ *     worktree-vs-index base (not HEAD) is what makes incremental hunk
+ *     staging correct server-side
+ *   - `conflicts`/`untracked` and untracked/added/ignored statuses keep
+ *     the legacy behavior (HEAD-vs-worktree diff / plain open) — hunk
+ *     staging never applies to them.
+ * When `bucket` is absent (legacy callers), the old status-based behavior
+ * applies (HEAD-vs-worktree), so nothing silently changes for callers
+ * that have not been updated.
  */
-export async function openResource(root: vscode.Uri, relativePath: string, status: string): Promise<void> {
+export async function openResource(
+  root: vscode.Uri,
+  relativePath: string,
+  status: string,
+  bucket?: CommitBucket,
+): Promise<void> {
   const uri = resolveRepoPath(root, relativePath);
+  if (bucket === 'staged') {
+    const left = uri.with({ scheme: ENGINE_SCHEME, query: 'HEAD' });
+    const right = indexUri(root, relativePath);
+    const title = `${path.basename(uri.fsPath)} (Index — HEAD)`;
+    await vscode.commands.executeCommand('vscode.diff', left, right, title);
+    return;
+  }
+  if (bucket === 'changes' && status !== 'untracked' && status !== 'added' && status !== 'ignored') {
+    const left = indexUri(root, relativePath);
+    const title = `${path.basename(uri.fsPath)} (Working Tree — Index)`;
+    await vscode.commands.executeCommand('vscode.diff', left, uri, title);
+    return;
+  }
   if (status === 'untracked' || status === 'added' || status === 'ignored') {
     await vscode.commands.executeCommand('vscode.open', uri);
     return;

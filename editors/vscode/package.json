@@ -120,6 +120,16 @@
         "icon": "$(eye)"
       },
       {
+        "command": "gitBamboo.stageHunk",
+        "title": "Git Bamboo: Stage Hunk",
+        "when": "false"
+      },
+      {
+        "command": "gitBamboo.unstageHunk",
+        "title": "Git Bamboo: Unstage Hunk",
+        "when": "false"
+      },
+      {
         "command": "gitBamboo.commitView.openChanges",
         "title": "Open Changes",
         "category": "Git Bamboo"

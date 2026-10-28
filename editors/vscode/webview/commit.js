@@ -5,7 +5,7 @@
  *
  * Host protocol (see src/commitView.ts):
  *   outbound: { type: 'stage' | 'unstage', paths }
- *             { type: 'openResource', path, status }
+ *             { type: 'openResource', path, status, bucket }
  *             { type: 'openMergeEditor', path }
  *             { type: 'resolveConflict', path, resolution }
  *             { type: 'commit', message, amend }
@@ -189,21 +189,21 @@ function createFileRow(item) {
       vscode.postMessage({ type: 'unstage', paths: [item.path] });
     }));
     actions.appendChild(createButton('openChanges', 'Open Changes', () => {
-      vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
+      vscode.postMessage({ type: 'openResource', path: item.path, status: item.status, bucket });
     }));
   } else {
     actions.appendChild(createButton('stage', 'Stage Changes', () => {
       vscode.postMessage({ type: 'stage', paths: [item.path] });
     }));
     actions.appendChild(createButton('openChanges', item.status === 'untracked' ? 'Open File' : 'Open Changes', () => {
-      vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
+      vscode.postMessage({ type: 'openResource', path: item.path, status: item.status, bucket });
     }));
   }
   row.appendChild(actions);
 
   // Row click opens the diff (or the file itself for untracked/added).
   row.addEventListener('click', () => {
-    vscode.postMessage({ type: 'openResource', path: item.path, status: item.status });
+    vscode.postMessage({ type: 'openResource', path: item.path, status: item.status, bucket });
   });
 
   if (item.old_path !== undefined) {

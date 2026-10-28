@@ -158,6 +158,51 @@ export interface StashEntry {
   date: string;
 }
 
+/** One line of a diff hunk body, as served by the engine's `getDiff` RPC.
+ *  `kind` mirrors the unified-diff origin marker; `text` excludes it. */
+export type DiffLineKind = 'context' | 'added' | 'removed';
+
+export interface DiffLine {
+  kind: DiffLineKind;
+  text: string;
+}
+
+/** One hunk of the engine's `getDiff` RPC. `new_start`/`new_lines` address
+ *  the NEW side — the worktree lines for an unstaged diff, the index lines
+ *  for a staged diff — and are the basis of stageRanges/unstageRanges. */
+export interface DiffHunk {
+  /** First line (1-based) on the old side; 0 when the old side is empty. */
+  old_start: number;
+  old_lines: number;
+  /** First line (1-based) on the new side; 0 when the new side is empty
+   *  (whole-file deletion). */
+  new_start: number;
+  new_lines: number;
+  lines: DiffLine[];
+}
+
+export interface GetDiffResult {
+  /** Binary files carry no hunks — hunk staging is impossible; the UI
+   *  falls back to whole-file staging. */
+  binary: boolean;
+  hunks: DiffHunk[];
+}
+
+/** Inclusive 1-based line range on the new side of a diff, addressed by
+ *  stageRanges (worktree lines) / unstageRanges (index lines). */
+export interface LineRange {
+  start: number;
+  end: number;
+}
+
+/** The hunk's new-side action interval — the shared host/engine contract
+ *  (engine `RawHunk::new_side_interval`): 1-based inclusive with a floor of
+ *  line 1 and a minimum width of one, so empty new sides stay addressable. */
+export function hunkNewInterval(hunk: DiffHunk): LineRange {
+  const start = Math.max(hunk.new_start, 1);
+  return { start, end: start + Math.max(hunk.new_lines, 1) - 1 };
+}
+
 /** Merge strategy for `pull`. `default` adds no flag so the user's
  *  `pull.rebase` / `pull.ff` git config is respected. */
 export type PullStrategy = 'default' | 'merge' | 'rebase' | 'ff-only';

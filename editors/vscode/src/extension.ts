@@ -17,6 +17,7 @@ import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
 import { openCommitDetailPanel } from './commitDetail';
 import { takeGraphContextTarget, type GraphContextCommit } from './graphSession';
 import { HeadContentProvider } from './headContent';
+import { HunkStagingController, STAGE_HUNK_COMMAND, UNSTAGE_HUNK_COMMAND } from './hunkStaging';
 import { trustedSetting, withNetOpGuard } from './netOps';
 import type { InitializeResult, RepoState } from './types';
 import { BRANCH_STATUS_DEBOUNCE_MS, debounce, errorMessage } from './util';
@@ -328,6 +329,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
+  // Hunk-level staging: [Stage Hunk]/[Unstage Hunk] CodeLenses on the
+  // diffs the Commit view opens. Palette-hidden — invoked from lenses only.
+  const hunkStaging = new HunkStagingController(client, folder.uri, () => commitView.refresh());
+  context.subscriptions.push(hunkStaging);
+  registerCommand(context, STAGE_HUNK_COMMAND, (path, range) => hunkStaging.stageHunk(path, range));
+  registerCommand(context, UNSTAGE_HUNK_COMMAND, (path, range) => hunkStaging.unstageHunk(path, range));
+
   // Sidebar commit graph (compact mode) + editor-area graph panel (full
   // width mode) share the same webview bundle via GraphSession.
   const graph = new GraphWebviewProvider(context, client, state);
@@ -443,15 +451,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     commitView.refresh();
     scheduleBranchStatus();
   });
-  onNotification(client, context, 'worktreeChanged', () => commitView.refresh());
+  onNotification(client, context, 'worktreeChanged', () => {
+    commitView.refresh();
+    hunkStaging.refreshLenses();
+  });
   onNotification(client, context, 'indexChanged', (params) => {
     state.epoch = numberField(params, 'epoch', state.epoch);
     commitView.refresh();
+    // Open index-side (`:0`) diff documents re-fetch their content, and
+    // the hunk CodeLenses re-render against the new index state.
+    headContent.notifyIndexChanged();
+    hunkStaging.refreshLenses();
   });
   onNotification(client, context, 'headChanged', () => {
     void refreshHead();
     scheduleBranchStatus();
     commitView.refresh();
+    hunkStaging.refreshLenses();
   });
 
   // Enables commandPalette `when: git-bamboo:active` visibility rules.

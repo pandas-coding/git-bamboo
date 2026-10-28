@@ -12,11 +12,15 @@ import type {
   CommitDetail,
   CommitFile,
   ConflictResolution,
+  DiffHunk,
   ForceMode,
+  GetDiffResult,
   GetHeadResult,
   PullStrategy,
   Ref,
   RemoteInfo,
+  StashEntry,
+  LineRange,
 } from './types';
 
 /** Engine JSON-RPC error codes the client acts on (beyond raw display). */
@@ -198,6 +202,59 @@ export class EngineClient {
       return null; // engine error (e.g. unknown commit): treat as unavailable
     }
     return isValidCommitDetail(result) ? result : null;
+  }
+
+  /** Engine RPC `getDiff`: the hunk list of one path. `staged=false`
+   *  diffs the worktree against the index, `staged=true` the index
+   *  against HEAD — the engine is the only hunk source. */
+  async getDiff(path: string, staged: boolean): Promise<GetDiffResult> {
+    const result = await this.request<unknown>('getDiff', { path, staged }, 15_000);
+    return isValidGetDiffResult(result) ? result : { binary: false, hunks: [] };
+  }
+
+  /** Engine RPC `stageRanges`: stage the hunks of `path` intersecting
+   *  the new-side (worktree) line `ranges`. The engine re-validates the
+   *  ranges against a freshly computed diff (stale selections are
+   *  INVALID_ARGUMENT). */
+  stageRanges(path: string, ranges: LineRange[]): Promise<string> {
+    return this.request<string>('stageRanges', { path, ranges });
+  }
+
+  /** Engine RPC `unstageRanges`: revert the staged hunks of `path`
+   *  intersecting the new-side (index) line `ranges` — symmetric to
+   *  stageRanges. */
+  unstageRanges(path: string, ranges: LineRange[]): Promise<string> {
+    return this.request<string>('unstageRanges', { path, ranges });
+  }
+
+  /** Engine RPC `stashList`: stash entries, newest first. */
+  async stashList(): Promise<StashEntry[]> {
+    const result = await this.request<unknown>('stashList', {}, 5_000);
+    return Array.isArray(result) ? (result as StashEntry[]) : [];
+  }
+
+  /** Engine RPC `stashPush`. */
+  stashPush(message: string | null, includeUntracked: boolean, stagedOnly: boolean): Promise<string> {
+    const params: Record<string, unknown> = {
+      include_untracked: includeUntracked,
+      staged_only: stagedOnly,
+    };
+    if (message !== null) params.message = message;
+    return this.request<string>('stashPush', params);
+  }
+
+  /** Engine RPC `stashPop` (apply=false) / `stashApply` (apply=true).
+   *  `stashRef` null = the latest entry. `reinstateIndex` = `--index`. */
+  stashPop(stashRef: string | null, apply: boolean, reinstateIndex: boolean): Promise<string> {
+    const params: Record<string, unknown> = { apply, reinstate_index: reinstateIndex };
+    if (stashRef !== null) params.stash_ref = stashRef;
+    return this.request<string>('stashPop', params);
+  }
+
+  /** Engine RPC `stashDrop`: permanently remove one entry (host confirms
+   *  first — this is the destructive one). */
+  stashDrop(stashRef: string): Promise<string> {
+    return this.request<string>('stashDrop', { stash_ref: stashRef });
   }
 
   /**
@@ -421,6 +478,25 @@ function isValidCommitFile(value: unknown): value is CommitFile {
     (status === 'A' || status === 'D' || status === 'M' || status === 'R' || status === 'C' || status === 'T') &&
     typeof v.additions === 'number' &&
     typeof v.deletions === 'number'
+  );
+}
+
+/** Validate a `getDiff` response: malformed results degrade to an empty
+ *  diff (the CodeLens provider then shows no hunk actions, never stale
+ *  ones). */
+function isValidGetDiffResult(value: unknown): value is GetDiffResult {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.binary !== 'boolean' || !Array.isArray(v.hunks)) return false;
+  return v.hunks.every(
+    (h): h is DiffHunk =>
+      typeof h === 'object' &&
+      h !== null &&
+      typeof (h as DiffHunk).old_start === 'number' &&
+      typeof (h as DiffHunk).old_lines === 'number' &&
+      typeof (h as DiffHunk).new_start === 'number' &&
+      typeof (h as DiffHunk).new_lines === 'number' &&
+      Array.isArray((h as DiffHunk).lines),
   );
 }
 
