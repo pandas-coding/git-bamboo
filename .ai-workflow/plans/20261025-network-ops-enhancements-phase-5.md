@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强 Phase 5：hunk 级暂存 + stash 管理 UI
 date: 2026-10-26
-status: ready
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 group: network-ops-enhancements
