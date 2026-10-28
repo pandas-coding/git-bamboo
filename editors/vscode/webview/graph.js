@@ -38,6 +38,118 @@
   const splitter = document.getElementById('splitter');
   const ctx = canvas.getContext('2d');
 
+  // ---------------------------------------------------------- network toolbar
+
+  const netButtons = {
+    fetch: document.getElementById('btn-fetch'),
+    pull: document.getElementById('btn-pull'),
+    push: document.getElementById('btn-push'),
+    sync: document.getElementById('btn-sync'),
+  };
+  const aheadBehind = document.getElementById('ahead-behind');
+  /** op -> which button spins while it runs (publish spins push). */
+  const OP_SPIN = { fetch: 'fetch', pull: 'pull', push: 'push', sync: 'sync', publish: 'push' };
+
+  const OP_TITLES = {
+    fetch: 'Fetch from all remotes',
+    pull: 'Pull',
+    push: 'Push',
+    sync: 'Sync (pull, then push)',
+  };
+  const DETACHED_TITLE = 'HEAD is detached — switch to a branch to pull or push';
+
+  /** True while a net op runs (netOpState from the host). */
+  let netOpActive = false;
+  /** Which op is running (for the spinner); null when idle. */
+  let activeOp = null;
+  /** Latest branchStatus from the host (null until first push). */
+  let branchStatus = null;
+
+  /** Derives all toolbar state from netOpActive + branchStatus: busy
+   *  spinner, detached disablement with explanatory tooltips, and the
+   *  badge (counts / ↑✱ publish entry / detached). */
+  function updateToolbar() {
+    for (const btn of Object.values(netButtons)) btn.classList.remove('busy');
+    if (netOpActive && activeOp && netButtons[OP_SPIN[activeOp]]) {
+      netButtons[OP_SPIN[activeOp]].classList.add('busy');
+    }
+
+    const detached = branchStatus && branchStatus.detached;
+    netButtons.fetch.disabled = netOpActive;
+    for (const op of ['pull', 'push', 'sync']) {
+      const btn = netButtons[op];
+      // Branch-bound ops need a branch; fetch works from anywhere.
+      btn.disabled = netOpActive || !branchStatus || detached;
+      btn.title = detached ? DETACHED_TITLE : OP_TITLES[op];
+    }
+
+    if (!branchStatus) {
+      aheadBehind.textContent = '';
+      aheadBehind.disabled = true;
+      aheadBehind.title = '';
+      aheadBehind.setAttribute('aria-label', 'Ahead and behind counts');
+      return;
+    }
+    if (branchStatus.detached) {
+      aheadBehind.textContent = 'detached';
+      aheadBehind.disabled = true;
+      aheadBehind.title = DETACHED_TITLE;
+      aheadBehind.setAttribute('aria-label', 'Detached HEAD');
+    } else if (branchStatus.upstream === null) {
+      aheadBehind.textContent = '\u2191\u2731'; // ↑✱ — unpublished
+      aheadBehind.disabled = netOpActive;
+      aheadBehind.title = netOpActive
+        ? 'A network operation is running'
+        : 'Branch has no upstream — click to publish';
+      aheadBehind.setAttribute('aria-label', 'Publish branch');
+    } else {
+      // textContent, not innerHTML: the upstream name is remote-controlled.
+      aheadBehind.textContent = `\u2191${branchStatus.ahead} \u2193${branchStatus.behind}`;
+      aheadBehind.disabled = true;
+      aheadBehind.title = `ahead ${branchStatus.ahead}, behind ${branchStatus.behind} of ${branchStatus.upstream}`;
+      aheadBehind.setAttribute('aria-label',
+        `Ahead ${branchStatus.ahead}, behind ${branchStatus.behind} of ${branchStatus.upstream}`);
+    }
+  }
+
+  /** Validates a host branchStatus payload; invalid shapes keep the last
+   *  known state (host pushes are trusted in principle, but a malformed
+   *  message must not blank the toolbar mid-session). */
+  function parseBranchStatus(message) {
+    if (
+      typeof message.detached !== 'boolean' ||
+      (typeof message.upstream !== 'string' && message.upstream !== null) ||
+      !Number.isFinite(message.ahead) ||
+      !Number.isFinite(message.behind) ||
+      message.ahead < 0 ||
+      message.behind < 0
+    ) {
+      return null;
+    }
+    return {
+      detached: message.detached,
+      upstream: message.upstream,
+      ahead: Math.floor(message.ahead),
+      behind: Math.floor(message.behind),
+    };
+  }
+
+  for (const [op, btn] of Object.entries(netButtons)) {
+    btn.addEventListener('click', () => {
+      // The host re-checks in-flight state (netOp arriving mid-op is
+      // dropped) — this guard just avoids obviously dead clicks.
+      if (netOpActive || btn.disabled) return;
+      vscode.postMessage({ type: 'netOp', op });
+    });
+  }
+
+  aheadBehind.addEventListener('click', () => {
+    if (aheadBehind.disabled || netOpActive) return;
+    vscode.postMessage({ type: 'netOp', op: 'publish' });
+  });
+
+  updateToolbar();
+
   /** Refs by commit id (branch/tag/remote tips, from getRefs). */
   let branchTips = new Map();
   /** HEAD commit id, for marking the HEAD row (null while unknown). */
@@ -592,6 +704,18 @@
           ? Math.min(GRAPH_MAX_WIDTH, Math.max(GRAPH_MIN_WIDTH, Math.round(message.width)))
           : null;
       applyWidth();
+    } else if (message.type === 'netOpState' && typeof message.active === 'boolean') {
+      // Host echo: the op starts (spinner + row disable) and ends (reset).
+      netOpActive = message.active;
+      activeOp =
+        message.active && typeof message.op === 'string' && Object.hasOwn(OP_SPIN, message.op)
+          ? message.op
+          : null;
+      updateToolbar();
+    } else if (message.type === 'branchStatus') {
+      const parsed = parseBranchStatus(message);
+      if (parsed) branchStatus = parsed;
+      updateToolbar();
     }
   });
 
