@@ -1,8 +1,8 @@
 ---
 title: 交互式 rebase（计划面板）+ JetBrains 式 blame 与历史搜索
 date: 2026-10-25
-updated: 2026-10-29
-status: raw
+updated: 2026-10-30
+status: planning
 tags: [git, ui, vscode-extension]
 ---
 
@@ -54,3 +54,10 @@ git-bamboo 完全没有 rebase、blame 和历史搜索能力——这是与 GitS
 - 姊妹 idea：`.ai-workflow/ideas/20261025-network-ops-enhancements.md`（冲突流基建来源，rebase 冲突复用）
 - 设计文档：`docs/network-ops-interaction-design.md`
 - 对标研究：本 idea 的差距分析基于 2026-10-25 对 GitStudio（github.com/GitStudioHQ/gitstudio / gitstudio.dev）与 JetBrains git 插件的调研。
+
+## Plans
+
+- `.ai-workflow/plans/20261025-rebase-and-history-insights-phase-1.md` — 引擎层 rebase 地基（计划/执行/中途态/undo）
+- `.ai-workflow/plans/20261025-rebase-and-history-insights-phase-2.md` — rebase 计划面板 + graph 集成 + 冲突流共享抽取
+- `.ai-workflow/plans/20261025-rebase-and-history-insights-phase-3.md` — JetBrains 式 blame（getBlame + 标注/悬停/导航）
+- `.ai-workflow/plans/20261025-rebase-and-history-insights-phase-4.md` — graph 搜索过滤（作者/消息/路径）
