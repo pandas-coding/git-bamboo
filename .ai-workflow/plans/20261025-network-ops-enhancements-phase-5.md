@@ -52,13 +52,13 @@ tags: [git, rust, vscode-extension, ui]
 
 ## Acceptance Criteria
 
-- [ ] diff 视图中每个 hunk 有 Stage（或 Unstage）动作；暂存后该 hunk 从工作区 diff 消失、出现在 staged。
-- [ ] 只暂存部分 hunk 后提交，提交内容恰好只含选中 hunk（`git show` 验证）。
-- [ ] diff 过期（暂存后文件又被修改）时区间请求被引擎拒绝而非错误应用。
-- [ ] 提交视图 stash 区：create（含 untracked 选项）→ 列表出现 → pop 恢复改动；apply 保留条目；drop 有确认。
-- [ ] stash pop 冲突 → 冲突栏出现、stash 条目仍在、通知明确"stash retained"。
-- [ ] 每条新增 webview→host 消息有 host 验证；stash 目标消费时新鲜校验。
-- [ ] `cargo test` + tsc 通过。
+- [x] diff 视图中每个 hunk 有 Stage（或 Unstage）动作；暂存后该 hunk 从工作区 diff 消失、出现在 staged。（CodeLens 方案，`hunkStaging.ts`）
+- [x] 只暂存部分 hunk 后提交，提交内容恰好只含选中 hunk（`git show` 验证）。（引擎测试含 `git diff --cached` 内容断言）
+- [x] diff 过期（暂存后文件又被修改）时区间请求被引擎拒绝而非错误应用。（测试：hunk 交叉过期拒绝）
+- [x] 提交视图 stash 区：create（含 untracked 选项）→ 列表出现 → pop 恢复改动；apply 保留条目；drop 有确认。（modal 确认）
+- [x] stash pop 冲突 → 冲突栏出现、stash 条目仍在、通知明确"stash retained"。（-32008 → STASH_CONFLICT 通知）
+- [x] 每条新增 webview→host 消息有 host 验证；stash 目标消费时新鲜校验。（stash@{N} 正则 + 消费时 stashList 新鲜校验）
+- [x] `cargo test` + tsc 通过。（引擎 90 测试通过、tsc 零错误，2026-10-29 回顾时复核）
 
 ## Dependencies
 
@@ -71,3 +71,10 @@ tags: [git, rust, vscode-extension, ui]
 - .ai-workflow/ideas/20261025-network-ops-enhancements.md
 - .ai-workflow/plans/20261025-network-ops-enhancements-phase-1.md
 - .ai-workflow/plans/20261025-network-ops-enhancements-phase-3.md
+
+## Learnings
+
+- .ai-workflow/learnings/20261029-hunk-staging-blob-reconstruction.md
+- .ai-workflow/learnings/20261029-byte-exact-diff-parsing-for-blob-reconstruction.md
+- .ai-workflow/learnings/20261029-codelens-hunk-actions.md
+- .ai-workflow/learnings/20261029-plan-status-hygiene.md

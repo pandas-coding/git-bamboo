@@ -1,7 +1,7 @@
 ---
 title: 网络操作增强：push/pull/fetch 闭环 + 冲突流 + hunk 暂存 + stash
 date: 2026-10-25
-status: planning
+status: done
 tags: [git, ui, vscode-extension]
 ---
 
@@ -50,3 +50,10 @@ git-bamboo 当前的网络操作（push/pull/fetch）要求用户手敲 remote �
   - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-3.md`（最小冲突流）
   - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-4.md`（graph 工具栏 + auto-fetch）
   - `.ai-workflow/plans/20261025-network-ops-enhancements-phase-5.md`（hunk 暂存 + stash UI）
+
+## Learnings（2026-10-29 回顾，phase 5）
+
+- .ai-workflow/learnings/20261029-hunk-staging-blob-reconstruction.md
+- .ai-workflow/learnings/20261029-byte-exact-diff-parsing-for-blob-reconstruction.md
+- .ai-workflow/learnings/20261029-codelens-hunk-actions.md
+- .ai-workflow/learnings/20261029-plan-status-hygiene.md
