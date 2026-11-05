@@ -9,6 +9,7 @@ use bamboo_protocol::{
 };
 
 use crate::cache::CachedCommit;
+use crate::rebase::{rebase_chain, rebase_status_result, read_rebase_state};
 use crate::session::Session;
 use crate::write_queue::{redact_credentials, validate_ref_arg};
 
@@ -1367,4 +1368,115 @@ pub fn read_diff(session: &Session, path: &str, staged: bool) -> anyhow::Result<
         binary: raw.binary,
         hunks,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Interactive rebase reads (getRebasePlan / getRebaseStatus)
+// ---------------------------------------------------------------------------
+
+/// `getRebasePlan`: the commit chain a "rebase onto X" would replay, in
+/// replay order (oldest → newest). Read-only snapshot; the real freshness
+/// gate is startRebase's validation (the todo id set must equal the
+/// recomputed chain exactly at EXECUTION time), so this read intentionally
+/// carries no epoch and tolerates a concurrently moving repository.
+pub fn read_rebase_plan(
+    session: &Session,
+    onto: &str,
+    branch: Option<&str>,
+) -> anyhow::Result<bamboo_protocol::GetRebasePlanResult> {
+    validate_ref_arg(onto)
+        .map_err(|e| BambooError::invalid_argument(format!("getRebasePlan: {e}")))?;
+    let branch = match branch {
+        Some(b) => {
+            validate_ref_arg(b)
+                .map_err(|e| BambooError::invalid_argument(format!("getRebasePlan: {e}")))?;
+            if b == "HEAD" {
+                // `branch: null` is the current-branch form; an explicit
+                // "HEAD" would silently resolve against detached HEAD.
+                return Err(BambooError::invalid_argument(
+                    "getRebasePlan: branch must name a local branch; pass branch: null \
+                     for the current branch",
+                )
+                .into());
+            }
+            Some(b.to_string())
+        }
+        None => None,
+    };
+
+    let git_dir = crate::gitdir::resolve_git_dir(&session.repo_path);
+    let branch_name = match branch {
+        Some(b) => b,
+        None => {
+            let raw = std::fs::read_to_string(git_dir.join("HEAD"))
+                .with_context(|| format!("failed to read {}", git_dir.join("HEAD").display()))?;
+            let raw = raw.trim().to_string();
+            raw.strip_prefix("ref: refs/heads/")
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    BambooError::invalid_argument(
+                        "getRebasePlan: HEAD is detached; there is no current branch",
+                    )
+                })?
+        }
+    };
+
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+    let onto_id = resolve_rev_commit(&repo, onto)
+        .map_err(|e| BambooError::git_error(format!("getRebasePlan: {e}")))?;
+    let branch_id = repo
+        .rev_parse_single(format!("refs/heads/{branch_name}").as_bytes())
+        .map_err(|_| {
+            BambooError::invalid_argument(format!(
+                "getRebasePlan: branch {branch_name:?} not found"
+            ))
+        })?
+        .object()?
+        .peel_to_commit()?
+        .id;
+
+    let Some((base, chain)) = rebase_chain(&repo, onto_id, branch_id)? else {
+        return Err(BambooError::invalid_argument(
+            "getRebasePlan: onto and branch share no common ancestor",
+        )
+        .into());
+    };
+
+    let commits = chain
+        .into_iter()
+        .map(|c| bamboo_protocol::RebasePlanCommit {
+            id: c.id,
+            subject: c.subject,
+            author: c.author,
+            time: c.time,
+        })
+        .collect();
+    Ok(bamboo_protocol::GetRebasePlanResult {
+        onto: onto.to_string(),
+        upstream: base.to_string(),
+        branch: branch_name,
+        commits,
+    })
+}
+
+/// Resolve a revision to a commit id via gix (no subprocess).
+fn resolve_rev_commit(repo: &gix::Repository, rev: &str) -> anyhow::Result<gix::ObjectId> {
+    let obj = repo
+        .rev_parse_single(rev.as_bytes())
+        .map_err(|e| anyhow::anyhow!("rev {rev:?} does not resolve: {e}"))?
+        .object()?;
+    let commit = obj
+        .peel_to_commit()
+        .map_err(|e| anyhow::anyhow!("rev {rev:?} is not a commit: {e}"))?;
+    Ok(commit.id)
+}
+
+/// `getRebaseStatus`: direct mapping of the on-disk rebase state. Read-only
+/// and session-gated like every other read; detects externally-started
+/// rebases too (there is no engine-side in-progress state to compare with).
+pub fn read_rebase_status(
+    session: &Session,
+) -> anyhow::Result<bamboo_protocol::GetRebaseStatusResult> {
+    let state = read_rebase_state(&session.repo_path, &session.git_dir);
+    Ok(rebase_status_result(&state))
 }

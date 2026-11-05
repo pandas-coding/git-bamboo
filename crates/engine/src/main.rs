@@ -10,6 +10,15 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Editor self-invocation modes: `git rebase -i` runs the engine itself
+    // as GIT_SEQUENCE_EDITOR / GIT_EDITOR (the process command line is
+    // `<engine> --internal-<mode>-editor <sidecar> <file-to-edit>`; git
+    // appends the file as the final argument — see rebase.rs). These run
+    // synchronously and exit before anything server-ish starts.
+    if let Some(code) = handle_editor_invocation() {
+        std::process::exit(code);
+    }
+
     tracing::info!("bamboo-engine starting");
 
     // Optionally watch the parent process and exit when it is gone, so a
@@ -36,6 +45,39 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("bamboo-engine stopped");
     Ok(())
+}
+
+/// Handle `--internal-sequence-editor <sidecar>` /
+/// `--internal-message-editor <sidecar>`: git appends the file to edit as
+/// the final argv argument (the value passed to it verbatim). Returns
+/// Some(exit_code) when this process was invoked as an editor, None
+/// otherwise (normal server startup).
+fn handle_editor_invocation() -> Option<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    for (i, arg) in args.iter().enumerate() {
+        let mode = if arg == "--internal-sequence-editor" {
+            bamboo_engine::rebase::run_sequence_editor
+        } else if arg == "--internal-message-editor" {
+            bamboo_engine::rebase::run_message_editor
+        } else {
+            continue;
+        };
+        // Layout: [flag, sidecar, target]. A missing sidecar/target (or a
+        // degenerate "target == sidecar", i.e. no file was appended) is a
+        // malformed invocation: exit non-zero, which makes git cancel the
+        // rebase cleanly.
+        let Some(sidecar) = args.get(i + 1) else {
+            return Some(1);
+        };
+        let Some(target) = args.last() else {
+            return Some(1);
+        };
+        if sidecar == target {
+            return Some(1);
+        }
+        return Some(mode(sidecar, target));
+    }
+    None
 }
 
 /// Parse `--parent-pid <pid>` from argv and start the parent-watch thread.

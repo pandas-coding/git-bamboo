@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 1：引擎层 rebase 地基（计划/执行/中途态/undo）
 date: 2026-10-30
-status: ready
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights

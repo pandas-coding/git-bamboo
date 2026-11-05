@@ -568,6 +568,207 @@ pub struct StashEntry {
     pub date: String,
 }
 
+// ---------------------------------------------------------------------------
+// Interactive rebase (phase 1: engine foundation)
+// ---------------------------------------------------------------------------
+
+/// Action of one interactive-rebase todo entry. The Phase 1 write set is
+/// `pick`/`reword`/`squash`/`drop` — `startRebase` rejects `fixup` and
+/// `edit` (Phase 2). They exist in the enum so `getRebaseStatus` can parse
+/// externally-started rebases whose todo files use them instead of
+/// dropping those lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebaseAction {
+    Pick,
+    Reword,
+    Squash,
+    Fixup,
+    Drop,
+    Edit,
+}
+
+/// One entry of a `startRebase` todo: the commit to replay (`id`, full
+/// object id as served by `getRebasePlan`), the action, and an optional
+/// custom message for reword/squash. Drops are explicit entries — the
+/// engine requires the todo's id set to equal the current
+/// `upstream..branch` commit set exactly, so a stale client snapshot can
+/// never silently drop or add commits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebaseTodoEntry {
+    pub id: String,
+    pub action: RebaseAction,
+    /// Custom message for `reword`/`squash` (invalid on other actions).
+    /// Single-paragraph only: the engine rejects control characters.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `getRebasePlan` request: the commit chain that a "rebase onto X" would
+/// replay. `branch: null` (default) = the current HEAD branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetRebasePlan {
+    pub onto: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// One commit of a rebase plan (the replay candidates for the plan UI).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebasePlanCommit {
+    pub id: String,
+    pub subject: String,
+    pub author: String,
+    pub time: i64,
+}
+
+/// `getRebasePlan` result. `upstream` is `merge-base(onto, branch)` — the
+/// rebase replays exactly `upstream..branch`; `commits` lists them in
+/// replay order (oldest → newest).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetRebasePlanResult {
+    pub onto: String,
+    pub upstream: String,
+    pub branch: String,
+    pub commits: Vec<RebasePlanCommit>,
+}
+
+/// `getRebaseStatus` request (no parameters).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetRebaseStatus {}
+
+/// High-level rebase state. `idle` = no rebase in progress. `stopped` =
+/// a rebase is on disk waiting for the user (conflict or message stop;
+/// includes externally-started rebases). `running` = the rebase-merge/
+/// rebase-apply state dir exists but no stop is recorded (an external
+/// process is actively replaying — best-effort classification).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebaseRunState {
+    #[default]
+    Idle,
+    Stopped,
+    Running,
+}
+
+/// Which on-disk restate backend git is using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebaseBackend {
+    /// `rebase-merge` (the interactive/merge backend).
+    Merge,
+    /// `rebase-apply` (am/legacy backend).
+    Apply,
+}
+
+/// One parsed todo entry of a `getRebaseStatus` read (from the `done` or
+/// the remaining `git-rebase-todo` lines).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebaseStatusEntry {
+    pub action: RebaseAction,
+    pub id: String,
+    pub subject: String,
+}
+
+/// `getRebaseStatus` result: the direct mapping of the on-disk rebase
+/// state (all fields `None`/empty in the idle case). Raw `done` /
+/// `remaining` lines are kept verbatim (they may contain `label`/`exec`/
+/// ... lines the parser passes through rather than drops); the parsed
+/// `*_entries` lists contain only pick-like entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetRebaseStatusResult {
+    pub state: RebaseRunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<RebaseBackend>,
+    /// Short name of the branch being rebased; `None` when detached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The `--onto` commit (sha or ref, as git recorded it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onto: Option<String>,
+    /// The pre-rebase branch tip as git recorded it (informational; the
+    /// engine keeps its own authoritative copy in the undo journal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orig_head: Option<String>,
+    /// The commit the rebase stopped on (REBASE_HEAD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_sha: Option<String>,
+    /// 1-based index of the commit being replayed (`msgnum`), and the
+    /// total number of commits to replay (`end`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msgnum: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<u32>,
+    /// Raw lines of the `done` file (already-replayed todo entries).
+    #[serde(default)]
+    pub done: Vec<String>,
+    /// Raw lines of `git-rebase-todo` (not yet replayed).
+    #[serde(default)]
+    pub remaining: Vec<String>,
+    /// Parsed pick-like entries of `done`.
+    #[serde(default)]
+    pub done_entries: Vec<RebaseStatusEntry>,
+    /// Parsed pick-like entries of `git-rebase-todo`.
+    #[serde(default)]
+    pub remaining_entries: Vec<RebaseStatusEntry>,
+}
+
+/// `startRebase` request: execute an interactive rebase with an
+/// engine-revalidated todo list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartRebase {
+    pub onto: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub todo: Vec<RebaseTodoEntry>,
+}
+
+/// `rebaseContinue` / `rebaseSkip` / `rebaseAbort` request (they operate
+/// on the current in-progress rebase; no parameters).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseContinue {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseSkip {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseAbort {}
+
+/// Why a rebase stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebaseStopReason {
+    /// A merge conflict — resolve the files, then `rebaseContinue`.
+    Conflict,
+    /// Any other stop (message editing etc.).
+    RewordStop,
+}
+
+/// Structured outcome of `startRebase` / `rebaseContinue` /
+/// `rebaseSkip`. A stop is NORMAL semantics, not an error: `stopped: true`
+/// means the rebase is on disk waiting for the user (with `reason`,
+/// `stopped_sha`, `msgnum` and `end` describing the stop); `stopped: false`
+/// with `finished: true` means the rebase ran to completion (or there was
+/// nothing left to continue — the idempotent double-click case). Real
+/// failures (invalid refs, git crashing) surface as GIT_ERROR.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebaseResult {
+    pub stopped: bool,
+    /// The rebase is no longer in progress (completed, aborted, or nothing
+    /// left to continue).
+    #[serde(default)]
+    pub finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RebaseStopReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msgnum: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Undo {
     pub transaction_id: u64,

@@ -34,6 +34,18 @@ pub struct Snapshot {
     /// Undo restores the index from this when present.
     #[serde(default)]
     pub index_tree: Option<String>,
+    /// Rebase transactions only: the authoritative pre-rebase tip of
+    /// [`Snapshot::rebase_branch`], recorded because mid-rebase resets
+    /// overwrite `ORIG_HEAD` (git documents it as unreliable).
+    /// `restore_snapshot` uses it to abort a still-in-progress rebase and
+    /// align the worktree after ref restoration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_rebase_tip: Option<String>,
+    /// Rebase transactions only: the branch that was rebased (None for
+    /// the detached-HEAD case, which startRebase rejects, so in practice
+    /// always Some).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase_branch: Option<String>,
 }
 
 /// A journaled write transaction with pre- and post-write snapshots.
@@ -268,7 +280,73 @@ impl UndoEngine {
             refs,
             stash_ref: stash,
             index_tree,
+            pre_rebase_tip: None,
+            rebase_branch: None,
         })
+    }
+
+    /// Annotate a transaction's pre-snapshot with the authoritative
+    /// pre-rebase state (`pre_rebase_tip` + `rebase_branch`).
+    /// `branch: None` derives both from the snapshot's own HEAD/refs (the
+    /// common case: rebasing the checked-out branch); `branch: Some(b)`
+    /// looks the tip up in the snapshotted refs.
+    pub fn annotate_rebase(&self, id: u64, branch: Option<&str>) -> anyhow::Result<()> {
+        let path = self.pre_path(id);
+        let data = fs::read_to_string(&path)?;
+        let mut file: TransactionFile = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse snapshot {}", path.display()))?;
+
+        let (branch_name, tip) = match branch {
+            Some(b) => {
+                let full = format!("refs/heads/{b}");
+                let tip = snapshot_tip_for(&file.snapshot, &full)?;
+                (Some(b.to_string()), tip)
+            }
+            None => {
+                let branch_name = file
+                    .snapshot
+                    .head
+                    .strip_prefix("ref: refs/heads/")
+                    .map(str::to_string);
+                let tip = match &branch_name {
+                    Some(b) => snapshot_tip_for(&file.snapshot, &format!("refs/heads/{b}"))?,
+                    // Detached HEAD: the HEAD sha itself is the tip.
+                    None => file
+                        .snapshot
+                        .head
+                        .trim()
+                        .to_string(),
+                };
+                (branch_name, tip)
+            }
+        };
+        validate_sha(&tip)?;
+        file.snapshot.pre_rebase_tip = Some(tip);
+        file.snapshot.rebase_branch = branch_name;
+        let data = serde_json::to_vec_pretty(&file)?;
+        write_durable(&path, &data)?;
+        Ok(())
+    }
+
+    /// Rewrite a committed transaction's POST snapshot with the current
+    /// repository state. Used when rebaseContinue/rebaseSkip finish a
+    /// rebase (or rebaseAbort restores it): those advance the
+    /// already-journaled StartRebase transaction instead of journaling a
+    /// new one, and the safety check in [`Self::undo`]` must see the real
+    /// outcome, not the stale stopped-state snapshot. A missing file (the
+    /// tx was already pruned by an undo) is a warn-level no-op.
+    pub fn refresh_post_snapshot(&self, id: u64) -> anyhow::Result<()> {
+        let path = self.post_path(id);
+        if !path.exists() {
+            warn!(transaction_id = id, "post snapshot missing; nothing to refresh");
+            return Ok(());
+        }
+        let data = fs::read_to_string(&path)?;
+        let mut file: TransactionFile = serde_json::from_str(&data)?;
+        file.snapshot = self.read_snapshot()?;
+        let data = serde_json::to_vec_pretty(&file)?;
+        write_durable(&path, &data)?;
+        Ok(())
     }
 
     /// Undo a transaction: restore the repository to its pre-write state.
@@ -356,6 +434,19 @@ impl UndoEngine {
     /// Uses one `git update-ref --stdin` batch (atomic), then restores the
     /// index, then HEAD last.
     fn restore_snapshot(&self, pre: &Snapshot) -> anyhow::Result<usize> {
+        // Rebase transactions need extra care: while a rebase is in
+        // progress HEAD is detached mid-replay and the branch ref may not
+        // have moved back yet, so abort the rebase FIRST (git restores the
+        // pre-rebase branch/worktree state itself — best-effort: a failed
+        // abort is non-fatal, the ref restoration below is still correct,
+        // only the worktree may need manual attention).
+        let is_rebase = pre.pre_rebase_tip.is_some();
+        if is_rebase && rebase_in_progress_on_disk(&self.git_dir) {
+            if let Err(e) = self.run_git(&["rebase", "--abort"]) {
+                warn!(error = %e, "git rebase --abort failed during undo");
+            }
+        }
+
         let current = self.read_snapshot()?;
         let mut restored_refs = 0;
 
@@ -395,6 +486,17 @@ impl UndoEngine {
 
         // HEAD last: its target ref now exists.
         self.restore_head(&pre.head)?;
+
+        if is_rebase {
+            // Align worktree + index with the RESTORED HEAD (which is the
+            // pre-rebase state after the ref/head restoration above — not
+            // a recorded sha, the branch may legitimately have been the
+            // non-checked-out one). The whole point of undoing a rebase is
+            // restoring content, not only refs.
+            if let Err(e) = self.run_git(&["reset", "--hard"]) {
+                warn!(error = %e, "git reset --hard failed during rebase undo");
+            }
+        }
 
         Ok(restored_refs)
     }
@@ -558,6 +660,15 @@ impl UndoEngine {
         }
     }
 
+    /// Whether the journal still contains the given transaction (used to
+    /// release the in-flight rebase binding after an undo that pruned
+    /// its transaction).
+    pub fn has_transaction(&self, id: u64) -> bool {
+        self.read_journal()
+            .map(|txs| txs.iter().any(|t| t.id == id))
+            .unwrap_or(false)
+    }
+
     pub fn list_transactions(&self, limit: u32) -> anyhow::Result<Vec<UndoEntry>> {
         let transactions = self.read_journal()?;
         let mut entries: Vec<UndoEntry> = transactions
@@ -584,6 +695,7 @@ impl UndoEngine {
         let timestamp = Utc::now().timestamp();
         let status = match result {
             WriteResult::Ok(_) => "ok",
+            WriteResult::Rebase(_) => "ok",
             WriteResult::Undo(Ok(_)) => "ok",
             WriteResult::Err(_) | WriteResult::Undo(Err(_)) => "err",
         };
@@ -674,6 +786,21 @@ fn read_loose_refs(dir: &Path, prefix: &str) -> anyhow::Result<HashMap<String, S
         refs.insert(name, target);
     }
     Ok(refs)
+}
+
+/// The tip sha a snapshot recorded for `full_ref`, erroring when the
+/// branch does not exist in it (annotate_rebase helper).
+fn snapshot_tip_for(snapshot: &Snapshot, full_ref: &str) -> anyhow::Result<String> {
+    snapshot
+        .refs
+        .get(full_ref)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("branch {full_ref:?} does not exist in the snapshot"))
+}
+
+/// Whether git left a rebase state directory in the gitdir.
+fn rebase_in_progress_on_disk(git_dir: &Path) -> bool {
+    git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir()
 }
 
 /// Write `data` to `path` durably: create/truncate, write, fsync the file,

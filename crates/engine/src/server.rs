@@ -10,13 +10,14 @@ use tracing::{debug, info, warn};
 use bamboo_protocol::{
     BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
     Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetDiff, GetGraph, GetHeadResult,
-    GetRemotes, GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult,
-    ListUndoStack, OutputResult, Pull, Push, RefsChanged, RemoteInfo, ResolveConflict, StashDrop,
-    StashEntry, StashPop, StashPush, Stage, StageRanges, StatusItem, SwitchBranch, Undo,
-    UndoResponse, Unstage, UnstageRanges, WorktreeChanged,
+    GetRebasePlan, GetRebaseStatus, GetRemotes, GetStatus, GraphPage, HeadChanged, IndexChanged,
+    Initialize, InitializeResult, ListUndoStack, OutputResult, Pull, Push, RefsChanged, RemoteInfo,
+    RebaseAbort, RebaseContinue, RebaseSkip, ResolveConflict, StashDrop, StashEntry, StashPop,
+    StashPush, Stage, StageRanges, StartRebase, StatusItem, SwitchBranch, Undo, UndoResponse,
+    Unstage, UnstageRanges, WorktreeChanged,
 };
 
-use crate::session::{EngineEvent, Session};
+use crate::session::{EngineEvent, Session, WriteOutcome};
 use crate::write_queue::WriteCommand;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -410,23 +411,25 @@ impl BambooServer {
             }
             "stageRanges" => {
                 let req: StageRanges = parse_params("stageRanges", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::StageRanges {
-                        path: req.path,
-                        ranges: line_ranges_tuple(&req.ranges),
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::StageRanges {
+                            path: req.path,
+                            ranges: line_ranges_tuple(&req.ranges),
+                        })
+                        .await?,
+                )
             }
             "unstageRanges" => {
                 let req: UnstageRanges = parse_params("unstageRanges", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::UnstageRanges {
-                        path: req.path,
-                        ranges: line_ranges_tuple(&req.ranges),
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::UnstageRanges {
+                            path: req.path,
+                            ranges: line_ranges_tuple(&req.ranges),
+                        })
+                        .await?,
+                )
             }
             "getCommitDetail" => {
                 let req: GetCommitDetail = parse_params("getCommitDetail", params)?;
@@ -491,13 +494,14 @@ impl BambooServer {
             }
             "resolveConflict" => {
                 let req: ResolveConflict = parse_params("resolveConflict", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::ResolveConflict {
-                        path: req.path,
-                        resolution: req.resolution,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::ResolveConflict {
+                            path: req.path,
+                            resolution: req.resolution,
+                        })
+                        .await?,
+                )
             }
             "commit" => {
                 let req: CommitMsg = parse_params("commit", params)?;
@@ -531,75 +535,133 @@ impl BambooServer {
             }
             "switchBranch" => {
                 let req: SwitchBranch = parse_params("switchBranch", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::SwitchBranch {
-                        name: req.name,
-                        auto_stash: req.auto_stash,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::SwitchBranch {
+                            name: req.name,
+                            auto_stash: req.auto_stash,
+                        })
+                        .await?,
+                )
             }
             "fetch" => {
                 let req: Fetch = parse_params("fetch", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::Fetch { remote: req.remote })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::Fetch { remote: req.remote })
+                        .await?,
+                )
             }
             "pull" => {
                 let req: Pull = parse_params("pull", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::Pull {
-                        remote: req.remote,
-                        branch: req.branch,
-                        strategy: req.strategy,
-                        auto_stash: req.auto_stash,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::Pull {
+                            remote: req.remote,
+                            branch: req.branch,
+                            strategy: req.strategy,
+                            auto_stash: req.auto_stash,
+                        })
+                        .await?,
+                )
             }
             "push" => {
                 let req: Push = parse_params("push", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::Push {
-                        remote: req.remote,
-                        branch: req.branch,
-                        force: req.force,
-                        set_upstream: req.set_upstream,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::Push {
+                            remote: req.remote,
+                            branch: req.branch,
+                            force: req.force,
+                            set_upstream: req.set_upstream,
+                        })
+                        .await?,
+                )
             }
             "stashPush" => {
                 let req: StashPush = parse_params("stashPush", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::StashPush {
-                        message: req.message,
-                        include_untracked: req.include_untracked,
-                        staged_only: req.staged_only,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::StashPush {
+                            message: req.message,
+                            include_untracked: req.include_untracked,
+                            staged_only: req.staged_only,
+                        })
+                        .await?,
+                )
             }
             "stashPop" => {
                 let req: StashPop = parse_params("stashPop", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::StashPop {
-                        stash_ref: req.stash_ref,
-                        apply: req.apply,
-                        reinstate_index: req.reinstate_index,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::StashPop {
+                            stash_ref: req.stash_ref,
+                            apply: req.apply,
+                            reinstate_index: req.reinstate_index,
+                        })
+                        .await?,
+                )
             }
             "stashDrop" => {
                 let req: StashDrop = parse_params("stashDrop", params)?;
-                let output = session
-                    .enqueue_write(WriteCommand::StashDrop {
-                        stash_ref: req.stash_ref,
-                    })
-                    .await?;
-                to_json_value(&OutputResult { output })
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::StashDrop {
+                            stash_ref: req.stash_ref,
+                        })
+                        .await?,
+                )
+            }
+            "getRebasePlan" => {
+                let req: GetRebasePlan = parse_params("getRebasePlan", params)?;
+                let plan = spawn_blocking_read(session, move |s| {
+                    crate::gix_read::read_rebase_plan(s, &req.onto, req.branch.as_deref())
+                })
+                .await
+                .map_err(|e| {
+                    // Preserve structured errors (INVALID_ARGUMENT for
+                    // malformed/detached cases).
+                    e.downcast::<BambooError>()
+                        .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
+                })?;
+                to_json_value(&plan)
+            }
+            "getRebaseStatus" => {
+                // Params are parsed (and validated) for symmetry with
+                // every other method, even though this one takes none.
+                let _: GetRebaseStatus = parse_params("getRebaseStatus", params)?;
+                // Read RPC — never enters the write queue. Session-gated
+                // like every other read.
+                let status = spawn_blocking_read(session, crate::gix_read::read_rebase_status)
+                    .await
+                    .map_err(|e| BambooError::git_error(e.to_string()))?;
+                to_json_value(&status)
+            }
+            "startRebase" => {
+                let req: StartRebase = parse_params("startRebase", params)?;
+                write_outcome_json(
+                    session
+                        .enqueue_write(WriteCommand::StartRebase {
+                            onto: req.onto,
+                            branch: req.branch,
+                            todo: req.todo,
+                        })
+                        .await?,
+                )
+            }
+            "rebaseContinue" => {
+                let _: RebaseContinue = parse_params("rebaseContinue", params)?;
+                write_outcome_json(
+                    session.enqueue_write(WriteCommand::RebaseContinue).await?,
+                )
+            }
+            "rebaseSkip" => {
+                let _: RebaseSkip = parse_params("rebaseSkip", params)?;
+                write_outcome_json(session.enqueue_write(WriteCommand::RebaseSkip).await?)
+            }
+            "rebaseAbort" => {
+                let _: RebaseAbort = parse_params("rebaseAbort", params)?;
+                write_outcome_json(session.enqueue_write(WriteCommand::RebaseAbort).await?)
             }
             "getRemotes" => {
                 // Params are parsed (and validated) for symmetry with
@@ -742,6 +804,16 @@ fn parse_params<T: serde::de::DeserializeOwned>(
 fn to_json_value<T: serde::Serialize>(value: &T) -> Result<Value, BambooError> {
     serde_json::to_value(value)
         .map_err(|e| BambooError::git_error(format!("response serialization failed: {e}")))
+}
+
+/// Serialize a write-queue outcome: plain commands keep the
+/// `OutputResult` envelope, rebase commands return the typed `RebaseResult`
+/// (stops included — a stop is a normal result).
+fn write_outcome_json(outcome: WriteOutcome) -> Result<Value, BambooError> {
+    match outcome {
+        WriteOutcome::Output(output) => to_json_value(&OutputResult { output }),
+        WriteOutcome::Rebase(r) => to_json_value(&r),
+    }
 }
 
 /// Run a blocking gix read on the blocking pool, returning its result.
