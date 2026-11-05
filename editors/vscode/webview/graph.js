@@ -83,12 +83,16 @@
     for (const btn of Object.values(rebaseButtons)) btn.disabled = blocked;
   }
 
-  /** Validates a host rebaseStatus payload; invalid shapes keep the last
-   *  known state (mirrors parseBranchStatus's discipline). */
+  /** Validates a host rebaseStatus payload. Returns the parsed state for
+   *  stopped/running, null for idle (valid: banner must hide), and
+   *  undefined for malformed shapes (keep the last known state — mirrors
+   *  parseBranchStatus's discipline, but idle is a real state here, not a
+   *  failure). */
   function parseRebaseStatus(message) {
     const status = message.status;
-    if (!status || typeof status !== 'object' || typeof status.state !== 'string') return null;
-    if (status.state !== 'stopped' && status.state !== 'running') return null;
+    if (!status || typeof status !== 'object' || typeof status.state !== 'string') return undefined;
+    if (status.state === 'idle') return null;
+    if (status.state !== 'stopped' && status.state !== 'running') return undefined;
     const parsed = { state: status.state };
     if (typeof status.msgnum === 'number' && Number.isFinite(status.msgnum)) parsed.msgnum = status.msgnum;
     if (typeof status.end === 'number' && Number.isFinite(status.end)) parsed.end = status.end;
@@ -791,7 +795,7 @@
       updateRebaseBanner();
     } else if (message.type === 'rebaseStatus') {
       const parsed = parseRebaseStatus(message);
-      if (parsed) rebaseStatus = parsed;
+      if (parsed !== undefined) rebaseStatus = parsed;
       updateRebaseBanner();
     } else if (message.type === 'branchStatus') {
       const parsed = parseBranchStatus(message);

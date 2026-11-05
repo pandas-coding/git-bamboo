@@ -139,7 +139,10 @@ function clearBanners() {
 function setBusyIndicator(active) {
   executing = active;
   for (const button of actionButtons) button.disabled = active;
-  els.execute.textContent = active ? 'Running…' : 'Execute';
+  // Update the label span, not textContent — the leading icon is trusted
+  // static markup (icons.js) and must survive the toggle.
+  const label = els.execute.lastElementChild;
+  if (label) label.textContent = active ? 'Running…' : 'Execute';
 }
 
 /* ------------------------------------------------------------- plan view */
@@ -444,10 +447,12 @@ function setStatus(message) {
   if (!status || typeof status !== 'object') return;
   if (status.state === 'idle') {
     // Idle pushes never clobber the plan editor (user edits win); a
-    // docked view going idle means the rebase finished (e.g. from the
-    // terminal) — report it as completed.
+    // docked view going idle means the rebase ended (finished, aborted,
+    // or resolved from the terminal — the disk state can't tell which,
+    // so the message stays neutral; explicit 'finished' pushes carry the
+    // outcome).
     if (mode === 'docked') {
-      finish('completed');
+      finish('ended');
     } else if (mode === 'loading' || mode === 'empty') {
       setMode('empty');
       els.emptyText.textContent = 'No rebase is in progress.';
@@ -530,7 +535,11 @@ function renderStatusList(list, entries, stoppedSha) {
 function finish(outcome) {
   clearBanners();
   els.finishedText.textContent =
-    outcome === 'aborted' ? 'Rebase aborted — the branch is back at its pre-rebase state.' : 'Rebase completed.';
+    outcome === 'aborted'
+      ? 'Rebase aborted — the branch is back at its pre-rebase state.'
+      : outcome === 'ended'
+        ? 'The rebase is no longer in progress.'
+        : 'Rebase completed.';
   showBanner('finished', true);
   setMode('empty');
   els.emptyText.textContent = '';
