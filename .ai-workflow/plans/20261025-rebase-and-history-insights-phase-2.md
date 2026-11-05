@@ -56,7 +56,7 @@ tags: [git, vscode-extension, ui]
 
 ## Acceptance Criteria
 
-- [ ] `npm run compile`（或既有等价 lint/build 流程）无错误；`cargo` 侧零改动（本阶段纯 TS/UI）。
+- [x] `npm run compile`（或既有等价 lint/build 流程）无错误；`cargo` 侧零改动（本阶段纯 TS/UI）。
 - [ ] **手测**：graph 右键 "Rebase onto…" 弹面板，todo 列表与 `git log upstream..branch` 一致。
 - [ ] **手测**：拖拽重排 + drop + squash + reword 自定义消息组合执行，`git log` 结果与计划一致（对照命令行 git 验证）。
 - [ ] **手测**：执行中产生冲突 → 面板停靠视图 + 提交视图冲突栏出现 rebase 冲突 → 三方合并编辑器（rebase 侧标签正确）→ 解决 + 继续 → 完成，graph 自动刷新。
