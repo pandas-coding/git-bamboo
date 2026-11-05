@@ -43,11 +43,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Commands are registered unconditionally (even before a repo is open) so
   // palette entries never dead-end silently; handlers guard on the session.
   registerCommand(context, 'gitBamboo.openGraph', async () => {
-    if (!activeClient || !activeState) {
+    if (!activeClient || !activeState || !activeConflictFlow) {
       noSessionWarning();
       return;
     }
-    openGraphPanel(context, activeClient, activeState);
+    openGraphPanel(context, activeClient, activeState, activeConflictFlow);
   });
   registerCommand(context, 'gitBamboo.undo', () =>
     activeClient ? commands.undoLast(activeClient) : noSessionWarning());
@@ -386,14 +386,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Sidebar commit graph (compact mode) + editor-area graph panel (full
   // width mode) share the same webview bundle via GraphSession.
-  const graph = new GraphWebviewProvider(context, client, state);
+  const graph = new GraphWebviewProvider(context, client, state, conflictFlow);
   context.subscriptions.push(graph);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(GraphWebviewProvider.viewId, graph, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
   );
-  registerGraphPanelSerializer(context, client, state);
+  registerGraphPanelSerializer(context, client, state, conflictFlow);
   // Rebase panel restores as the read-only docked view when a rebase is
   // still on disk across a window reload (idle → empty state).
   registerRebasePanelSerializer(context, client, conflictFlow);

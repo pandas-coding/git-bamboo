@@ -38,6 +38,74 @@
   const splitter = document.getElementById('splitter');
   const ctx = canvas.getContext('2d');
 
+  // ---------------------------------------------------------- rebase banner
+
+  const rebaseBanner = document.getElementById('rebase-banner');
+  const rebaseText = document.getElementById('rebase-text');
+  const rebaseButtons = {
+    continue: document.getElementById('rebase-continue'),
+    skip: document.getElementById('rebase-skip'),
+    abort: document.getElementById('rebase-abort'),
+  };
+  /** Latest rebaseStatus from the host (null = idle or unknown → banner
+   *  hidden). Only `stopped` shows controls; `running` is read-only. */
+  let rebaseStatus = null;
+  /** True while the host runs a rebase control op (buttons disabled). */
+  let rebaseControlActive = false;
+
+  function shortSha(id) {
+    return typeof id === 'string' && id.length >= 7 ? id.slice(0, 7) : String(id);
+  }
+
+  /** Derives the banner from rebaseStatus: hidden unless a rebase is on
+   *  disk. Controls enabled only while stopped AND no other mutating op
+   *  is in flight (net op or rebase control). */
+  function updateRebaseBanner() {
+    const state = rebaseStatus && rebaseStatus.state;
+    if (state !== 'stopped' && state !== 'running') {
+      rebaseBanner.hidden = true;
+      return;
+    }
+    rebaseBanner.hidden = false;
+    let text = 'Rebase in progress';
+    if (rebaseStatus.msgnum && rebaseStatus.end) {
+      text += ` ${rebaseStatus.msgnum}/${rebaseStatus.end}`;
+    }
+    if (state === 'stopped') {
+      text += ` — stopped at ${shortSha(rebaseStatus.stopped_sha)}`;
+      const conflicts = rebaseStatus.conflicts;
+      if (conflicts > 0) {
+        text += ` · ${conflicts} unresolved conflict${conflicts === 1 ? '' : 's'}`;
+      }
+    }
+    rebaseText.textContent = text;
+    const blocked = state !== 'stopped' || rebaseControlActive || netOpActive;
+    for (const btn of Object.values(rebaseButtons)) btn.disabled = blocked;
+  }
+
+  /** Validates a host rebaseStatus payload; invalid shapes keep the last
+   *  known state (mirrors parseBranchStatus's discipline). */
+  function parseRebaseStatus(message) {
+    const status = message.status;
+    if (!status || typeof status !== 'object' || typeof status.state !== 'string') return null;
+    if (status.state !== 'stopped' && status.state !== 'running') return null;
+    const parsed = { state: status.state };
+    if (typeof status.msgnum === 'number' && Number.isFinite(status.msgnum)) parsed.msgnum = status.msgnum;
+    if (typeof status.end === 'number' && Number.isFinite(status.end)) parsed.end = status.end;
+    if (typeof status.stopped_sha === 'string') parsed.stopped_sha = status.stopped_sha;
+    parsed.conflicts =
+      typeof message.conflicts === 'number' && Number.isFinite(message.conflicts)
+        ? message.conflicts
+        : 0;
+    return parsed;
+  }
+
+  for (const [op, btn] of Object.entries(rebaseButtons)) {
+    btn.addEventListener('click', () => {
+      if (!btn.disabled) vscode.postMessage({ type: 'rebaseControl', op });
+    });
+  }
+
   // ---------------------------------------------------------- network toolbar
 
   const netButtons = {
@@ -715,6 +783,16 @@
           ? message.op
           : null;
       updateToolbar();
+      updateRebaseBanner();
+    } else if (message.type === 'rebaseControlState' && typeof message.active === 'boolean') {
+      // Host echo for the banner's own controls (same disable-while-running
+      // discipline as the toolbar's netOpState).
+      rebaseControlActive = message.active;
+      updateRebaseBanner();
+    } else if (message.type === 'rebaseStatus') {
+      const parsed = parseRebaseStatus(message);
+      if (parsed) rebaseStatus = parsed;
+      updateRebaseBanner();
     } else if (message.type === 'branchStatus') {
       const parsed = parseBranchStatus(message);
       if (parsed) branchStatus = parsed;

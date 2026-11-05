@@ -6,6 +6,7 @@
  * and survives window reloads via a panel serializer.
  */
 import * as vscode from 'vscode';
+import { ConflictFlow } from './conflictFlow';
 import { EngineClient } from './engineClient';
 import { GraphSession } from './graphSession';
 import type { RepoState } from './types';
@@ -21,6 +22,7 @@ export function openGraphPanel(
   context: vscode.ExtensionContext,
   client: EngineClient,
   state: RepoState,
+  conflictFlow: ConflictFlow,
 ): vscode.WebviewPanel {
   if (activePanel) {
     // Reveal where the panel already lives — forcing ViewColumn.Beside
@@ -42,7 +44,7 @@ export function openGraphPanel(
       ],
     },
   );
-  attachSession(context, client, state, panel);
+  attachSession(context, client, state, conflictFlow, panel);
   return panel;
 }
 
@@ -51,11 +53,12 @@ function attachSession(
   context: vscode.ExtensionContext,
   client: EngineClient,
   state: RepoState,
+  conflictFlow: ConflictFlow,
   panel: vscode.WebviewPanel,
 ): void {
   panel.webview.html = buildWebviewHtml(context.extensionUri, panel.webview, 'graph.html');
   activePanel = panel;
-  const session = new GraphSession(client, state, panel.webview, 'panel', context, () => {
+  const session = new GraphSession(client, state, conflictFlow, panel.webview, 'panel', context, () => {
     if (activePanel === panel) activePanel = undefined;
   });
   panel.onDidDispose(() => session.dispose());
@@ -69,11 +72,12 @@ export function registerGraphPanelSerializer(
   context: vscode.ExtensionContext,
   client: EngineClient,
   state: RepoState,
+  conflictFlow: ConflictFlow,
 ): void {
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(GRAPH_PANEL_TYPE, {
       deserializeWebviewPanel: async (panel: vscode.WebviewPanel) => {
-        attachSession(context, client, state, panel);
+        attachSession(context, client, state, conflictFlow, panel);
       },
     }),
   );
