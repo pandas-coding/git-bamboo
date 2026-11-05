@@ -15,6 +15,29 @@ use crate::undo::UndoEngine;
 use crate::write_queue::{run_write_queue, WriteCommand, WriteResult};
 use crate::undo::{UndoErrorKind, UndoSummary};
 
+/// The result of one write command, crossing the session boundary with
+/// its structure intact: plain commands return an output string,
+/// interactive-rebase commands return the typed outcome (a stop is a
+/// normal result, not an error).
+#[derive(Debug, Clone)]
+pub enum WriteOutcome {
+    Output(String),
+    Rebase(bamboo_protocol::RebaseResult),
+}
+
+impl WriteOutcome {
+    /// The plain output string; panics for rebase commands (tests and
+    /// RPC code that must not silently drop a structured rebase result).
+    pub fn expect_output(self) -> String {
+        match self {
+            WriteOutcome::Output(output) => output,
+            WriteOutcome::Rebase(_) => {
+                panic!("expected a plain write output, got a rebase result")
+            }
+        }
+    }
+}
+
 /// Events emitted by the engine to be forwarded to connected clients
 /// as JSON-RPC notifications.
 #[derive(Debug, Clone)]
@@ -59,6 +82,14 @@ pub struct Session {
     pub cache: Mutex<Cache>,
     pub undo: UndoEngine,
     pub write_tx: mpsc::Sender<(WriteCommand, tokio::sync::oneshot::Sender<WriteResult>)>,
+    /// The undo transaction id of the in-flight interactive rebase, if
+    /// any: startRebase is journaled once; the continue/skip/abort steps
+    /// that advance that SAME rebase bypass the journal and instead
+    /// refresh this tx's post snapshot when the rebase finishes (see
+    /// write_queue::rebase_step / undo::refresh_post_snapshot). Also
+    /// survives a stopped rebase so a later undo of the tx can
+    /// `git rebase --abort` + restore.
+    rebase_tx: std::sync::Mutex<Option<u64>>,
     notify_tx: mpsc::UnboundedSender<EngineEvent>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
@@ -101,6 +132,7 @@ impl Session {
             cache: Mutex::new(cache),
             undo,
             write_tx,
+            rebase_tx: std::sync::Mutex::new(None),
             notify_tx,
             watcher: Mutex::new(None),
         });
@@ -130,10 +162,26 @@ impl Session {
         self.epoch.load(Ordering::SeqCst)
     }
 
+    /// Bind the undo transaction that owns the in-flight rebase (set by
+    /// run_write right after journaling StartRebase).
+    pub fn set_rebase_tx(&self, id: u64) {
+        *self.rebase_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+    }
+
+    /// Release the binding (the rebase finished/was aborted/failed).
+    pub fn take_rebase_tx(&self) -> Option<u64> {
+        self.rebase_tx.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// The bound rebase transaction, if the rebase is still in flight.
+    pub fn current_rebase_tx(&self) -> Option<u64> {
+        *self.rebase_tx.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Enqueue a write command. Errors are typed `BambooError`s so
     /// structured codes (STASH_CONFLICT, PUSH_REJECTED, ...) reach the
     /// RPC surface intact.
-    pub async fn enqueue_write(&self, cmd: WriteCommand) -> Result<String, BambooError> {
+    pub async fn enqueue_write(&self, cmd: WriteCommand) -> Result<WriteOutcome, BambooError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.write_tx
             .send((cmd, tx))
@@ -143,10 +191,11 @@ impl Session {
             .await
             .map_err(|_| BambooError::git_error("write result dropped"))?;
         match result {
-            WriteResult::Ok(output) => Ok(output),
+            WriteResult::Ok(output) => Ok(WriteOutcome::Output(output)),
+            WriteResult::Rebase(r) => Ok(WriteOutcome::Rebase(r)),
             WriteResult::Err(e) => Err(e),
             WriteResult::Undo(r) => r
-                .map(|_| String::new())
+                .map(|_| WriteOutcome::Output(String::new()))
                 .map_err(|e| BambooError::git_error(e.to_string())),
         }
     }
@@ -167,6 +216,9 @@ impl Session {
             WriteResult::Undo(r) => Ok(r),
             WriteResult::Ok(_) => Err(anyhow::anyhow!(
                 "internal error: undo command returned a write result"
+            )),
+            WriteResult::Rebase(_) => Err(anyhow::anyhow!(
+                "internal error: undo command returned a rebase result"
             )),
             WriteResult::Err(e) => Err(anyhow::anyhow!("{}", e)),
         }

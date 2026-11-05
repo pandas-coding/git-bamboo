@@ -16,7 +16,13 @@ import type {
   ForceMode,
   GetDiffResult,
   GetHeadResult,
+  GetRebasePlanResult,
+  GetRebaseStatusResult,
   PullStrategy,
+  RebasePlanCommit,
+  RebaseResult,
+  RebaseStatusEntry,
+  RebaseTodoEntry,
   Ref,
   RemoteInfo,
   StashEntry,
@@ -345,6 +351,76 @@ export class EngineClient {
     return typeof result?.output === 'string' ? result.output : '';
   }
 
+  /** Engine RPC `getRebasePlan`: the replay window for an interactive
+   *  rebase of `branch` (defaults to the current branch when null)
+   *  onto `onto`. Commits come back in replay order (oldest first),
+   *  so the returned list maps 1:1 onto a todo list. Malformed fields
+   *  degrade to defaults (empty strings, empty list) like getHead. */
+  async getRebasePlan(onto: string, branch?: string | null): Promise<GetRebasePlanResult> {
+    const params: Record<string, unknown> = { onto };
+    if (branch != null) params.branch = branch;
+    const result = await this.request<unknown>('getRebasePlan', params, 15_000);
+    return normalizeRebasePlan(result);
+  }
+
+  /** Engine RPC `getRebaseStatus`: the state of an in-progress rebase
+   *  (idle, stopped at a conflict/reword, or running). Malformed fields
+   *  are dropped rather than half-trusted — an unrecognized state
+   *  degrades to `idle` so the UI closes the rebase surface. */
+  async getRebaseStatus(): Promise<GetRebaseStatusResult> {
+    const result = await this.request<unknown>('getRebaseStatus', {}, 5_000);
+    return normalizeRebaseStatus(result);
+  }
+
+  /** Engine RPC `startRebase`: begin an interactive rebase of `branch`
+   *  (defaults to the current branch when null) onto `onto` with the
+   *  user-edited todo. The engine requires the todo's id set to exactly
+   *  equal the upstream..branch commit set from getRebasePlan (else
+   *  INVALID_ARGUMENT). `message` on an entry is only honored for
+   *  reword/squash. `stopped: true` is a normal outcome (conflict or
+   *  reword wait), not an error; real failures reject with GIT_ERROR. */
+  async startRebase(
+    onto: string,
+    todo: RebaseTodoEntry[],
+    branch?: string | null,
+  ): Promise<RebaseResult> {
+    const params: Record<string, unknown> = {
+      onto,
+      todo: todo.map((entry) =>
+        entry.message === undefined
+          ? { id: entry.id, action: entry.action }
+          : { id: entry.id, action: entry.action, message: entry.message },
+      ),
+    };
+    if (branch != null) params.branch = branch;
+    const result = await this.request<unknown>('startRebase', params, 120_000);
+    return normalizeRebaseResult(result);
+  }
+
+  /** Engine RPC `rebaseContinue`: resume a stopped rebase (after the user
+   *  resolved a conflict or saved a reword message). Large rebases are
+   *  slow, so this uses a long timeout. Same result contract as
+   *  startRebase — `stopped: true` is a normal outcome, not an error. */
+  async rebaseContinue(): Promise<RebaseResult> {
+    const result = await this.request<unknown>('rebaseContinue', {}, 120_000);
+    return normalizeRebaseResult(result);
+  }
+
+  /** Engine RPC `rebaseSkip`: skip the commit the rebase is stopped on
+   *  and continue. Same result contract as startRebase. */
+  async rebaseSkip(): Promise<RebaseResult> {
+    const result = await this.request<unknown>('rebaseSkip', {}, 120_000);
+    return normalizeRebaseResult(result);
+  }
+
+  /** Engine RPC `rebaseAbort`: tear down the in-progress rebase and move
+   *  back to the pre-rebase state. Resolves with the engine's (already
+   *  aborted) status; real failures reject with GIT_ERROR. */
+  async rebaseAbort(): Promise<RebaseResult> {
+    const result = await this.request<unknown>('rebaseAbort', {}, 120_000);
+    return normalizeRebaseResult(result);
+  }
+
   /** Graceful shutdown request (best-effort, 2s cap), then kill the child. */
   async dispose(): Promise<void> {
     // Guard against double-dispose (deactivate + context disposal).
@@ -519,5 +595,103 @@ function isValidBranchStatus(value: unknown): value is BranchStatus {
     typeof v.ahead === 'number' &&
     typeof v.behind === 'number'
   );
+}
+
+/** Normalize a `getRebasePlan` response: malformed shapes degrade to a
+ *  minimal plan (empty strings, no commits) rather than throwing, so the
+ *  UI can show "nothing to rebase" instead of an error surface. */
+function normalizeRebasePlan(value: unknown): GetRebasePlanResult {
+  const v = isRecord(value) ? value : {};
+  const commits = Array.isArray(v.commits)
+    ? v.commits.filter(isValidRebasePlanCommit).map((c) => ({ ...c }))
+    : [];
+  return {
+    onto: typeof v.onto === 'string' ? v.onto : '',
+    upstream: typeof v.upstream === 'string' ? v.upstream : '',
+    branch: typeof v.branch === 'string' ? v.branch : '',
+    commits,
+  };
+}
+
+function isValidRebasePlanCommit(value: unknown): value is RebasePlanCommit {
+  if (typeof value !== 'object' || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.id === 'string' &&
+    typeof v.subject === 'string' &&
+    typeof v.author === 'string' &&
+    typeof v.time === 'number'
+  );
+}
+
+/** Normalize a `getRebaseStatus` response: an unrecognized state degrades
+ *  to `idle` (the UI closes the rebase surface), and each field is only
+ *  trusted when its typeof matches — optional fields the engine omits
+ *  (e.g. everything but the raw line lists when idle) stay undefined. */
+function normalizeRebaseStatus(value: unknown): GetRebaseStatusResult {
+  const v = isRecord(value) ? value : {};
+  const state =
+    v.state === 'idle' || v.state === 'stopped' || v.state === 'running' ? v.state : 'idle';
+  const result: GetRebaseStatusResult = {
+    state,
+    done: stringArray(v.done),
+    remaining: stringArray(v.remaining),
+    done_entries: statusEntries(v.done_entries),
+    remaining_entries: statusEntries(v.remaining_entries),
+  };
+  if (v.backend === 'merge' || v.backend === 'apply') result.backend = v.backend;
+  if (typeof v.branch === 'string') result.branch = v.branch;
+  if (typeof v.onto === 'string') result.onto = v.onto;
+  if (typeof v.orig_head === 'string') result.orig_head = v.orig_head;
+  if (typeof v.stopped_sha === 'string') result.stopped_sha = v.stopped_sha;
+  if (typeof v.msgnum === 'number') result.msgnum = v.msgnum;
+  if (typeof v.end === 'number') result.end = v.end;
+  return result;
+}
+
+function statusEntries(value: unknown): RebaseStatusEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (e): e is RebaseStatusEntry =>
+      isRecord(e) &&
+      typeof e.id === 'string' &&
+      typeof e.subject === 'string' &&
+      isRebaseAction(e.action),
+  );
+}
+
+function isRebaseAction(value: unknown): boolean {
+  return (
+    value === 'pick' ||
+    value === 'reword' ||
+    value === 'squash' ||
+    value === 'fixup' ||
+    value === 'drop' ||
+    value === 'edit'
+  );
+}
+
+/** Normalize a rebase write-result (`startRebase`/`rebaseContinue`/
+ *  `rebaseSkip`/`rebaseAbort`): `stopped`/`finished` degrade to false, and
+ *  optional stop fields are only trusted when their typeof matches. */
+function normalizeRebaseResult(value: unknown): RebaseResult {
+  const v = isRecord(value) ? value : {};
+  const result: RebaseResult = {
+    stopped: v.stopped === true,
+    finished: v.finished === true,
+  };
+  if (v.reason === 'conflict' || v.reason === 'reword_stop') result.reason = v.reason;
+  if (typeof v.stopped_sha === 'string') result.stopped_sha = v.stopped_sha;
+  if (typeof v.msgnum === 'number') result.msgnum = v.msgnum;
+  if (typeof v.end === 'number') result.end = v.end;
+  return result;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((s): s is string => typeof s === 'string') : [];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 

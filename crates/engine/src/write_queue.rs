@@ -8,9 +8,15 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use bamboo_protocol::{BambooError, ConflictKind, ConflictResolution, ForceMode, PullStrategy};
+use bamboo_protocol::{
+    BambooError, ConflictKind, ConflictResolution, ForceMode, PullStrategy, RebaseResult,
+    RebaseTodoEntry,
+};
 
 use crate::gix_read::{parse_unified_diff, RawFileDiff, RawHunk, DIFF_FLAGS};
+use crate::rebase::{
+    self, build_validated_todo, classify_stop_reason, write_sidecars, RebaseStateInternal,
+};
 use crate::session::{EngineEvent, Session};
 use crate::undo::{UndoError, UndoOutcome, UndoSummary, UndoErrorKind};
 
@@ -102,6 +108,37 @@ pub enum WriteCommand {
     },
     /// UNDO DECISION: journaled (moves refs/stash).
     StashDrop { stash_ref: Option<String> },
+    /// UNDO DECISION: journaled — a rebase rewrites branch refs and
+    /// HEAD, exactly what `Snapshot` captures. The pre-snapshot is
+    /// additionally annotated with `pre_rebase_tip`/`rebase_branch` (see
+    /// `run_write`) because mid-rebase resets overwrite `ORIG_HEAD`,
+    /// which git documents as unreliable; undo restores from the
+    /// journal, never ORIG_HEAD. When the rebase stops (conflict), the
+    /// journaled post snapshot is the stopped state; continue/skip
+    /// refresh it when the rebase finishes and abort restores it, so the
+    /// whole rebase stays undoable as one unit.
+    StartRebase {
+        onto: String,
+        branch: Option<String>,
+        todo: Vec<RebaseTodoEntry>,
+    },
+    /// UNDO DECISION: bypasses a NEW journal entry — continue/skip
+    /// advance the ALREADY-JOURNALED StartRebase transaction instead of
+    /// starting a new one. The post snapshot of that tx is refreshed
+    /// when the rebase finishes (`refresh_rebase_tx`) so the undo safety
+    /// check tracks the real outcome and the pre-state restore (abort +
+    /// reset) stays reachable. A stop is normal semantics; the result
+    /// carries the stop reason/progress, not an error.
+    RebaseContinue,
+    /// UNDO DECISION: as RebaseContinue (drops the stopped commit and
+    /// advances the same journaled rebase transaction).
+    RebaseSkip,
+    /// UNDO DECISION: bypasses a new journal entry — abort IS a
+    /// recovery operation (it restores the pre-rebase state recorded in
+    /// the StartRebase tx's pre-snapshot); the tx's post snapshot is
+    /// refreshed to the restored state so the undo stack stays
+    /// consistent.
+    RebaseAbort,
     /// Cascade rollback. Routed through the same single-consumer queue as
     /// every other mutation so undo can never interleave with a write.
     Undo { transaction_id: u64 },
@@ -175,6 +212,12 @@ impl WriteCommand {
                 }
             }
             WriteCommand::StashDrop { .. } => "StashDrop".to_string(),
+            WriteCommand::StartRebase { todo, .. } => {
+                format!("StartRebase({} entries)", todo.len())
+            }
+            WriteCommand::RebaseContinue => "RebaseContinue".to_string(),
+            WriteCommand::RebaseSkip => "RebaseSkip".to_string(),
+            WriteCommand::RebaseAbort => "RebaseAbort".to_string(),
             WriteCommand::Undo { .. } => "Undo".to_string(),
         }
     }
@@ -183,6 +226,10 @@ impl WriteCommand {
 #[derive(Debug, Clone)]
 pub enum WriteResult {
     Ok(String),
+    /// Structured interactive-rebase outcome. A STOP is a normal
+    /// outcome, not an error (the conflict is in the worktree, not the
+    /// command); real failures use `Err` like every other command.
+    Rebase(RebaseResult),
     /// Failure carrying a structured protocol error (code + message) so
     /// the server can surface STASH_CONFLICT / PUSH_REJECTED /
     /// AUTH_REQUIRED to the client instead of a flat git-error string.
@@ -407,10 +454,40 @@ pub async fn run_write_queue(
                     }
                 }
             }
+            // RebaseContinue/RebaseSkip/RebaseAbort bypass the undo
+            // journal (they advance/abort the ALREADY-JOURNALED
+            // StartRebase transaction — see the WriteCommand declarations
+            // and `rebase_step`). They still run serialized on this queue,
+            // bump the epoch on success, and are audit-logged; the bound
+            // transaction's post snapshot is refreshed when the rebase
+            // finishes/aborts so later undos are neither blocked nor
+            // desynced. In-flight dedup: the queue's single-consumer
+            // serialization IS the per-command in-flight guard — a
+            // double-clicked continue simply queues behind the first, and
+            // the second then observes "no rebase in progress", which
+            // classifies as idempotent success (see rebase_step).
+            WriteCommand::RebaseContinue
+            | WriteCommand::RebaseSkip
+            | WriteCommand::RebaseAbort => {
+                let result = rebase_step(&session, &cmd).await;
+                match result {
+                    Ok(r) => (WriteResult::Rebase(r), 0),
+                    Err(e) => {
+                        let mapped = match e.downcast::<BambooError>() {
+                            Ok(structured) => structured,
+                            Err(e) => BambooError::git_error(e.to_string()),
+                        };
+                        (WriteResult::Err(mapped), 0)
+                    }
+                }
+            }
             _ => run_write(&session, &cmd).await,
         };
 
-        let success = matches!(result, WriteResult::Ok(_) | WriteResult::Undo(Ok(_)));
+        let success = matches!(
+            result,
+            WriteResult::Ok(_) | WriteResult::Rebase(_) | WriteResult::Undo(Ok(_))
+        );
 
         // Append audit log entry (best-effort).
         if let Err(e) = session.undo.append_audit_log(&desc, epoch, &result, tx_id) {
@@ -426,8 +503,38 @@ pub async fn run_write_queue(
             if matches!(cmd, WriteCommand::Undo { .. }) {
                 session.emit(EngineEvent::GraphInvalidated { epoch: new_epoch });
             }
-            if let WriteResult::Ok(output) = &result {
-                info!(output = %output, "write command succeeded");
+            if matches!(
+                cmd,
+                WriteCommand::StartRebase { .. }
+                    | WriteCommand::RebaseContinue
+                    | WriteCommand::RebaseSkip
+                    | WriteCommand::RebaseAbort
+            ) {
+                // A rebase moves HEAD (detached mid-rebase, back on the
+                // branch at the end) and rewrites the branch ref, so the
+                // graph and head views must refresh. Emitted directly
+                // with the just-bumped epoch instead of waiting for the
+                // fs watcher batch, so the RPC response is always
+                // preceded by its notifications.
+                let new_head = std::fs::read_to_string(session.git_dir.join("HEAD"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                session.emit(EngineEvent::HeadChanged { new_head, epoch: new_epoch });
+                session.emit(EngineEvent::GraphInvalidated { epoch: new_epoch });
+            }
+            match &result {
+                WriteResult::Ok(output) => {
+                    info!(output = %output, "write command succeeded");
+                }
+                WriteResult::Rebase(r) => {
+                    info!(
+                        stopped = r.stopped,
+                        finished = r.finished,
+                        "rebase step succeeded"
+                    );
+                }
+                _ => {}
             }
         } else {
             warn!(error = ?result, "write command failed");
@@ -459,7 +566,38 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
         }
     };
 
-    let result = execute_command(session, cmd).await;
+    // StartRebase carries extra undo metadata: the authoritative
+    // pre-rebase branch tip (`ORIG_HEAD` is overwritten by mid-rebase
+    // resets, git documents it as unreliable) and the branch name, used
+    // by `restore_snapshot` to `git rebase --abort` + hard-reset the
+    // worktree. The annotation derives both from the just-written pre
+    // snapshot — refs are still pre-state because this queue is
+    // single-consumer — and binds the tx so continue/skip/abort can
+    // refresh its post snapshot when the rebase finishes.
+    if let WriteCommand::StartRebase { branch, .. } = cmd {
+        if let Err(e) = session.undo.annotate_rebase(tx_id, branch.as_deref()) {
+            error!(error = %e, "failed to annotate undo snapshot for rebase");
+            let _ = session.undo.commit(tx_id, &desc, epoch, false);
+            return (
+                WriteResult::Err(BambooError::git_error(format!(
+                    "failed to annotate undo snapshot: {e}"
+                ))),
+                tx_id,
+            );
+        }
+        session.set_rebase_tx(tx_id);
+    }
+
+    // The rebase flow returns a STRUCTURED result (stops are normal
+    // outcomes); every other command produces a plain output string.
+    let result: anyhow::Result<CmdOutcome> = match cmd {
+        WriteCommand::StartRebase { onto, branch, todo } => {
+            start_rebase_flow(session, onto, branch.as_deref(), todo.clone())
+                .await
+                .map(CmdOutcome::Rebase)
+        }
+        _ => execute_command(session, cmd).await.map(CmdOutcome::Output),
+    };
 
     // Finalize the undo transaction (post-write snapshot + journal entry).
     let success = result.is_ok();
@@ -478,11 +616,26 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
     }
 
     match result {
-        Ok(output) => (WriteResult::Ok(output), tx_id),
+        Ok(CmdOutcome::Output(output)) => (WriteResult::Ok(output), tx_id),
+        Ok(CmdOutcome::Rebase(r)) => {
+            // The rebase finished completely in this one command (no
+            // stop): release the tx binding — run_write's commit above
+            // already captured the final post snapshot.
+            if r.finished {
+                session.take_rebase_tx();
+            }
+            (WriteResult::Rebase(r), tx_id)
+        }
         // Structured protocol errors (STASH_CONFLICT, PUSH_REJECTED,
         // AUTH_REQUIRED) survive; everything else degrades to a plain
         // git error carrying git's stderr.
         Err(e) => {
+            // A failed startRebase never left a rebase in progress — the
+            // validation happens before any subprocess — so the tx
+            // binding must not survive either.
+            if matches!(cmd, WriteCommand::StartRebase { .. }) {
+                session.take_rebase_tx();
+            }
             let mapped = match e.downcast::<BambooError>() {
                 Ok(structured) => structured,
                 Err(e) => BambooError::git_error(e.to_string()),
@@ -492,14 +645,31 @@ async fn run_write(session: &Session, cmd: &WriteCommand) -> (WriteResult, u64) 
     }
 }
 
+/// The execution result of one journaled write: a plain output string or
+/// a structured rebase outcome.
+enum CmdOutcome {
+    Output(String),
+    Rebase(RebaseResult),
+}
+
 /// Execute an undo. Runs the (synchronous, git-shelling) undo engine on a
 /// blocking thread — still serialized behind this single-consumer queue.
 async fn run_undo(session: Arc<Session>, transaction_id: u64) -> (WriteResult, u64) {
-    let result = tokio::task::spawn_blocking(move || session.undo.undo(transaction_id)).await;
+    let undo_session = std::sync::Arc::clone(&session);
+    let result = tokio::task::spawn_blocking(move || undo_session.undo.undo(transaction_id)).await;
     let result: Result<UndoOutcome, UndoError> = match result {
         Ok(r) => r,
         Err(e) => Err(UndoError::Io(anyhow::anyhow!("undo task failed: {e}"))),
     };
+    // The undo may have pruned the bound rebase transaction (a cascade
+    // rollback past it — which also aborted any in-progress rebase via
+    // restore_snapshot); release the binding only when that happened, so
+    // a still-journaled rebase keeps its refresh binding.
+    if let Some(rebase_tx) = session.current_rebase_tx() {
+        if !session.undo.has_transaction(rebase_tx) {
+            session.take_rebase_tx();
+        }
+    }
     match result {
         Ok(UndoOutcome::Restored { restored_refs }) => (
             WriteResult::Undo(Ok(UndoSummary { restored_refs, noop: false })),
@@ -531,6 +701,12 @@ async fn execute_command(session: &Session, cmd: &WriteCommand) -> anyhow::Resul
         }
         WriteCommand::StageRanges { .. } | WriteCommand::UnstageRanges { .. } => {
             unreachable!("stageRanges/unstageRanges are routed in run_write_queue")
+        }
+        WriteCommand::StartRebase { .. }
+        | WriteCommand::RebaseContinue
+        | WriteCommand::RebaseSkip
+        | WriteCommand::RebaseAbort => {
+            unreachable!("rebase commands are routed in run_write/run_write_queue")
         }
         WriteCommand::SwitchBranch { name, auto_stash } => {
             return switch_branch(session, name, *auto_stash).await;
@@ -1922,6 +2098,288 @@ async fn switch_branch(
         },
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Interactive rebase execution (see rebase.rs for todo/state/editors)
+// ---------------------------------------------------------------------------
+
+/// The branch name a `branch: null` rebase operates on: the current HEAD
+/// branch. Detached HEAD is rejected — git can rebase a detached HEAD,
+/// but the undo story (branch tip restore) needs a branch.
+fn current_branch_name(session: &Session) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(session.git_dir.join("HEAD"))?;
+    let raw = raw.trim();
+    raw.strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
+        .ok_or_else(|| {
+            BambooError::invalid_argument(
+                "HEAD is detached; pass an explicit branch for the rebase",
+            )
+            .into()
+        })
+}
+
+/// Read the in-progress rebase state off the write queue's async context
+/// (fs reads + possibly one rev-parse subprocess).
+async fn read_rebase_state_async(session: &Session) -> RebaseStateInternal {
+    let repo_path = session.repo_path.clone();
+    let git_dir = session.git_dir.clone();
+    tokio::task::spawn_blocking(move || rebase::read_rebase_state(&repo_path, &git_dir))
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether the index has unresolved conflict entries (`git diff --name-only
+/// --diff-filter=U` is empty only when it does not).
+async fn has_unmerged_paths(repo_path: &std::path::Path) -> anyhow::Result<bool> {
+    let out = run_git_checked(repo_path, &["diff", "--name-only", "--diff-filter=U"], &[])
+        .await?;
+    Ok(!out.is_empty())
+}
+
+/// Execute `startRebase`: freshness-gate the client todo against the
+/// CURRENT `upstream..branch` commit chain (a stale plan can never
+/// silently drop or add commits — any deviation is INVALID_ARGUMENT
+/// before any subprocess runs), write the todo + message sidecars, then
+/// let `git rebase -i --no-autosquash --onto <onto> <merge-base> <branch>`
+/// do the actual replay with the engine self-invoked as
+/// GIT_SEQUENCE_EDITOR/GIT_EDITOR (non-interactive, no terminal).
+///
+/// No wall-clock timeout: a large rebase legitimately runs long, and the
+/// single-consumer queue being blocked is the same trade-off the undo
+/// journal already makes for every journaled write.
+async fn start_rebase_flow(
+    session: &Session,
+    onto: &str,
+    branch: Option<&str>,
+    todo: Vec<RebaseTodoEntry>,
+) -> anyhow::Result<RebaseResult> {
+    validate_ref_arg(onto)
+        .map_err(|e| BambooError::invalid_argument(format!("startRebase: {e}")))?;
+    if let Some(branch) = branch {
+        validate_ref_arg(branch)
+            .map_err(|e| BambooError::invalid_argument(format!("startRebase: {e}")))?;
+    }
+
+    // Everything up to `write_sidecars` is pure gix/fs work — a stale or
+    // malformed todo leaves NO sidecar and spawns NO subprocess.
+    let (base_sha, chain, branch_name) = {
+        let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+        let branch_name = match branch {
+            Some(b) => b.to_string(),
+            None => current_branch_name(session)?,
+        };
+        let onto_id = rev_resolve_commit(&repo, onto, "startRebase: onto")?;
+        let branch_id = rev_resolve_commit(
+            &repo,
+            &format!("refs/heads/{branch_name}"),
+            "startRebase: branch",
+        )?;
+        let Some((base, chain)) = rebase::rebase_chain(&repo, onto_id, branch_id)? else {
+            return Err(BambooError::invalid_argument(
+                "startRebase: onto and branch share no common ancestor",
+            )
+            .into());
+        };
+        (base.to_string(), chain, branch_name)
+    };
+
+    let (lines, messages) = build_validated_todo(&todo, &chain)?;
+    write_sidecars(&session.git_dir, &lines, &messages)?;
+
+    // Editors point at the engine itself (re-invoked with
+    // --internal-sequence-editor/--internal-message-editor, see rebase.rs
+    // and main.rs): git appends the file to edit as the final argument.
+    let seq_editor = rebase::sequence_editor_value(&session.git_dir)?;
+    let msg_editor = rebase::message_editor_value(&session.git_dir)?;
+    let argv = [
+        "rebase",
+        "-i",
+        "--no-autosquash",
+        "--onto",
+        onto,
+        &base_sha,
+        &branch_name,
+    ];
+    info!(
+        onto,
+        branch = %branch_name,
+        upstream = %base_sha,
+        entries = lines.len(),
+        "starting interactive rebase"
+    );
+    let out = base_git_command(&session.repo_path)
+        .args(argv)
+        .env("GIT_SEQUENCE_EDITOR", &seq_editor)
+        .env("GIT_EDITOR", &msg_editor)
+        .output()
+        .await?;
+
+    let result = classify_rebase_completion(
+        session,
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+    .await?;
+    if result.finished {
+        rebase::cleanup_sidecars(&session.git_dir);
+        // The tx binding release happens in run_write (the post snapshot
+        // is captured by its commit).
+    }
+    Ok(result)
+}
+
+/// Resolve a revision to a commit id (engine-side, no subprocess).
+fn rev_resolve_commit(
+    repo: &gix::Repository,
+    rev: &str,
+    context: &str,
+) -> anyhow::Result<gix::ObjectId> {
+    let obj = repo
+        .rev_parse_single(rev.as_bytes())
+        .map_err(|_| BambooError::git_error(format!("{context}: {rev:?} does not resolve")))?
+        .object()
+        .map_err(|_| BambooError::git_error(format!("{context}: {rev:?} does not resolve")))?;
+    let commit = obj
+        .peel_to_commit()
+        .map_err(|_| BambooError::git_error(format!("{context}: {rev:?} is not a commit")))?;
+    Ok(commit.id)
+}
+
+/// Execute `rebaseContinue` / `rebaseSkip` / `rebaseAbort` on the current
+/// in-progress rebase (engine- or externally-started). Journaled undo is
+/// NOT re-entered here — see the WriteCommand declarations; the bound
+/// StartRebase tx's post snapshot is refreshed when the rebase completes
+/// so the undo safety check tracks the real outcome.
+async fn rebase_step(session: &Session, cmd: &WriteCommand) -> anyhow::Result<RebaseResult> {
+    let state = read_rebase_state_async(session).await;
+    if !state.in_progress() {
+        return match cmd {
+            // Idempotent: a double-clicked continue (or one racing the
+            // rebase's completion) sees "nothing left to continue" and
+            // that IS the success state.
+            WriteCommand::RebaseContinue => Ok(RebaseResult {
+                stopped: false,
+                finished: true,
+                ..Default::default()
+            }),
+            _ => Err(BambooError::invalid_argument("no rebase in progress").into()),
+        };
+    }
+
+    let argv: Vec<&str> = match cmd {
+        WriteCommand::RebaseContinue => {
+            // Unresolved conflicts would make git refuse ("cannot rebase:
+            // you have unstaged changes" / re-stop immediately); fail fast
+            // with a structured error the client can act on.
+            if has_unmerged_paths(&session.repo_path).await? {
+                return Err(BambooError::invalid_argument(
+                    "rebaseContinue: resolve the conflicts (and stage the resolutions) first",
+                )
+                .into());
+            }
+            vec!["rebase", "--continue"]
+        }
+        WriteCommand::RebaseSkip => vec!["rebase", "--skip"],
+        WriteCommand::RebaseAbort => vec!["rebase", "--abort"],
+        _ => unreachable!("rebase_step only handles rebase step commands"),
+    };
+
+    // GIT_EDITOR stays wired to the message sidecar on continue/skip: a
+    // reword message stop that survived into a continue still needs the
+    // custom message (the sidecar lookup is by stopped sha, so stale
+    // entries are simply never matched).
+    let msg_editor = rebase::message_editor_value(&session.git_dir)?;
+    info!(op = ?argv, "advancing in-progress rebase");
+    let out = base_git_command(&session.repo_path)
+        .args(&argv)
+        .env("GIT_EDITOR", &msg_editor)
+        .output()
+        .await?;
+    let ok = out.status.success();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    if matches!(cmd, WriteCommand::RebaseAbort) {
+        if !ok {
+            anyhow::bail!("git rebase --abort failed: {}", redact_credentials(&stderr).trim());
+        }
+        // git restored the branch ref/worktree to the pre-rebase state;
+        // refresh the journaled tx's post snapshot to match so the undo
+        // stack stays consistent (undo of the rebase tx becomes a clean
+        // restore of the same state).
+        rebase::cleanup_sidecars(&session.git_dir);
+        refresh_rebase_tx(session);
+        session.take_rebase_tx();
+        return Ok(RebaseResult { stopped: false, finished: true, ..Default::default() });
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let result = classify_rebase_completion(session, ok, stdout, stderr).await?;
+    if result.finished {
+        rebase::cleanup_sidecars(&session.git_dir);
+        // The rebase the StartRebase tx journaled is now complete: rewrite
+        // that tx's post snapshot to the final state, otherwise the undo
+        // safety check would compare against the stale stopped-state
+        // snapshot and block every later undo.
+        refresh_rebase_tx(session);
+        session.take_rebase_tx();
+    }
+    Ok(result)
+}
+
+/// Map one `git rebase` invocation's exit to the protocol result:
+///
+/// * exit 0, no on-disk rebase state → finished;
+/// * any exit WITH on-disk rebase state → stopped (normal outcome;
+///   reason/progress read from the state, conflicts detected from the
+///   index);
+/// * non-zero exit with no state → a real error, EXCEPT "No rebase in
+///   progress?" which is a racing completion (idempotent success).
+async fn classify_rebase_completion(
+    session: &Session,
+    ok: bool,
+    _stdout: String,
+    stderr: String,
+) -> anyhow::Result<RebaseResult> {
+    let state = read_rebase_state_async(session).await;
+    if !state.in_progress() {
+        if ok {
+            return Ok(RebaseResult { stopped: false, finished: true, ..Default::default() });
+        }
+        if stderr.to_lowercase().contains("no rebase in progress") {
+            return Ok(RebaseResult { stopped: false, finished: true, ..Default::default() });
+        }
+        anyhow::bail!("git rebase failed: {}", redact_credentials(&stderr).trim());
+    }
+    // On-disk rebase state: stopped (also reached defensively when exit
+    // was 0 — git should not exit 0 with state left behind, but if it
+    // does, reporting the stop is strictly safer than reporting done).
+    let has_unmerged = has_unmerged_paths(&session.repo_path).await?;
+    Ok(RebaseResult {
+        stopped: true,
+        finished: false,
+        reason: Some(classify_stop_reason(has_unmerged)),
+        stopped_sha: state.stopped_sha.clone(),
+        msgnum: state.msgnum,
+        end: state.end,
+    })
+}
+
+/// Rewrite the journaled StartRebase transaction's post snapshot with the
+/// CURRENT repository state (see rebase_step: called when the rebase
+/// finishes or is aborted). Best-effort: a missing/pruned tx just warns.
+fn refresh_rebase_tx(session: &Session) {
+    if let Some(id) = session.current_rebase_tx() {
+        if let Err(e) = session.undo.refresh_post_snapshot(id) {
+            warn!(
+                error = %e,
+                transaction_id = id,
+                "failed to refresh the rebase tx post snapshot; undo may be blocked"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -374,3 +374,144 @@ fn diff_types_wire_shapes() {
     .unwrap();
     assert_eq!(unstage.ranges.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Interactive rebase types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rebase_result_roundtrip() {
+    let r = RebaseResult {
+        stopped: true,
+        reason: Some(RebaseStopReason::RewordStop),
+        stopped_sha: Some("abc".into()),
+        msgnum: Some(2),
+        end: Some(5),
+        finished: false,
+    };
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(json.contains("\"reword_stop\""));
+    let back: RebaseResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(r, back);
+
+    // The idle/default shape round-trips too.
+    let r = RebaseResult::default();
+    let back: RebaseResult =
+        serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+    assert_eq!(r, back);
+}
+
+#[test]
+fn rebase_action_serializes_lowercase() {
+    let json = serde_json::to_string(&RebaseAction::Pick).unwrap();
+    assert_eq!(json, "\"pick\"");
+    assert_eq!(
+        serde_json::to_string(&RebaseAction::Fixup).unwrap(),
+        "\"fixup\""
+    );
+    // Parsing is case-sensitive lowercase, like git's todo words.
+    let a: RebaseAction = serde_json::from_str("\"squash\"").unwrap();
+    assert_eq!(a, RebaseAction::Squash);
+}
+
+#[test]
+fn rebase_todo_entry_roundtrip() {
+    let e = RebaseTodoEntry {
+        id: "0123456789abcdef0123456789abcdef01234567".into(),
+        action: RebaseAction::Reword,
+        message: Some("renamed".into()),
+    };
+    let json = serde_json::to_string(&e).unwrap();
+    assert!(json.contains("\"reword\""));
+    let back: RebaseTodoEntry = serde_json::from_str(&json).unwrap();
+    assert_eq!(e, back);
+
+    // message is optional on the wire.
+    let back: RebaseTodoEntry =
+        serde_json::from_str("{\"id\":\"x\",\"action\":\"pick\"}").unwrap();
+    assert_eq!(back.message, None);
+}
+
+#[test]
+fn rebase_plan_and_status_roundtrip() {
+    let req = GetRebasePlan {
+        onto: "main".into(),
+        branch: None,
+    };
+    let back: GetRebasePlan = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+    assert_eq!(req, back);
+
+    let result = GetRebasePlanResult {
+        onto: "main".into(),
+        upstream: "c2".into(),
+        branch: "feature".into(),
+        commits: vec![RebasePlanCommit {
+            id: "abc".into(),
+            subject: "f1".into(),
+            author: "Tester".into(),
+            time: 123,
+        }],
+    };
+    let back: GetRebasePlanResult =
+        serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+    assert_eq!(result, back);
+
+    let status = GetRebaseStatusResult {
+        state: RebaseRunState::Stopped,
+        backend: Some(RebaseBackend::Merge),
+        branch: Some("feature".into()),
+        onto: Some("main".into()),
+        orig_head: Some("tip".into()),
+        stopped_sha: Some("abc".into()),
+        msgnum: Some(1),
+        end: Some(3),
+        done: vec!["pick abc f1".into()],
+        remaining: vec!["pick def f2".into()],
+        done_entries: vec![RebaseStatusEntry {
+            action: RebaseAction::Pick,
+            id: "abc".into(),
+            subject: "f1".into(),
+        }],
+        remaining_entries: vec![RebaseStatusEntry {
+            action: RebaseAction::Squash,
+            id: "def".into(),
+            subject: "f2".into(),
+        }],
+    };
+    let json = serde_json::to_string(&status).unwrap();
+    assert!(json.contains("\"stopped\""));
+    assert!(json.contains("\"merge\""));
+    let back: GetRebaseStatusResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(status, back);
+
+    // The idle default serializes compactly (optional fields skipped).
+    let idle = GetRebaseStatusResult::default();
+    let json = serde_json::to_string(&idle).unwrap();
+    assert!(json.contains("\"idle\""));
+    assert!(!json.contains("backend"));
+}
+
+#[test]
+fn start_rebase_request_roundtrip() {
+    let req = StartRebase {
+        onto: "main".into(),
+        branch: Some("feature".into()),
+        todo: vec![RebaseTodoEntry {
+            id: "abc".into(),
+            action: RebaseAction::Drop,
+            message: None,
+        }],
+    };
+    let back: StartRebase = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+    assert_eq!(req, back);
+
+    // branch/todo default to null/empty.
+    let req: StartRebase = serde_json::from_str("{\"onto\":\"main\"}").unwrap();
+    assert_eq!(req.branch, None);
+    assert!(req.todo.is_empty());
+
+    let c: RebaseContinue = serde_json::from_str("{}").unwrap();
+    let _: RebaseSkip = serde_json::from_str("{}").unwrap();
+    let _: RebaseAbort = serde_json::from_str("{}").unwrap();
+    let _ = c;
+}

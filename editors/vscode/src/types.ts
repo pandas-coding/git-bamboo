@@ -233,3 +233,91 @@ export interface RepoState {
   /** Repository root, used to resolve repo-relative paths (e.g. for commit detail). */
   root: Uri;
 }
+
+// ---------------------------------------------------------------------------
+// Interactive rebase (engine phase 1)
+// ---------------------------------------------------------------------------
+
+/** One todo-list action of an interactive rebase, as the engine accepts it.
+ *  `pick`/`reword`/`squash`/`drop` are valid in a startRebase todo;
+ *  `fixup`/`edit` only appear in status entries reported by the engine. */
+export type RebaseAction = 'pick' | 'reword' | 'squash' | 'fixup' | 'drop' | 'edit';
+
+/** One entry of the todo list sent to the engine's `startRebase` RPC.
+ *  `id` is a full sha from getRebasePlan; the engine requires the todo's
+ *  id set to exactly equal the current upstream..branch commit set.
+ *  `message` is only honored for `reword`/`squash`. */
+export interface RebaseTodoEntry {
+  id: string;
+  action: RebaseAction;
+  message?: string;
+}
+
+/** One commit of the engine's `getRebasePlan` result, in replay order
+ *  (oldest first). `time` is unix seconds. */
+export interface RebasePlanCommit {
+  id: string;
+  subject: string;
+  author: string;
+  time: number;
+}
+
+/** Result of the engine's `getRebasePlan` RPC: the replay window for an
+ *  interactive rebase onto `onto` — commits are upstream..branch, in
+ *  replay order. `upstream` is merge-base(onto, branch) as a full sha. */
+export interface GetRebasePlanResult {
+  onto: string;
+  upstream: string;
+  branch: string;
+  commits: RebasePlanCommit[];
+}
+
+/** Whether an interactive rebase is on disk, per `getRebaseStatus`. */
+export type RebaseRunState = 'idle' | 'stopped' | 'running';
+
+/** Rebase backend in use, per `getRebaseStatus` (omitted when idle). */
+export type RebaseBackend = 'merge' | 'apply';
+
+/** One parsed todo entry of the engine's `getRebaseStatus` result. */
+export interface RebaseStatusEntry {
+  action: RebaseAction;
+  id: string;
+  subject: string;
+}
+
+/** Result of the engine's `getRebaseStatus` RPC. `done`/`remaining` are
+ *  the raw todo lines (comments included in `done`); `*_entries` are the
+ *  engine's parsed views of the same lists. Optional fields are omitted
+ *  by the engine when unknown or not applicable (e.g. when idle). */
+export interface GetRebaseStatusResult {
+  state: RebaseRunState;
+  backend?: RebaseBackend;
+  branch?: string;
+  onto?: string;
+  orig_head?: string;
+  stopped_sha?: string;
+  msgnum?: number;
+  end?: number;
+  done: string[];
+  remaining: string[];
+  done_entries: RebaseStatusEntry[];
+  remaining_entries: RebaseStatusEntry[];
+}
+
+/** Why a rebase stopped: a merge conflict, or a `reword` waiting for the
+ *  user's message (a normal outcome, not an error). */
+export type RebaseStopReason = 'conflict' | 'reword_stop';
+
+/** Result of the engine's `startRebase`/`rebaseContinue`/`rebaseSkip`
+ *  (and `rebaseAbort`, where it reports the aborted run). `stopped: true`
+ *  means the rebase is on disk waiting for the user — NOT an error;
+ *  `finished: true` means completed/nothing left. Real failures reject
+ *  with the engine's RPC error instead. */
+export interface RebaseResult {
+  stopped: boolean;
+  finished: boolean;
+  reason?: RebaseStopReason;
+  stopped_sha?: string;
+  msgnum?: number;
+  end?: number;
+}
