@@ -62,16 +62,17 @@ fn handle_editor_invocation() -> Option<i32> {
         } else {
             continue;
         };
-        // Layout: [flag, sidecar, target]. A missing sidecar/target (or a
-        // degenerate "target == sidecar", i.e. no file was appended) is a
-        // malformed invocation: exit non-zero, which makes git cancel the
-        // rebase cleanly.
-        let Some(sidecar) = args.get(i + 1) else {
+        // Exact layout: [flag, sidecar, target] and the flag is at
+        // `args.len() - 3` (git appends exactly one file). Anything else —
+        // extra arguments, a missing sidecar/target, or a degenerate
+        // "target == sidecar" (no file was appended) — is a malformed
+        // invocation: exit non-zero, which makes git cancel the rebase
+        // cleanly.
+        if args.len() != i + 3 {
             return Some(1);
-        };
-        let Some(target) = args.last() else {
-            return Some(1);
-        };
+        }
+        let sidecar = &args[i + 1];
+        let target = &args[i + 2];
         if sidecar == target {
             return Some(1);
         }

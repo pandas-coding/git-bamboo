@@ -349,6 +349,23 @@ impl UndoEngine {
         Ok(())
     }
 
+    /// Rewrite the LATEST committed transaction's post snapshot with the
+    /// current state. Conflict-resolution flows (Stage/ResolveConflict
+    /// during a rebase stop) journal transactions AFTER the StartRebase
+    /// tx; when the rebase then completes, those later post snapshots
+    /// still describe the stopped state and would block undo via the
+    /// same safety check — so the write queue refreshes the latest tx
+    /// alongside the rebase tx. A missing journal (nothing journaled
+    /// yet) is a warn-level no-op.
+    pub fn refresh_latest_post_snapshot(&self) -> anyhow::Result<()> {
+        let transactions = self.read_journal()?;
+        let Some(latest) = transactions.last() else {
+            warn!("no journaled transaction; nothing to refresh");
+            return Ok(());
+        };
+        self.refresh_post_snapshot(latest.id)
+    }
+
     /// Undo a transaction: restore the repository to its pre-write state.
     ///
     /// Safety: the current repository state must match the post-write
@@ -437,13 +454,25 @@ impl UndoEngine {
         // Rebase transactions need extra care: while a rebase is in
         // progress HEAD is detached mid-replay and the branch ref may not
         // have moved back yet, so abort the rebase FIRST (git restores the
-        // pre-rebase branch/worktree state itself — best-effort: a failed
-        // abort is non-fatal, the ref restoration below is still correct,
-        // only the worktree may need manual attention).
+        // pre-rebase branch/worktree state itself). A failed abort is
+        // non-fatal — the ref restoration below is still correct, and the
+        // worktree is recovered via the recorded pre-rebase tip (see
+        // below).
+        //
+        // Also captured BEFORE any restoration: whether the worktree is
+        // clean relative to HEAD. For a COMPLETED rebase the hard reset
+        // below only runs when the worktree was clean — uncommitted user
+        // changes made after the rebase finished must survive the undo
+        // (refs/HEAD/index are still restored; only worktree content is
+        // deliberately left alone).
         let is_rebase = pre.pre_rebase_tip.is_some();
-        if is_rebase && rebase_in_progress_on_disk(&self.git_dir) {
+        let worktree_was_clean = is_rebase && self.worktree_is_clean();
+        let rebase_was_live = is_rebase && rebase_in_progress_on_disk(&self.git_dir);
+        let mut abort_failed = false;
+        if rebase_was_live {
             if let Err(e) = self.run_git(&["rebase", "--abort"]) {
                 warn!(error = %e, "git rebase --abort failed during undo");
+                abort_failed = true;
             }
         }
 
@@ -488,17 +517,50 @@ impl UndoEngine {
         self.restore_head(&pre.head)?;
 
         if is_rebase {
-            // Align worktree + index with the RESTORED HEAD (which is the
-            // pre-rebase state after the ref/head restoration above — not
-            // a recorded sha, the branch may legitimately have been the
-            // non-checked-out one). The whole point of undoing a rebase is
-            // restoring content, not only refs.
-            if let Err(e) = self.run_git(&["reset", "--hard"]) {
-                warn!(error = %e, "git reset --hard failed during rebase undo");
+            if rebase_was_live && abort_failed {
+                // git's abort failed to restore the worktree: fall back to
+                // the journaled pre-rebase tip (authoritative — ORIG_HEAD
+                // is overwritten by mid-rebase resets and documented as
+                // unreliable). Refs/HEAD were already restored above, so
+                // this only realigns worktree content.
+                if let Some(tip) = &pre.pre_rebase_tip {
+                    if let Err(e) = self.run_git(&["reset", "--hard", tip]) {
+                        warn!(error = %e, "git reset --hard failed during rebase undo");
+                    }
+                }
+            } else if rebase_was_live {
+                // git's --abort already realigned worktree + index with the
+                // restored refs — nothing more to do.
+            } else if worktree_was_clean {
+                // Completed rebase, clean worktree: align worktree + index
+                // with the RESTORED HEAD (which is the pre-rebase state
+                // after the ref/head restoration above — not a recorded
+                // sha, the branch may legitimately have been the
+                // non-checked-out one). The whole point of undoing a
+                // rebase is restoring content, not only refs.
+                if let Err(e) = self.run_git(&["reset", "--hard"]) {
+                    warn!(error = %e, "git reset --hard failed during rebase undo");
+                }
+            } else {
+                // Completed rebase, DIRTY worktree: uncommitted changes
+                // survive the undo (documented: undo restores refs, HEAD
+                // and index, not the user's uncommitted work).
+                warn!(
+                    "skipping worktree reset during rebase undo: worktree has uncommitted changes"
+                );
             }
         }
 
         Ok(restored_refs)
+    }
+
+    /// Whether the worktree + index are clean relative to HEAD
+    /// (`git status --porcelain` empty). Best-effort: on git failure the
+    /// answer is "dirty" (the conservative branch — keeps user changes).
+    fn worktree_is_clean(&self) -> bool {
+        self.run_git_capture(&["status", "--porcelain"])
+            .map(|out| out.trim().is_empty())
+            .unwrap_or(false)
     }
 
     fn restore_head(&self, head: &str) -> anyhow::Result<()> {

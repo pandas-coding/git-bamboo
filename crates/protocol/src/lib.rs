@@ -661,20 +661,38 @@ pub enum RebaseBackend {
     Apply,
 }
 
-/// One parsed todo entry of a `getRebaseStatus` read (from the `done` or
-/// the remaining `git-rebase-todo` lines).
+/// One line of a `getRebaseStatus` todo list (`done` / remaining
+/// `git-rebase-todo`): either a parsed pick-like entry, or a line the
+/// parser does not recognize (`label`, `exec`, `reset`, `merge`,
+/// `break`, `noop`, `update-ref`, malformed lines, ...) kept verbatim —
+/// never interpreted, never dropped.
+///
+/// UNTRUSTED DATA: subjects and raw lines originate from the repository's
+/// commit messages (todo files are generated from them), so a malicious
+/// clone can put arbitrary text here. UI consumers must treat every
+/// string as plain text (escape on render, no HTML/markdown interpolation).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RebaseStatusEntry {
-    pub action: RebaseAction,
-    pub id: String,
-    pub subject: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RebaseStatusEntry {
+    /// A parsed `<action> <sha> <subject>` line.
+    Entry {
+        action: RebaseAction,
+        id: String,
+        subject: String,
+    },
+    /// A passthrough line, verbatim.
+    Raw {
+        line: String,
+    },
 }
 
 /// `getRebaseStatus` result: the direct mapping of the on-disk rebase
-/// state (all fields `None`/empty in the idle case). Raw `done` /
-/// `remaining` lines are kept verbatim (they may contain `label`/`exec`/
-/// ... lines the parser passes through rather than drops); the parsed
-/// `*_entries` lists contain only pick-like entries.
+/// state (all fields `None`/empty in the idle case). `done` / `remaining`
+/// carry the todo lists once: each line is either a parsed entry or a
+/// verbatim passthrough line (see [`RebaseStatusEntry`]).
+///
+/// UNTRUSTED DATA: these strings mirror repo content (commit subjects);
+/// escape before rendering anywhere.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GetRebaseStatusResult {
     pub state: RebaseRunState,
@@ -699,18 +717,12 @@ pub struct GetRebaseStatusResult {
     pub msgnum: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<u32>,
-    /// Raw lines of the `done` file (already-replayed todo entries).
+    /// The already-replayed todo lines (`done` file).
     #[serde(default)]
-    pub done: Vec<String>,
-    /// Raw lines of `git-rebase-todo` (not yet replayed).
+    pub done: Vec<RebaseStatusEntry>,
+    /// The not-yet-replayed todo lines (`git-rebase-todo`).
     #[serde(default)]
-    pub remaining: Vec<String>,
-    /// Parsed pick-like entries of `done`.
-    #[serde(default)]
-    pub done_entries: Vec<RebaseStatusEntry>,
-    /// Parsed pick-like entries of `git-rebase-todo`.
-    #[serde(default)]
-    pub remaining_entries: Vec<RebaseStatusEntry>,
+    pub remaining: Vec<RebaseStatusEntry>,
 }
 
 /// `startRebase` request: execute an interactive rebase with an
@@ -749,16 +761,12 @@ pub enum RebaseStopReason {
 /// `rebaseSkip`. A stop is NORMAL semantics, not an error: `stopped: true`
 /// means the rebase is on disk waiting for the user (with `reason`,
 /// `stopped_sha`, `msgnum` and `end` describing the stop); `stopped: false`
-/// with `finished: true` means the rebase ran to completion (or there was
+/// means the rebase is no longer in progress (completed, aborted, or
 /// nothing left to continue — the idempotent double-click case). Real
 /// failures (invalid refs, git crashing) surface as GIT_ERROR.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RebaseResult {
     pub stopped: bool,
-    /// The rebase is no longer in progress (completed, aborted, or nothing
-    /// left to continue).
-    #[serde(default)]
-    pub finished: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<RebaseStopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

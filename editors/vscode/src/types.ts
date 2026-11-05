@@ -278,17 +278,23 @@ export type RebaseRunState = 'idle' | 'stopped' | 'running';
 /** Rebase backend in use, per `getRebaseStatus` (omitted when idle). */
 export type RebaseBackend = 'merge' | 'apply';
 
-/** One parsed todo entry of the engine's `getRebaseStatus` result. */
-export interface RebaseStatusEntry {
-  action: RebaseAction;
-  id: string;
-  subject: string;
-}
+/** One entry of the engine's `getRebaseStatus` result, tagged on the
+ *  wire (`kind`):
+ *  - `entry`: a parsed pick-like todo line (comments and blank lines are
+ *    dropped by the engine);
+ *  - `raw`: any other non-empty todo line (labels, `exec`, `break`,
+ *    `merge`, unknown syntax), passed through verbatim so status views
+ *    never lose information.
+ *  UNTRUSTED DATA: subjects and raw lines originate in the repository's
+ *  todo files; treat them as plain text (no markup interpretation). */
+export type RebaseStatusEntry =
+  | { kind: 'entry'; action: RebaseAction; id: string; subject: string }
+  | { kind: 'raw'; line: string };
 
 /** Result of the engine's `getRebaseStatus` RPC. `done`/`remaining` are
- *  the raw todo lines (comments included in `done`); `*_entries` are the
- *  engine's parsed views of the same lists. Optional fields are omitted
- *  by the engine when unknown or not applicable (e.g. when idle). */
+ *  the parsed (and raw-passthrough) views of git's todo files; blank and
+ *  comment lines are dropped. Optional fields are omitted by the engine
+ *  when unknown or not applicable (e.g. when idle). */
 export interface GetRebaseStatusResult {
   state: RebaseRunState;
   backend?: RebaseBackend;
@@ -298,10 +304,8 @@ export interface GetRebaseStatusResult {
   stopped_sha?: string;
   msgnum?: number;
   end?: number;
-  done: string[];
-  remaining: string[];
-  done_entries: RebaseStatusEntry[];
-  remaining_entries: RebaseStatusEntry[];
+  done: RebaseStatusEntry[];
+  remaining: RebaseStatusEntry[];
 }
 
 /** Why a rebase stopped: a merge conflict, or a `reword` waiting for the
@@ -311,11 +315,11 @@ export type RebaseStopReason = 'conflict' | 'reword_stop';
 /** Result of the engine's `startRebase`/`rebaseContinue`/`rebaseSkip`
  *  (and `rebaseAbort`, where it reports the aborted run). `stopped: true`
  *  means the rebase is on disk waiting for the user — NOT an error;
- *  `finished: true` means completed/nothing left. Real failures reject
- *  with the engine's RPC error instead. */
+ *  `stopped: false` means completed/nothing left (`!stopped` IS the
+ *  finished state). Real failures reject with the engine's RPC error
+ *  instead. */
 export interface RebaseResult {
   stopped: boolean;
-  finished: boolean;
   reason?: RebaseStopReason;
   stopped_sha?: string;
   msgnum?: number;

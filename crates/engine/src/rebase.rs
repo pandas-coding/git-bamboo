@@ -26,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bamboo_protocol::{
@@ -139,7 +140,15 @@ pub(crate) fn parse_todo_line(line: &str) -> ParsedTodoLine {
     let (Some(word), Some(id)) = (parts.next(), parts.next()) else {
         return ParsedTodoLine::Other(line.to_string());
     };
-    let subject = parts.next().unwrap_or("").to_string();
+    let mut subject = parts.next().unwrap_or("");
+    // git >=2.44 writes `<action> <sha> # <subject>` (the subject sits
+    // behind a comment marker); strip it so status subjects do not leak
+    // the marker. `core.commentChar` overrides are a documented
+    // limitation — only `#` is handled.
+    if let Some(stripped) = subject.strip_prefix('#') {
+        subject = stripped.trim_start();
+    }
+    let subject = subject.to_string();
     match parse_action_word(word) {
         // A pick-like line must carry a hex id; `exec <cmd>` lines share
         // the word shape with nothing (no clash with the six action words),
@@ -183,7 +192,9 @@ pub(crate) fn is_valid_todo_id(id: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Filter raw todo lines into parsed pick-like status entries.
+/// Map raw todo lines to status entries: pick-like lines parse, other
+/// non-empty lines pass through verbatim (blank/comment lines carry no
+/// status value and are dropped).
 pub(crate) fn parse_status_entries(lines: &[String]) -> Vec<RebaseStatusEntry> {
     lines
         .iter()
@@ -192,60 +203,40 @@ pub(crate) fn parse_status_entries(lines: &[String]) -> Vec<RebaseStatusEntry> {
                 action,
                 id,
                 subject,
-            } => Some(RebaseStatusEntry {
-                action,
-                id,
-                subject,
-            }),
-            _ => None,
+            } => Some(RebaseStatusEntry::Entry { action, id, subject }),
+            ParsedTodoLine::Other(raw) => Some(RebaseStatusEntry::Raw { line: raw }),
+            ParsedTodoLine::Empty => None,
         })
         .collect()
+}
+
+/// Whether a just-read status describes an on-disk rebase (used by the
+/// write queue's start/step guards).
+pub(crate) fn is_in_progress(status: &GetRebaseStatusResult) -> bool {
+    status.state != RebaseRunState::Idle
 }
 
 // ---------------------------------------------------------------------------
 // In-progress state detection (getRebaseStatus)
 // ---------------------------------------------------------------------------
 
-/// Raw in-progress rebase state, read best-effort from the gitdir.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RebaseStateInternal {
-    pub backend: Option<RebaseBackend>,
-    pub branch: Option<String>,
-    pub onto: Option<String>,
-    pub orig_head: Option<String>,
-    pub stopped_sha: Option<String>,
-    pub msgnum: Option<u32>,
-    pub end: Option<u32>,
-    pub done: Vec<String>,
-    pub remaining: Vec<String>,
-    /// A stop marker was found (stopped-sha file / REBASE_HEAD): the
-    /// rebase is waiting for the user rather than actively replaying.
-    pub stopped: bool,
-}
-
-impl RebaseStateInternal {
-    /// A rebase state dir exists on disk.
-    pub fn in_progress(&self) -> bool {
-        self.backend.is_some()
-    }
-}
-
 /// Read the in-progress rebase state from the gitdir (rebase-merge first,
-/// then rebase-apply). Best-effort: individual missing/unreadable fields
-/// are `None`/empty, matching how GitLens-style clients treat the same
-/// files. One git subprocess at most (REBASE_HEAD fallback for the
-/// stopped sha when the stopped-sha file is absent).
-pub(crate) fn read_rebase_state(
-    repo_path: &Path,
-    git_dir: &Path,
-) -> RebaseStateInternal {
+/// then rebase-apply) directly as the protocol result. Best-effort:
+/// individual missing/unreadable fields are `None`/empty, matching how
+/// GitLens-style clients treat the same files. One git subprocess at most
+/// (REBASE_HEAD fallback for the stopped sha when the stopped-sha file is
+/// absent).
+pub(crate) fn read_rebase_state(repo_path: &Path, git_dir: &Path) -> GetRebaseStatusResult {
     let merge_dir = git_dir.join("rebase-merge");
     let apply_dir = git_dir.join("rebase-apply");
     if !merge_dir.is_dir() && !apply_dir.is_dir() {
-        return RebaseStateInternal::default();
+        return GetRebaseStatusResult::default();
     }
 
-    let mut state = RebaseStateInternal::default();
+    let mut state = GetRebaseStatusResult {
+        state: RebaseRunState::Running,
+        ..Default::default()
+    };
     if merge_dir.is_dir() {
         state.backend = Some(RebaseBackend::Merge);
         state.branch = short_branch(read_trimmed(&merge_dir.join("head-name")));
@@ -254,8 +245,8 @@ pub(crate) fn read_rebase_state(
         state.msgnum = read_trimmed(&merge_dir.join("msgnum")).and_then(|s| s.parse().ok());
         state.end = read_trimmed(&merge_dir.join("end")).and_then(|s| s.parse().ok());
         state.stopped_sha = read_trimmed(&merge_dir.join("stopped-sha"));
-        state.done = read_lines(&merge_dir.join("done"));
-        state.remaining = read_lines(&merge_dir.join("git-rebase-todo"));
+        state.done = parse_status_entries(&read_lines(&merge_dir.join("done")));
+        state.remaining = parse_status_entries(&read_lines(&merge_dir.join("git-rebase-todo")));
     } else {
         // Legacy am-based backend: `next`/`last` are the msgnum/end
         // equivalents; there is no todo, so done/remaining stay empty.
@@ -275,9 +266,49 @@ pub(crate) fn read_rebase_state(
     }
     // The apply backend only exists while waiting for the user (git am /
     // rebase -m conflicts); the merge backend is "stopped" when a stop
-    // marker exists, "running" when the dir is present without one.
-    state.stopped = state.stopped_sha.is_some() || state.backend == Some(RebaseBackend::Apply);
+    // marker exists (including the REBASE_HEAD fallback above),
+    // "running" when the dir is present without one.
+    if state.stopped_sha.is_some() || state.backend == Some(RebaseBackend::Apply) {
+        state.state = RebaseRunState::Stopped;
+    }
     state
+}
+
+/// The branch name a `branch: null` rebase/plan operates on: the current
+/// HEAD branch. Detached HEAD is rejected — git can rebase a detached
+/// HEAD, but the undo story (branch tip restore) needs a branch. Shared
+/// by getRebasePlan and startRebase; `context` prefixes the error.
+pub(crate) fn current_branch_name(git_dir: &Path, context: &str) -> anyhow::Result<String> {
+    let raw = fs::read_to_string(git_dir.join("HEAD"))?;
+    let raw = raw.trim();
+    raw.strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
+        .ok_or_else(|| {
+            BambooError::invalid_argument(format!(
+                "{context}: HEAD is detached; pass an explicit branch"
+            ))
+            .into()
+        })
+}
+
+/// Resolve a revision to a commit id (engine-side, no subprocess).
+/// Shared by getRebasePlan and startRebase; `context` prefixes the
+/// errors, which map to GIT_ERROR (a bad ref is not the client's input
+/// shape — unless a caller downcasts, like getRebasePlan's branch arm).
+pub(crate) fn resolve_rev_commit(
+    repo: &gix::Repository,
+    rev: &str,
+    context: &str,
+) -> anyhow::Result<gix::ObjectId> {
+    let obj = repo
+        .rev_parse_single(rev.as_bytes())
+        .map_err(|_| BambooError::git_error(format!("{context}: {rev:?} does not resolve")))?
+        .object()
+        .map_err(|_| BambooError::git_error(format!("{context}: {rev:?} does not resolve")))?;
+    let commit = obj
+        .peel_to_commit()
+        .map_err(|_| BambooError::git_error(format!("{context}: {rev:?} is not a commit")))?;
+    Ok(commit.id)
 }
 
 /// `git rev-parse --quiet --verify REBASE_HEAD` (empty when it doesn't
@@ -333,34 +364,6 @@ fn read_lines(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Map the raw state to the protocol `getRebaseStatus` result.
-pub(crate) fn rebase_status_result(state: &RebaseStateInternal) -> GetRebaseStatusResult {
-    if !state.in_progress() {
-        return GetRebaseStatusResult {
-            state: RebaseRunState::Idle,
-            ..Default::default()
-        };
-    }
-    GetRebaseStatusResult {
-        state: if state.stopped {
-            RebaseRunState::Stopped
-        } else {
-            RebaseRunState::Running
-        },
-        backend: state.backend,
-        branch: state.branch.clone(),
-        onto: state.onto.clone(),
-        orig_head: state.orig_head.clone(),
-        stopped_sha: state.stopped_sha.clone(),
-        msgnum: state.msgnum,
-        end: state.end,
-        done: state.done.clone(),
-        remaining: state.remaining.clone(),
-        done_entries: parse_status_entries(&state.done),
-        remaining_entries: parse_status_entries(&state.remaining),
-    }
-}
-
 /// Classify why a rebase stopped: unresolved index entries → conflict,
 /// anything else (message editing etc.) → reword_stop.
 pub(crate) fn classify_stop_reason(has_unmerged: bool) -> RebaseStopReason {
@@ -389,6 +392,12 @@ pub(crate) struct ChainCommit {
 /// `merge-base..branch` in REPLAY ORDER (oldest → newest, parents before
 /// children — a deterministic topological sort, matching what
 /// `git rebase` itself would list in the todo).
+///
+/// Merge commits are EXCLUDED: git's default rebase todo never contains
+/// them (linear replay; `--rebase-merges` is out of Phase 1 scope), and a
+/// `pick <merge>` line makes git refuse the whole todo. The exclusion
+/// applies to the plan AND the freshness set, so clients building a todo
+/// from `getRebasePlan` can never wedge the rebase on a merge.
 ///
 /// Returns `None` when the two commits share no common ancestor (git's
 /// rebase would refuse the same way).
@@ -443,6 +452,13 @@ pub(crate) fn rebase_chain(
             .unwrap_or(0);
         let subject = String::from_utf8_lossy(&decoded.message_summary()).into_owned();
         let parent_ids = decoded.parents().map(|p| p.to_string()).collect::<Vec<_>>();
+        if parent_ids.len() > 1 {
+            // Merge commit: not replayable by a linear todo (see the doc
+            // comment above). Its children keep walking — a child whose
+            // parent is an excluded merge simply has no in-set parent
+            // edge, exactly like a parent below the merge base.
+            continue;
+        }
         by_id.insert(id.to_string(), commits.len());
         commits.push(ChainCommit {
             id: id.to_string(),
@@ -521,22 +537,64 @@ pub(crate) fn messages_sidecar_path(git_dir: &Path) -> PathBuf {
     sidecar_dir(git_dir).join("messages.sidecar")
 }
 
+/// Run marker: the full pre-rebase branch tip recorded when the engine
+/// started the rebase. The message editor compares it with git's own
+/// `rebase-merge/orig-head` so a STALE sidecar from an earlier
+/// (aborted-in-place) rebase can never rewrite the messages of a later
+/// run that happens to replay a commit with the same sha.
+fn run_sidecar_path(git_dir: &Path) -> PathBuf {
+    sidecar_dir(git_dir).join("run.sidecar")
+}
+
 /// Remove the sidecar dir (after the rebase finished/aborted). Best-effort.
 pub(crate) fn cleanup_sidecars(git_dir: &Path) {
     let _ = fs::remove_dir_all(sidecar_dir(git_dir));
 }
 
-/// Write both sidecars. The todo sidecar holds the serialized todo; the
+/// Create the sidecar dir engine-private (0700 on unix).
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Write a sidecar privately (0600 on unix) WITHOUT following a
+/// pre-planted symlink: remove the existing entry first (removes the
+/// symlink itself, not its target), then create exclusively — a
+/// concurrent creator loses the race with an error instead of clobbering.
+fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let _ = fs::remove_file(path);
+    let mut file = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Write the sidecars. The todo sidecar holds the serialized todo; the
 /// message sidecar maps `<full-sha> <message>` lines for the
-/// reword/squash commits with custom messages.
+/// reword/squash commits with custom messages; the run sidecar records
+/// the pre-rebase tip for the stale-run gate (see `run_sidecar_path`).
 pub(crate) fn write_sidecars(
     git_dir: &Path,
     todo: &[TodoLine],
     messages: &HashMap<String, String>,
+    run_tip: &str,
 ) -> anyhow::Result<()> {
     let dir = sidecar_dir(git_dir);
-    fs::create_dir_all(&dir)?;
-    fs::write(todo_sidecar_path(git_dir), serialize_todo(todo))?;
+    create_private_dir(&dir)?;
+    write_private(&todo_sidecar_path(git_dir), &serialize_todo(todo))?;
+    write_private(&run_sidecar_path(git_dir), run_tip.as_bytes())?;
     let mut msg_data = String::new();
     for (sha, message) in messages {
         // Messages are pre-validated: single paragraph, no newlines, so
@@ -546,18 +604,22 @@ pub(crate) fn write_sidecars(
         msg_data.push_str(message);
         msg_data.push('\n');
     }
-    fs::write(messages_sidecar_path(git_dir), msg_data)?;
+    write_private(&messages_sidecar_path(git_dir), msg_data.as_bytes())?;
     Ok(())
 }
 
 /// The executable to re-invoke for the editor modes. Normally the engine
 /// itself (`current_exe`); overridable so integration tests can point the
 /// editor at the real engine binary — the test binary's own main cannot
-/// handle the editor flags.
+/// handle the editor flags. The override is debug-build-only: a
+/// production engine must never honor an environment hook that decides
+/// which binary git executes as the rebase editor.
 pub(crate) fn internal_editor_exe() -> anyhow::Result<PathBuf> {
-    if let Ok(exe) = std::env::var("BAMBOO_ENGINE_EDITOR_EXE") {
-        if !exe.is_empty() {
-            return Ok(PathBuf::from(exe));
+    if cfg!(debug_assertions) {
+        if let Ok(exe) = std::env::var("BAMBOO_ENGINE_EDITOR_EXE") {
+            if !exe.is_empty() {
+                return Ok(PathBuf::from(exe));
+            }
         }
     }
     std::env::current_exe().map_err(|e| anyhow::anyhow!("failed to resolve engine exe: {e}"))
@@ -604,14 +666,37 @@ pub(crate) fn message_editor_value(git_dir: &Path) -> anyhow::Result<String> {
     ))
 }
 
+/// Containment check for the editor self-invocation modes: the file to
+/// edit (and the sidecar) must live inside the gitdir — git only ever
+/// passes paths there. Defense in depth: today these modes are only
+/// reachable by a local process with argv control over the engine binary,
+/// but the modes must not be an arbitrary-file-write primitive in case
+/// reachability ever widens.
+fn resolve_inside_git_dir(git_dir: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|e| anyhow::anyhow!("cannot resolve editor path {path:?}: {e}"))?;
+    let base = fs::canonicalize(git_dir)
+        .map_err(|e| anyhow::anyhow!("cannot resolve git dir: {e}"))?;
+    if !resolved.starts_with(&base) {
+        anyhow::bail!("editor path {path:?} is outside the git directory");
+    }
+    Ok(resolved)
+}
+
 /// Implementation of `--internal-sequence-editor`: copy the validated
 /// sidecar over git's freshly generated `git-rebase-todo`, byte-exact.
 /// Exit 0 = git proceeds with OUR todo; a non-zero exit makes git cancel
 /// the rebase cleanly (the engine treats that as a hard error).
 pub fn run_sequence_editor(sidecar: &str, todo_target: &str) -> i32 {
     let result: anyhow::Result<()> = (|| {
-        let data = fs::read(sidecar)?;
-        fs::write(todo_target, data)?;
+        // git runs the editor with cwd = worktree root; both paths must
+        // resolve inside that worktree's gitdir.
+        let repo_path = std::env::current_dir()?;
+        let git_dir = crate::gitdir::resolve_git_dir(&repo_path);
+        let sidecar = resolve_inside_git_dir(&git_dir, sidecar)?;
+        let target = resolve_inside_git_dir(&git_dir, todo_target)?;
+        let data = fs::read(&sidecar)?;
+        fs::write(&target, data)?;
         Ok(())
     })();
     match result {
@@ -625,54 +710,95 @@ pub fn run_sequence_editor(sidecar: &str, todo_target: &str) -> i32 {
 
 /// Implementation of `--internal-message-editor`: git has stopped with
 /// COMMIT_EDITMSG open (reword/squash message editing). If the stopped
-/// commit has a custom message in the sidecar, replace COMMIT_EDITMSG's
-/// content with it; otherwise exit 0 without touching the file (git's own
-/// message — the original for reword, the folded combination for squash —
-/// is kept, so the editor is a no-op pass-through).
+/// commit has a custom message in the sidecar of THIS rebase run, replace
+/// COMMIT_EDITMSG's content with it; otherwise exit 0 without touching
+/// the file (git's own message — the original for reword, the folded
+/// combination for squash — is kept, so the editor is a no-op
+/// pass-through).
+///
+/// Two gates protect the write: (1) the run marker — the sidecar is only
+/// honored when its recorded pre-rebase tip matches git's
+/// `rebase-merge/orig-head`, so a stale sidecar from an earlier,
+/// aborted-in-place rebase never rewrites a later run's messages; and
+/// (2) re-validation — the message is checked against the same rules as
+/// the original RPC (a tampered sidecar cannot smuggle an unbounded or
+/// control-character-bearing message into a commit).
 ///
 /// git runs editors with cwd = worktree root, so the gitdir is resolved
-/// from cwd to read `rebase-merge/stopped-sha`.
+/// from cwd.
 pub fn run_message_editor(sidecar: &str, commit_editmsg: &str) -> i32 {
-    let lookup = read_message_sidecar(sidecar);
-    let repo_path = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("bamboo: message editor failed to resolve cwd: {e}");
-            return 1;
+    let result: anyhow::Result<()> = (|| {
+        let repo_path = std::env::current_dir()?;
+        let git_dir = crate::gitdir::resolve_git_dir(&repo_path);
+        let messages = match sidecar_matches_current_run(&git_dir, sidecar) {
+            true => read_message_sidecar(sidecar),
+            false => None,
+        };
+        let stopped_sha = read_trimmed(&git_dir.join("rebase-merge").join("stopped-sha"))
+            .or_else(|| stopped_sha_from_done(&git_dir))
+            .or_else(|| resolve_rebase_head(&repo_path));
+        let custom_message = match (&stopped_sha, &messages) {
+            (Some(sha), Some(messages)) => messages.get(sha).cloned(),
+            _ => None,
+        };
+        if let Some(message) = custom_message {
+            // Re-validate at consumption time: the sidecar file — not the
+            // long-gone RPC request — is the source of truth here.
+            validate_rebase_message(&message)?;
+            let target = resolve_inside_git_dir(&git_dir, commit_editmsg)?;
+            // Byte-exact: the validated single-paragraph message plus the
+            // trailing newline git expects.
+            fs::write(&target, format!("{message}\n"))?;
         }
-    };
-    let git_dir = crate::gitdir::resolve_git_dir(&repo_path);
-    let stopped_sha = read_trimmed(&git_dir.join("rebase-merge").join("stopped-sha"))
-        .or_else(|| stopped_sha_from_done(&git_dir))
-        .or_else(|| resolve_rebase_head(&repo_path));
-    let custom_message = match (&stopped_sha, &lookup) {
-        (Some(sha), Some(messages)) => messages.get_line(sha).cloned(),
-        _ => None,
-    };
-    if let Some(message) = custom_message {
-        // Byte-exact: the validated single-paragraph message plus the
-        // trailing newline git expects.
-        if let Err(e) = fs::write(commit_editmsg, format!("{message}\n")) {
-            eprintln!("bamboo: message editor failed to write {commit_editmsg}: {e}");
-            return 1;
+        // No custom message (or no stopped sha): pass git's message
+        // through untouched.
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("bamboo: message editor failed: {e:#}");
+            1
         }
     }
-    // No custom message (or no stopped sha): pass git's message through.
-    0
+}
+
+/// The stale-run gate: the sidecar's run marker must equal git's own
+/// `rebase-merge/orig-head` (both record the branch tip at rebase
+/// start). Any mismatch — including a missing marker (externally
+/// started rebase) or a missing orig-head — disables custom messages
+/// (pass-through), never fails the rebase.
+fn sidecar_matches_current_run(git_dir: &Path, sidecar: &str) -> bool {
+    let run_tip = read_trimmed(&git_dir.join("bamboo").join("rebase").join("run.sidecar"));
+    let orig_head = read_trimmed(&git_dir.join("rebase-merge").join("orig-head"));
+    let marker_ok = match (run_tip, orig_head) {
+        (Some(run_tip), Some(orig_head)) => {
+            if run_tip == orig_head {
+                true
+            } else {
+                eprintln!(
+                    "bamboo: ignoring stale message sidecar (run marker does not match \
+                     the current rebase)"
+                );
+                false
+            }
+        }
+        _ => false,
+    };
+    marker_ok && sidecar_is_regular_file(sidecar)
+}
+
+/// Reject a non-regular sidecar (e.g. a symlink planted at the path the
+/// engine passes to git): reading through one would let the sidecar
+/// content come from an arbitrary file.
+fn sidecar_is_regular_file(path: &str) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
 }
 
 /// Parsed `messages.sidecar`: full sha → message.
-struct MessageSidecar {
-    entries: HashMap<String, String>,
-}
-
-impl MessageSidecar {
-    fn get_line(&self, sha: &str) -> Option<&String> {
-        self.entries.get(sha)
-    }
-}
-
-fn read_message_sidecar(path: &str) -> Option<MessageSidecar> {
+fn read_message_sidecar(path: &str) -> Option<HashMap<String, String>> {
     let content = fs::read_to_string(path).ok()?;
     let mut entries = HashMap::new();
     for line in content.lines() {
@@ -680,7 +806,7 @@ fn read_message_sidecar(path: &str) -> Option<MessageSidecar> {
             entries.insert(sha.to_string(), message.to_string());
         }
     }
-    Some(MessageSidecar { entries })
+    Some(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -775,4 +901,152 @@ pub(crate) fn build_validated_todo(
         .into());
     }
     Ok((lines, messages))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (integration flows live in tests/engine_tests.rs)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(action: RebaseAction, id: &str, subject: &str) -> ParsedTodoLine {
+        ParsedTodoLine::Entry {
+            action,
+            id: id.to_string(),
+            subject: subject.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_full_words_and_abbreviations() {
+        // Full words and git's one-letter abbreviations
+        // (rebase.abbreviateCommands), any hex id length 4-64.
+        for (word, action) in [
+            ("pick", RebaseAction::Pick),
+            ("p", RebaseAction::Pick),
+            ("reword", RebaseAction::Reword),
+            ("r", RebaseAction::Reword),
+            ("squash", RebaseAction::Squash),
+            ("s", RebaseAction::Squash),
+            ("fixup", RebaseAction::Fixup),
+            ("f", RebaseAction::Fixup),
+            ("drop", RebaseAction::Drop),
+            ("d", RebaseAction::Drop),
+            ("edit", RebaseAction::Edit),
+            ("e", RebaseAction::Edit),
+        ] {
+            assert_eq!(
+                parse_todo_line(&format!("{word} 0123456789abcdef f2 subject")),
+                entry(action, "0123456789abcdef", "f2 subject"),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_strips_comment_marker_from_subject() {
+        // git >=2.44 writes `<action> <sha> # <subject>`.
+        assert_eq!(
+            parse_todo_line("pick 0123456789abcdef # f2 subject"),
+            entry(RebaseAction::Pick, "0123456789abcdef", "f2 subject")
+        );
+        assert_eq!(parse_todo_line("p abcd # "), entry(RebaseAction::Pick, "abcd", ""));
+    }
+
+    #[test]
+    fn parse_passes_through_non_entry_lines() {
+        // Unsupported todo syntax passes through verbatim (never dropped,
+        // never interpreted).
+        for line in [
+            "label onto-main",
+            "reset onto",
+            "merge -C abc other",
+            "exec make test",
+            "break",
+            "noop",
+            "update-ref refs/heads/x",
+            "pick not-hex subject",
+            "completely unknown syntax",
+        ] {
+            assert_eq!(
+                parse_todo_line(line),
+                ParsedTodoLine::Other(line.to_string()),
+                "{line}"
+            );
+        }
+        // Blank and comment lines are empty.
+        assert_eq!(parse_todo_line(""), ParsedTodoLine::Empty);
+        assert_eq!(parse_todo_line("   "), ParsedTodoLine::Empty);
+        assert_eq!(parse_todo_line("# comment"), ParsedTodoLine::Empty);
+    }
+
+    #[test]
+    fn parse_status_entries_maps_lines_to_protocol_entries() {
+        let lines = vec![
+            "pick 0123456789abcdef # f1".to_string(),
+            "exec make".to_string(),
+            "# ignored".to_string(),
+            "drop fedcba9876543210 f3".to_string(),
+        ];
+        assert_eq!(
+            parse_status_entries(&lines),
+            vec![
+                RebaseStatusEntry::Entry {
+                    action: RebaseAction::Pick,
+                    id: "0123456789abcdef".to_string(),
+                    subject: "f1".to_string(),
+                },
+                RebaseStatusEntry::Raw {
+                    line: "exec make".to_string(),
+                },
+                RebaseStatusEntry::Entry {
+                    action: RebaseAction::Drop,
+                    id: "fedcba9876543210".to_string(),
+                    subject: "f3".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn serialize_todo_is_line_exact() {
+        let todo = vec![TodoLine {
+            action: RebaseAction::Squash,
+            id: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            subject: "fold these".to_string(),
+        }];
+        assert_eq!(
+            serialize_todo(&todo),
+            b"squash 0123456789abcdef0123456789abcdef01234567 fold these\n".to_vec()
+        );
+        assert_eq!(serialize_todo(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn todo_id_validation_bounds() {
+        assert!(is_valid_todo_id(&"a".repeat(40)));
+        assert!(is_valid_todo_id(&"a".repeat(64)));
+        assert!(!is_valid_todo_id(&"a".repeat(39))); // too short for client ids
+        assert!(!is_valid_todo_id(&"A".repeat(40))); // uppercase
+        assert!(is_hex_id("abcd")); // status-side ids may be abbreviated
+        assert!(!is_hex_id("abc"));
+    }
+
+    #[test]
+    fn read_message_sidecar_maps_sha_to_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.sidecar");
+        std::fs::write(
+            &path,
+            "0123456789abcdef reworded subject\n9876543210fedcba another\n",
+        )
+        .unwrap();
+        let map = read_message_sidecar(path.to_str().unwrap()).unwrap();
+        assert_eq!(map.get("0123456789abcdef").map(String::as_str), Some("reworded subject"));
+        assert_eq!(map.get("9876543210fedcba").map(String::as_str), Some("another"));
+        assert!(!map.contains_key("missing"));
+        assert!(read_message_sidecar(dir.path().join("absent").to_str().unwrap()).is_none());
+    }
 }

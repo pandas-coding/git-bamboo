@@ -9,7 +9,7 @@ use bamboo_protocol::{
 };
 
 use crate::cache::CachedCommit;
-use crate::rebase::{rebase_chain, rebase_status_result, read_rebase_state};
+use crate::rebase::{current_branch_name, read_rebase_state, rebase_chain, resolve_rev_commit};
 use crate::session::Session;
 use crate::write_queue::{redact_credentials, validate_ref_arg};
 
@@ -1407,33 +1407,23 @@ pub fn read_rebase_plan(
     let git_dir = crate::gitdir::resolve_git_dir(&session.repo_path);
     let branch_name = match branch {
         Some(b) => b,
-        None => {
-            let raw = std::fs::read_to_string(git_dir.join("HEAD"))
-                .with_context(|| format!("failed to read {}", git_dir.join("HEAD").display()))?;
-            let raw = raw.trim().to_string();
-            raw.strip_prefix("ref: refs/heads/")
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    BambooError::invalid_argument(
-                        "getRebasePlan: HEAD is detached; there is no current branch",
-                    )
-                })?
-        }
+        None => current_branch_name(&git_dir, "getRebasePlan")?,
     };
 
     let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
-    let onto_id = resolve_rev_commit(&repo, onto)
-        .map_err(|e| BambooError::git_error(format!("getRebasePlan: {e}")))?;
-    let branch_id = repo
-        .rev_parse_single(format!("refs/heads/{branch_name}").as_bytes())
-        .map_err(|_| {
-            BambooError::invalid_argument(format!(
-                "getRebasePlan: branch {branch_name:?} not found"
-            ))
-        })?
-        .object()?
-        .peel_to_commit()?
-        .id;
+    let onto_id = resolve_rev_commit(&repo, onto, "getRebasePlan: onto")?;
+    // A missing/unresolvable branch is a client-input problem, not a git
+    // failure: INVALID_ARGUMENT so the client can prompt.
+    let branch_id = resolve_rev_commit(
+        &repo,
+        &format!("refs/heads/{branch_name}"),
+        "getRebasePlan: branch",
+    )
+    .map_err(|_| {
+        BambooError::invalid_argument(format!(
+            "getRebasePlan: branch {branch_name:?} not found"
+        ))
+    })?;
 
     let Some((base, chain)) = rebase_chain(&repo, onto_id, branch_id)? else {
         return Err(BambooError::invalid_argument(
@@ -1459,17 +1449,7 @@ pub fn read_rebase_plan(
     })
 }
 
-/// Resolve a revision to a commit id via gix (no subprocess).
-fn resolve_rev_commit(repo: &gix::Repository, rev: &str) -> anyhow::Result<gix::ObjectId> {
-    let obj = repo
-        .rev_parse_single(rev.as_bytes())
-        .map_err(|e| anyhow::anyhow!("rev {rev:?} does not resolve: {e}"))?
-        .object()?;
-    let commit = obj
-        .peel_to_commit()
-        .map_err(|e| anyhow::anyhow!("rev {rev:?} is not a commit: {e}"))?;
-    Ok(commit.id)
-}
+
 
 /// `getRebaseStatus`: direct mapping of the on-disk rebase state. Read-only
 /// and session-gated like every other read; detects externally-started
@@ -1477,6 +1457,5 @@ fn resolve_rev_commit(repo: &gix::Repository, rev: &str) -> anyhow::Result<gix::
 pub fn read_rebase_status(
     session: &Session,
 ) -> anyhow::Result<bamboo_protocol::GetRebaseStatusResult> {
-    let state = read_rebase_state(&session.repo_path, &session.git_dir);
-    Ok(rebase_status_result(&state))
+    Ok(read_rebase_state(&session.repo_path, &session.git_dir))
 }

@@ -19,6 +19,7 @@ import type {
   GetRebasePlanResult,
   GetRebaseStatusResult,
   PullStrategy,
+  RebaseAction,
   RebasePlanCommit,
   RebaseResult,
   RebaseStatusEntry,
@@ -627,17 +628,15 @@ function isValidRebasePlanCommit(value: unknown): value is RebasePlanCommit {
 /** Normalize a `getRebaseStatus` response: an unrecognized state degrades
  *  to `idle` (the UI closes the rebase surface), and each field is only
  *  trusted when its typeof matches — optional fields the engine omits
- *  (e.g. everything but the raw line lists when idle) stay undefined. */
+ *  (e.g. everything but the todo lists when idle) stay undefined. */
 function normalizeRebaseStatus(value: unknown): GetRebaseStatusResult {
   const v = isRecord(value) ? value : {};
   const state =
     v.state === 'idle' || v.state === 'stopped' || v.state === 'running' ? v.state : 'idle';
   const result: GetRebaseStatusResult = {
     state,
-    done: stringArray(v.done),
-    remaining: stringArray(v.remaining),
-    done_entries: statusEntries(v.done_entries),
-    remaining_entries: statusEntries(v.remaining_entries),
+    done: statusEntries(v.done),
+    remaining: statusEntries(v.remaining),
   };
   if (v.backend === 'merge' || v.backend === 'apply') result.backend = v.backend;
   if (typeof v.branch === 'string') result.branch = v.branch;
@@ -651,16 +650,26 @@ function normalizeRebaseStatus(value: unknown): GetRebaseStatusResult {
 
 function statusEntries(value: unknown): RebaseStatusEntry[] {
   if (!Array.isArray(value)) return [];
-  return value.filter(
-    (e): e is RebaseStatusEntry =>
-      isRecord(e) &&
-      typeof e.id === 'string' &&
-      typeof e.subject === 'string' &&
-      isRebaseAction(e.action),
-  );
+  return value.map(normalizeStatusEntry).filter((e): e is RebaseStatusEntry => e !== null);
 }
 
-function isRebaseAction(value: unknown): boolean {
+/** One status entry, tagged on the wire: `entry` (parsed pick line) or
+ *  `raw` (verbatim passthrough line). Malformed entries are dropped,
+ *  never guessed at. */
+function normalizeStatusEntry(value: unknown): RebaseStatusEntry | null {
+  if (!isRecord(value)) return null;
+  if (value.kind === 'raw') {
+    return typeof value.line === 'string' ? { kind: 'raw', line: value.line } : null;
+  }
+  if (value.kind === 'entry' && isRebaseAction(value.action)) {
+    return typeof value.id === 'string' && typeof value.subject === 'string'
+      ? { kind: 'entry', action: value.action, id: value.id, subject: value.subject }
+      : null;
+  }
+  return null;
+}
+
+function isRebaseAction(value: unknown): value is RebaseAction {
   return (
     value === 'pick' ||
     value === 'reword' ||
@@ -672,23 +681,19 @@ function isRebaseAction(value: unknown): boolean {
 }
 
 /** Normalize a rebase write-result (`startRebase`/`rebaseContinue`/
- *  `rebaseSkip`/`rebaseAbort`): `stopped`/`finished` degrade to false, and
+ *  `rebaseSkip`/`rebaseAbort`): `stopped` degrades to false (`!stopped`
+ *  IS the finished state — there is no separate `finished` field), and
  *  optional stop fields are only trusted when their typeof matches. */
 function normalizeRebaseResult(value: unknown): RebaseResult {
   const v = isRecord(value) ? value : {};
   const result: RebaseResult = {
     stopped: v.stopped === true,
-    finished: v.finished === true,
   };
   if (v.reason === 'conflict' || v.reason === 'reword_stop') result.reason = v.reason;
   if (typeof v.stopped_sha === 'string') result.stopped_sha = v.stopped_sha;
   if (typeof v.msgnum === 'number') result.msgnum = v.msgnum;
   if (typeof v.end === 'number') result.end = v.end;
   return result;
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((s): s is string => typeof s === 'string') : [];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

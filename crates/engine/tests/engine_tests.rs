@@ -3355,7 +3355,6 @@ async fn start_rebase_drop_and_reorder() -> anyhow::Result<()> {
     todo[1].action = bamboo_protocol::RebaseAction::Drop;
     let result = start_rebase(&session, &sha_of(&dir, "c2")?, todo).await?;
     assert!(!result.stopped);
-    assert!(result.finished);
     assert_eq!(result.reason, None);
 
     // History: c1, c2, f3', f1' (newest first: f1', f3', c2, c1).
@@ -3381,7 +3380,7 @@ async fn start_rebase_reword_keeps_content_and_author() -> anyhow::Result<()> {
     todo[0].action = bamboo_protocol::RebaseAction::Reword;
     todo[0].message = Some("renamed one".to_string());
     let result = start_rebase(&session, &sha_of(&dir, "c2")?, todo).await?;
-    assert!(result.finished);
+    assert!(!result.stopped);
 
     let subjects = subjects(&dir, "feature")?;
     assert_eq!(subjects, vec!["f3", "f2", "renamed one", "c2", "c1"]);
@@ -3399,7 +3398,7 @@ async fn start_rebase_squash_folds_with_custom_message() -> anyhow::Result<()> {
     todo[1].action = bamboo_protocol::RebaseAction::Squash;
     todo[1].message = Some("folded f1 and f2".to_string());
     let result = start_rebase(&session, &sha_of(&dir, "c2")?, todo).await?;
-    assert!(result.finished);
+    assert!(!result.stopped);
 
     // f1+f2 folded into one commit with the custom message, then f3.
     let subjects = subjects(&dir, "feature")?;
@@ -3419,7 +3418,6 @@ async fn start_rebase_conflict_stop_and_continue() -> anyhow::Result<()> {
     let result = start_rebase(&session, "main", feature_todo(&dir)?).await?;
     // The conflict at f1 (shared.txt) is a NORMAL outcome, not an error.
     assert!(result.stopped);
-    assert!(!result.finished);
     assert_eq!(result.reason, Some(bamboo_protocol::RebaseStopReason::Conflict));
     assert_eq!(result.stopped_sha.as_deref(), Some(f1_sha.as_str()));
     assert_eq!(result.msgnum, Some(1));
@@ -3452,7 +3450,6 @@ async fn start_rebase_conflict_stop_and_continue() -> anyhow::Result<()> {
         .await?;
     match outcome {
         bamboo_engine::session::WriteOutcome::Rebase(r) => {
-            assert!(r.finished);
             assert!(!r.stopped);
         }
         _ => anyhow::bail!("expected a rebase result from rebaseContinue"),
@@ -3482,7 +3479,7 @@ async fn rebase_skip_drops_the_stopped_commit() -> anyhow::Result<()> {
         .enqueue_write(bamboo_engine::write_queue::WriteCommand::RebaseSkip)
         .await?;
     match outcome {
-        bamboo_engine::session::WriteOutcome::Rebase(r) => assert!(r.finished),
+        bamboo_engine::session::WriteOutcome::Rebase(r) => assert!(!r.stopped),
         _ => anyhow::bail!("expected a rebase result from rebaseSkip"),
     }
     // f1 was skipped: no f1.txt, and history is f3, f2 on m1.
@@ -3506,7 +3503,6 @@ async fn rebase_abort_restores_the_pre_rebase_state() -> anyhow::Result<()> {
         .await?;
     match outcome {
         bamboo_engine::session::WriteOutcome::Rebase(r) => {
-            assert!(r.finished);
             assert!(!r.stopped);
         }
         _ => anyhow::bail!("expected a rebase result from rebaseAbort"),
@@ -3549,7 +3545,7 @@ async fn undo_restores_after_completed_rebase() -> anyhow::Result<()> {
     let mut todo = feature_todo(&dir)?;
     todo[1].action = bamboo_protocol::RebaseAction::Drop;
     let result = start_rebase(&session, &sha_of(&dir, "c2")?, todo).await?;
-    assert!(result.finished);
+    assert!(!result.stopped);
     assert!(!dir.path().join("f2.txt").exists());
 
     settle().await;
@@ -3573,6 +3569,258 @@ async fn undo_restores_after_completed_rebase() -> anyhow::Result<()> {
     assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), before_tip);
     let head = std::fs::read_to_string(dir.path().join(".git").join("HEAD"))?;
     assert!(head.trim().ends_with("feature"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn start_rebase_rejected_while_rebase_in_progress() -> anyhow::Result<()> {
+    let dir = rebase_repo()?;
+    let session = open_session(&dir).await?;
+
+    // First rebase stops at the f1 conflict.
+    let result = start_rebase(&session, "main", feature_todo(&dir)?).await?;
+    assert!(result.stopped);
+
+    // A second startRebase must be a structured INVALID_ARGUMENT — not a
+    // misclassified "success with stopped: true" of a rebase that never
+    // ran — and must not disturb the in-flight rebase.
+    let epoch_before = session.current_epoch();
+    let err = start_rebase(&session, "main", feature_todo(&dir)?).await.unwrap_err();
+    let err = err
+        .downcast::<bamboo_protocol::BambooError>()
+        .unwrap();
+    assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+    assert!(err.message.contains("already in progress"));
+    // Error paths still invalidate: the rebase command bumped the epoch.
+    assert!(session.current_epoch() > epoch_before);
+
+    // The in-flight rebase is untouched (still stopped, same sha) and its
+    // sidecars were not overwritten.
+    let status = bamboo_engine::gix_read::read_rebase_status(&session)?;
+    assert_eq!(status.state, bamboo_protocol::RebaseRunState::Stopped);
+    assert_eq!(
+        status.stopped_sha.as_deref(),
+        Some(sha_of(&dir, "f1")?.as_str())
+    );
+
+    // The in-flight rebase remains fully operable: abort restores the
+    // pre-rebase state and its journaled undo tx survives (the binding
+    // was not hijacked by the failed second start).
+    let outcome = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::RebaseAbort)
+        .await?;
+    match outcome {
+        bamboo_engine::session::WriteOutcome::Rebase(r) => assert!(!r.stopped),
+        _ => anyhow::bail!("expected a rebase result from rebaseAbort"),
+    }
+    let subjects = subjects(&dir, "feature")?;
+    assert_eq!(subjects, vec!["f3", "f2", "f1", "c2", "c1"]);
+    let entries = session.undo.list_transactions(10)?;
+    // Two journaled txs: the in-flight rebase's, plus the REFUSED start
+    // (journal failed txs too, newest first). The rebase tx is the oldest.
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        session.undo.undo(entries[1].id)?,
+        bamboo_engine::undo::UndoOutcome::Restored { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn start_rebase_rejected_for_externally_started_rebase() -> anyhow::Result<()> {
+    let dir = rebase_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Simulate an externally-started rebase (only git's on-disk state dir;
+    // the engine has no tx binding for it).
+    let merge_dir = dir.path().join(".git").join("rebase-merge");
+    std::fs::create_dir_all(&merge_dir)?;
+    std::fs::write(merge_dir.join("head-name"), "refs/heads/feature")?;
+    std::fs::write(merge_dir.join("onto"), sha_of(&dir, "c2")?)?;
+
+    let err = start_rebase(&session, "main", feature_todo(&dir)?).await.unwrap_err();
+    let err = err
+        .downcast::<bamboo_protocol::BambooError>()
+        .unwrap();
+    assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+    assert!(err.message.contains("already in progress"));
+
+    // No sidecars were written for the refused start (a stale todo/marker
+    // would otherwise leak into the external rebase run).
+    assert!(!dir.path().join(".git").join("bamboo").join("rebase").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_works_after_conflict_resolution_and_continue() -> anyhow::Result<()> {
+    let dir = rebase_repo()?;
+    let session = open_session(&dir).await?;
+    let before_tip = sha_of(&dir, "f3")?;
+
+    // Conflict stop at f1.
+    let result = start_rebase(&session, "main", feature_todo(&dir)?).await?;
+    assert!(result.stopped);
+
+    // Resolve through a JOURNALED Stage: its post snapshot freezes the
+    // stopped-rebase state — the exact undo-safety hazard this test pins.
+    std::fs::write(dir.path().join("shared.txt"), "resolved\n")?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
+            "shared.txt".to_string(),
+        ]))
+        .await?;
+    let outcome = session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::RebaseContinue)
+        .await?;
+    match outcome {
+        bamboo_engine::session::WriteOutcome::Rebase(r) => assert!(!r.stopped),
+        _ => anyhow::bail!("expected a rebase result from rebaseContinue"),
+    }
+    settle().await;
+
+    // Undo the StartRebase tx (the oldest entry; list is newest-first):
+    // the safety check must pass because the continue refreshed the
+    // frozen post snapshots, and the restore must return to pre-rebase
+    // state (this is exactly the flow that used to block undo forever).
+    let entries = session.undo.list_transactions(10)?;
+    let rebase_tx = entries.last().expect("journaled rebase tx").id;
+    let outcome = session.undo.undo(rebase_tx)?;
+    assert!(matches!(
+        outcome,
+        bamboo_engine::undo::UndoOutcome::Restored { .. }
+    ));
+    let subjects = subjects(&dir, "feature")?;
+    assert_eq!(subjects, vec!["f3", "f2", "f1", "c2", "c1"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("shared.txt"))?,
+        "feature-side\n"
+    );
+    let tip = Command::new("git")
+        .args(["rev-parse", "feature"])
+        .current_dir(dir.path())
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), before_tip);
+    Ok(())
+}
+
+#[tokio::test]
+async fn start_rebase_with_nothing_to_do_is_structured_success() -> anyhow::Result<()> {
+    let dir = rebase_repo()?;
+    let session = open_session(&dir).await?;
+    let before_tip = sha_of(&dir, "f3")?;
+
+    // Rebase feature onto its own tip: nothing to replay. git would
+    // refuse with "nothing to do" — the engine reports a structured
+    // completed result instead (never stopped, never an error).
+    let result = start_rebase(&session, &sha_of(&dir, "f3")?, feature_todo(&dir)?).await?;
+    assert!(!result.stopped);
+    assert_eq!(result.reason, None);
+    assert_eq!(sha_of(&dir, "f3")?, before_tip);
+    // Nothing on disk: no rebase dir, no sidecars, no journal noise.
+    assert!(!dir.path().join(".git").join("rebase-merge").exists());
+    assert!(!dir.path().join(".git").join("bamboo").join("rebase").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebase_chain_excludes_merge_commits() -> anyhow::Result<()> {
+    let dir = rebase_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Merge a side branch into feature: feature's tip becomes a merge
+    // commit (parents: f3 + s1).
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()?;
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    };
+    git(&["branch", "side", &sha_of(&dir, "f2")?])?;
+    git(&["checkout", "-q", "side"])?;
+    std::fs::write(dir.path().join("s1.txt"), "s1\n")?;
+    git(&["add", "."])?;
+    git(&[
+        "commit",
+        "-q",
+        "-m",
+        "s1",
+        "--author",
+        "Rebase Tester <rebase@example.com>",
+    ])?;
+    git(&["checkout", "-q", "feature"])?;
+    git(&["merge", "-q", "--no-ff", "side", "-m", "merge1"])?;
+
+    // The plan lists the linear chain only: merge commits are excluded
+    // (git's own todo never contains them; a `pick <merge>` line would
+    // make git refuse the whole todo).
+    let plan = bamboo_engine::gix_read::read_rebase_plan(&session, "main", Some("feature"))?;
+    let mut planned: Vec<String> = plan.commits.iter().map(|c| c.subject.clone()).collect();
+    planned.sort();
+    assert_eq!(planned, vec!["f1", "f2", "f3", "s1"]);
+
+    // And the chain actually rebases: replay in place onto the merge
+    // base, completing without a stop.
+    let todo: Vec<bamboo_protocol::RebaseTodoEntry> = plan
+        .commits
+        .iter()
+        .map(|c| bamboo_protocol::RebaseTodoEntry {
+            id: c.id.clone(),
+            action: bamboo_protocol::RebaseAction::Pick,
+            message: None,
+        })
+        .collect();
+    let result = start_rebase(&session, &sha_of(&dir, "c2")?, todo).await?;
+    assert!(!result.stopped);
+    let subjects = subjects(&dir, "feature")?;
+    assert!(!subjects.contains(&"merge1".to_string()));
+    assert!(subjects.contains(&"s1".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_of_completed_rebase_preserves_dirty_worktree() -> anyhow::Result<()> {
+    let dir = rebase_repo()?;
+    let session = open_session(&dir).await?;
+    let before_tip = sha_of(&dir, "f3")?;
+
+    // Drop f2, complete the rebase in one shot.
+    let mut todo = feature_todo(&dir)?;
+    todo[1].action = bamboo_protocol::RebaseAction::Drop;
+    let result = start_rebase(&session, &sha_of(&dir, "c2")?, todo).await?;
+    assert!(!result.stopped);
+    settle().await;
+
+    // An uncommitted user change made AFTER the rebase completed.
+    std::fs::write(dir.path().join("f1.txt"), "f1 with local edit\n")?;
+
+    let entries = session.undo.list_transactions(10)?;
+    let outcome = session.undo.undo(entries[0].id)?;
+    assert!(matches!(
+        outcome,
+        bamboo_engine::undo::UndoOutcome::Restored { .. }
+    ));
+
+    // Refs/history/branch tip restored ...
+    let subjects = subjects(&dir, "feature")?;
+    assert_eq!(subjects, vec!["f3", "f2", "f1", "c2", "c1"]);
+    let tip = Command::new("git")
+        .args(["rev-parse", "feature"])
+        .current_dir(dir.path())
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), before_tip);
+    // ... but the uncommitted local edit survives (undo skips the worktree
+    // reset when the worktree was dirty).
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f1.txt"))?,
+        "f1 with local edit\n"
+    );
     Ok(())
 }
 
@@ -3648,7 +3896,7 @@ async fn get_rebase_status_detects_external_rebase() -> anyhow::Result<()> {
         .enqueue_write(bamboo_engine::write_queue::WriteCommand::RebaseContinue)
         .await?;
     match outcome {
-        bamboo_engine::session::WriteOutcome::Rebase(r) => assert!(r.finished),
+        bamboo_engine::session::WriteOutcome::Rebase(r) => assert!(!r.stopped),
         _ => anyhow::bail!("expected a rebase result from rebaseContinue"),
     }
     assert_eq!(
@@ -3670,7 +3918,6 @@ async fn rebase_continue_is_idempotent_when_idle() -> anyhow::Result<()> {
         .await?;
     match outcome {
         bamboo_engine::session::WriteOutcome::Rebase(r) => {
-            assert!(r.finished);
             assert!(!r.stopped);
         }
         _ => anyhow::bail!("expected a rebase result from rebaseContinue"),
@@ -3697,6 +3944,7 @@ async fn start_rebase_validation_rejects_stale_todo() -> anyhow::Result<()> {
     // A stale snapshot: one commit is silently missing (no explicit drop).
     todo.pop();
     let onto = sha_of(&dir, "c2")?;
+    let before_tip = sha_of(&dir, "f3")?;
     let err = start_rebase(&session, &onto, todo).await.unwrap_err();
     let err = err
         .downcast::<bamboo_protocol::BambooError>()
@@ -3720,7 +3968,7 @@ async fn start_rebase_validation_rejects_stale_todo() -> anyhow::Result<()> {
 
     // Nothing was mutated (no rebase dir, branch tip untouched).
     assert!(!dir.path().join(".git").join("rebase-merge").exists());
-    assert_eq!(sha_of(&dir, "f3")?, sha_of(&dir, "f3")?);
+    assert_eq!(before_tip, sha_of(&dir, "f3")?);
     Ok(())
 }
 
@@ -3770,7 +4018,6 @@ async fn start_rebase_validation_rejects_bad_entries() -> anyhow::Result<()> {
     expect_invalid(&session, &onto, todo, "duplicate ids").await;
 
     // Option-like onto / branch names never reach a git argv.
-    let set_editor_exe = set_editor_exe;
     set_editor_exe();
     let err = session
         .enqueue_write(bamboo_engine::write_queue::WriteCommand::StartRebase {

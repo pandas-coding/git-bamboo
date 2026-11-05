@@ -387,7 +387,6 @@ fn rebase_result_roundtrip() {
         stopped_sha: Some("abc".into()),
         msgnum: Some(2),
         end: Some(5),
-        finished: false,
     };
     let json = serde_json::to_string(&r).unwrap();
     assert!(json.contains("\"reword_stop\""));
@@ -465,24 +464,51 @@ fn rebase_plan_and_status_roundtrip() {
         stopped_sha: Some("abc".into()),
         msgnum: Some(1),
         end: Some(3),
-        done: vec!["pick abc f1".into()],
-        remaining: vec!["pick def f2".into()],
-        done_entries: vec![RebaseStatusEntry {
+        done: vec![RebaseStatusEntry::Entry {
             action: RebaseAction::Pick,
             id: "abc".into(),
             subject: "f1".into(),
         }],
-        remaining_entries: vec![RebaseStatusEntry {
-            action: RebaseAction::Squash,
-            id: "def".into(),
-            subject: "f2".into(),
-        }],
+        remaining: vec![
+            RebaseStatusEntry::Entry {
+                action: RebaseAction::Squash,
+                id: "def".into(),
+                subject: "f2".into(),
+            },
+            // Non-pick todo lines pass through verbatim.
+            RebaseStatusEntry::Raw {
+                line: "exec make".into(),
+            },
+        ],
     };
     let json = serde_json::to_string(&status).unwrap();
     assert!(json.contains("\"stopped\""));
     assert!(json.contains("\"merge\""));
+    assert!(json.contains("\"exec make\""));
     let back: GetRebaseStatusResult = serde_json::from_str(&json).unwrap();
     assert_eq!(status, back);
+
+    // Raw lines round-trip through the tagged shape on the wire.
+    let raw: RebaseStatusEntry =
+        serde_json::from_str("{\"kind\":\"raw\",\"line\":\"noop\"}").unwrap();
+    assert_eq!(
+        raw,
+        RebaseStatusEntry::Raw {
+            line: "noop".into()
+        }
+    );
+    let entry: RebaseStatusEntry = serde_json::from_str(
+        "{\"kind\":\"entry\",\"action\":\"drop\",\"id\":\"abc\",\"subject\":\"s\"}",
+    )
+    .unwrap();
+    assert_eq!(
+        entry,
+        RebaseStatusEntry::Entry {
+            action: RebaseAction::Drop,
+            id: "abc".into(),
+            subject: "s".into(),
+        }
+    );
 
     // The idle default serializes compactly (optional fields skipped).
     let idle = GetRebaseStatusResult::default();
