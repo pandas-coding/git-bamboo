@@ -114,6 +114,36 @@
         "category": "Git Bamboo"
       },
       {
+        "command": "gitBamboo.graph.rebaseOnto",
+        "title": "Rebase onto This Commit...",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.rebasePanel.execute",
+        "title": "Rebase Panel: Execute",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.rebasePanel.continue",
+        "title": "Rebase Panel: Continue",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.rebasePanel.skip",
+        "title": "Rebase Panel: Skip Commit",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.rebasePanel.abort",
+        "title": "Rebase Panel: Abort",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.rebasePanel.close",
+        "title": "Rebase Panel: Close",
+        "category": "Git Bamboo"
+      },
+      {
         "command": "gitBamboo.graphView.openCommitDetail",
         "title": "Open Commit Details",
         "category": "Git Bamboo",
@@ -284,6 +314,30 @@
           "when": "git-bamboo:active"
         },
         {
+          "command": "gitBamboo.graph.rebaseOnto",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.rebasePanel.execute",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.rebasePanel.continue",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.rebasePanel.skip",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.rebasePanel.abort",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.rebasePanel.close",
+          "when": "false"
+        },
+        {
           "command": "gitBamboo.commitView.discardAllUntracked",
           "when": "git-bamboo:active"
         }
@@ -303,6 +357,11 @@
           "command": "gitBamboo.graph.createBranchAt",
           "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
           "group": "2_branch"
+        },
+        {
+          "command": "gitBamboo.graph.rebaseOnto",
+          "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "3_rebase"
         },
         {
           "command": "gitBamboo.graph.copySha",
