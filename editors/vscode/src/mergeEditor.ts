@@ -67,10 +67,10 @@ async function isRebaseActive(root: vscode.Uri): Promise<boolean> {
  *  stage :2 (ours) feeds input1 "Current" and :3 (theirs) input2
  *  "Incoming" — only the *titles* differ, because during a rebase "ours"
  *  is the upstream side and "theirs" is the user's own replayed change.
- *  This is the structural hook for the rebase follow-up: deeper rebase
- *  semantics (flipping the accept-side buttons in the conflicts bucket to
- *  match these titles) key off `order`, not off openFor internals. */
-type MergeInputOrder = 'merge' | 'rebase';
+ *  Exported for the shared conflict flow (conflictFlow.ts), which
+ *  forwards an explicit order from rebase-path callers; every other
+ *  caller relies on openFor's automatic detection. */
+export type MergeInputOrder = 'merge' | 'rebase';
 
 function mergeInputs(root: vscode.Uri, relativePath: string, order: MergeInputOrder) {
   const titles =
@@ -127,8 +127,18 @@ export class MergeEditorManager implements vscode.Disposable {
    * silently empty sides that a save would then stage. An absent stage
    * (no :3 for a deleted side, no :1 base for both-added) resolves to
    * the empty string — that side's actual state — and errors propagate.
+   *
+   * `order` overrides the input-title order explicitly (the rebase flow
+   * passes 'rebase' from its own state knowledge); when omitted, the
+   * on-disk rebase state decides (merge-order outside a rebase, rebase
+   * order while one is in progress — engine- and externally-started
+   * alike).
    */
-  async openFor(relativePath: string, kind: ConflictKind | undefined): Promise<void> {
+  async openFor(
+    relativePath: string,
+    kind: ConflictKind | undefined,
+    order?: MergeInputOrder,
+  ): Promise<void> {
     const base = await this.client.getBlob(STAGE_BASE, relativePath);
     const ours = await this.client.getBlob(STAGE_OURS, relativePath);
     const theirs = await this.client.getBlob(STAGE_THEIRS, relativePath);
@@ -140,8 +150,8 @@ export class MergeEditorManager implements vscode.Disposable {
     }
 
     const output = vscode.Uri.joinPath(this.root, ...relativePath.split('/'));
-    const order: MergeInputOrder = (await isRebaseActive(this.root)) ? 'rebase' : 'merge';
-    const { input1, input2 } = mergeInputs(this.root, relativePath, order);
+    const resolvedOrder: MergeInputOrder = order ?? (await isRebaseActive(this.root) ? 'rebase' : 'merge');
+    const { input1, input2 } = mergeInputs(this.root, relativePath, resolvedOrder);
     const args: Record<string, unknown> = {
       // input1 = current (ours :2), input2 = incoming (theirs :3); the
       // output is the worktree file the editor writes resolutions into.

@@ -9,6 +9,7 @@
  * bypass the engine's epoch/undo tracking).
  */
 import * as vscode from 'vscode';
+import { showConflictsView } from './conflictFlow';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
 import type { BranchStatus, ForceMode, PullStrategy, RemoteInfo, RepoState } from './types';
 import { errorMessage, isDetachedError } from './util';
@@ -25,18 +26,16 @@ export interface NetOpsContext {
 }
 
 /** Build the shared net-ops context: the engine client, repo root, and
- *  the conflict-flow entry point (focuses the Commit view's conflicts
- *  section via its command, registered per-session in extension.ts).
- *  Lives here — next to the NetOpsContext type it constructs — so every
- *  consumer (palette commands, graph toolbar) imports it without pulling
- *  in the whole command module. */
+ *  the conflict-flow entry point (the shared conflicts-bucket reveal in
+ *  conflictFlow.ts — the same one the rebase panel's conflict notice
+ *  uses). Lives here — next to the NetOpsContext type it constructs —
+ *  so every consumer (palette commands, graph toolbar) imports it
+ *  without pulling in the whole command module. */
 export function netOpsContext(client: EngineClient, state: RepoState): NetOpsContext {
   return {
     client,
     repoRoot: state.root,
-    showConflicts: async () => {
-      await vscode.commands.executeCommand('gitBamboo.commit.showConflicts');
-    },
+    showConflicts: () => showConflictsView(),
   };
 }
 

@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 2：rebase 计划面板 + graph 集成 + 冲突流共享抽取
 date: 2026-10-30
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights

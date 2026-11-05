@@ -10,6 +10,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import * as commands from './commands';
+import { ConflictFlow } from './conflictFlow';
 import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
@@ -319,8 +320,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const headContent = new HeadContentProvider(client, folder.uri);
   context.subscriptions.push(headContent);
 
+  // Shared conflict flow for the session: conflict queries, resolution
+  // RPCs, and merge-editor opens. Owned here (not by the Commit view) so
+  // the rebase panel and the net-ops flows share the same controller —
+  // one conflicts bucket, one merge-editor save tracking, no copies.
+  const conflictFlow = new ConflictFlow(client, folder.uri);
+  context.subscriptions.push(conflictFlow);
+
   // Commit view: message box + change list + commit/amend, one webview.
-  const commitView = new CommitViewProvider(context, client, folder.uri);
+  const commitView = new CommitViewProvider(context, client, folder.uri, conflictFlow);
   activeCommitView = commitView;
   context.subscriptions.push(commitView);
   context.subscriptions.push(
