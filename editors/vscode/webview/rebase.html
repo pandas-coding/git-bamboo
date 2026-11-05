@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Replaced at runtime by the extension host with a CSP pinned to this webview. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git Bamboo — Rebase</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size, 13px);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      display: flex;
+      flex-direction: column;
+    }
+    .hidden { display: none !important; }
+
+    /* ---------- banners (stale / conflict / blocked / finished) ---------- */
+    .banner {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 12px;
+      margin: 10px 12px 0;
+      border-radius: 3px;
+      border: 1px solid transparent;
+      flex-shrink: 0;
+    }
+    .banner span { flex: 1; }
+    .banner.warn {
+      background: var(--vscode-inputValidation-warningBackground, rgba(191, 130, 4, 0.15));
+      border-color: var(--vscode-inputValidation-warningBorder, #b17d04);
+    }
+    .banner.error {
+      background: var(--vscode-inputValidation-errorBackground, rgba(196, 61, 58, 0.15));
+      border-color: var(--vscode-inputValidation-errorBorder, #c43a3a);
+    }
+    .banner.ok {
+      background: var(--vscode-inputValidation-infoBackground, rgba(53, 107, 172, 0.15));
+      border-color: var(--vscode-inputValidation-infoBorder, #3566ac);
+      color: var(--vscode-foreground);
+    }
+    .banner.ok .ok-mark { color: var(--vscode-testing-iconPassed, #73c991); }
+
+    /* ---------- buttons ---------- */
+    .btn {
+      border: 1px solid var(--vscode-button-border, transparent);
+      border-radius: 2px;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 12px;
+      line-height: 1.2;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+      background: var(--vscode-button-secondaryBackground, #3a3d41);
+      color: var(--vscode-button-secondaryForeground, #ffffff);
+    }
+    .btn:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
+    .btn.primary {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+    .btn.danger { color: var(--vscode-errorForeground, #f48771); }
+    .btn:disabled { opacity: 0.45; cursor: default; }
+    .btn svg { display: block; }
+
+    /* icon-only row buttons: revealed on row hover (see the commit view
+       convention — never per-row visible chrome noise) */
+    .row-btn {
+      padding: 2px 4px;
+      background: transparent;
+      border: none;
+      color: var(--vscode-foreground);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .row-btn:focus-visible { opacity: 1; pointer-events: auto; }
+    .todo-row:hover .row-btn,
+    .todo-row:focus-within .row-btn,
+    .todo-row.dropped .row-btn.restore-btn { opacity: 0.8; pointer-events: auto; }
+
+    /* ---------- plan view ---------- */
+    #plan-view {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+    #plan-header {
+      padding: 12px 14px 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, transparent);
+    }
+    #plan-header h1 {
+      margin: 0 0 4px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    #plan-header h1 .onto-sha { color: var(--vscode-descriptionForeground); font-weight: 400; }
+    #plan-meta {
+      margin: 0;
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+    }
+    #todo-list {
+      list-style: none;
+      margin: 0;
+      padding: 6px 0;
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+    }
+    .todo-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 5px 10px 5px 6px;
+      border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border, #333) 30%, transparent);
+    }
+    .todo-row:last-child { border-bottom: none; }
+    .todo-row.dragging { opacity: 0.45; }
+    .todo-row.drop-above { box-shadow: inset 0 2px 0 0 var(--vscode-focusBorder); }
+    .todo-row.drop-below { box-shadow: inset 0 -2px 0 0 var(--vscode-focusBorder); }
+    .todo-row.dropped { opacity: 0.45; }
+    .todo-row.dropped .commit-line,
+    .todo-row.dropped .row-actions { text-decoration: none; }
+    .drag-handle {
+      flex-shrink: 0;
+      cursor: grab;
+      color: var(--vscode-descriptionForeground);
+      padding: 2px 1px;
+      align-self: center;
+    }
+    .drag-handle:active { cursor: grabbing; }
+    .todo-row select {
+      flex-shrink: 0;
+      align-self: center;
+      font-family: inherit;
+      font-size: 12px;
+      color: var(--vscode-foreground);
+      background: var(--vscode-dropdown-background, #333);
+      border: 1px solid var(--vscode-dropdown-border, #3c3c3c);
+    }
+    .todo-row select.action-pick { color: var(--vscode-charts-blue, #3794ff); }
+    .todo-row select.action-reword { color: var(--vscode-charts-purple, #b180d7); }
+    .todo-row select.action-squash { color: var(--vscode-charts-orange, #d18616); }
+    .todo-row select.action-drop { color: var(--vscode-errorForeground, #f48771); }
+    .commit-line {
+      flex: 1;
+      min-width: 0;
+      align-self: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .commit-line .subject { display: inline; }
+    .commit-line .meta {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-left: 8px;
+    }
+    .row-actions {
+      display: flex;
+      gap: 2px;
+      flex-shrink: 0;
+      align-self: center;
+    }
+    .row-message {
+      flex-basis: 100%;
+      margin: 4px 0 1px;
+    }
+    .row-message input {
+      width: 100%;
+      box-sizing: border-box;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 3px 6px;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-inputValidation-infoBorder, #3566ac);
+    }
+    .row-message .hint {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      margin-top: 2px;
+    }
+    #plan-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 14px;
+      border-top: 1px solid var(--vscode-panel-border, transparent);
+      flex-shrink: 0;
+    }
+    #plan-actions .spacer { flex: 1; }
+    #todo-count {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+    }
+
+    /* ---------- docked (in-progress) view ---------- */
+    #docked-view {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+    #docked-header {
+      padding: 12px 14px 8px;
+      border-bottom: 1px solid var(--vscode-panel-border, transparent);
+      flex-shrink: 0;
+    }
+    #docked-header h1 { margin: 0 0 3px; font-size: 13px; font-weight: 600; }
+    #docked-sub {
+      margin: 0;
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+    }
+    #progress-track {
+      margin: 8px 14px 4px;
+      height: 3px;
+      border-radius: 2px;
+      background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+      flex-shrink: 0;
+    }
+    #progress-fill {
+      height: 100%;
+      width: 0;
+      border-radius: 2px;
+      background: var(--vscode-charts-blue, #3794ff);
+      transition: width 120ms ease;
+    }
+    #todo-sections { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0 8px; }
+    #todo-sections h2 {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--vscode-descriptionForeground);
+      margin: 10px 14px 4px;
+    }
+    .status-list { list-style: none; margin: 0; padding: 0; }
+    .status-list li {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 3px 14px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #done-list li { color: var(--vscode-descriptionForeground); }
+    #remaining-list li.current {
+      background: color-mix(in srgb, var(--vscode-focusBorder) 25%, transparent);
+      color: var(--vscode-foreground);
+    }
+    .status-action {
+      flex-shrink: 0;
+      font-size: 11px;
+      min-width: 52px;
+    }
+    .status-action.pick { color: var(--vscode-charts-blue, #3794ff); }
+    .status-action.reword { color: var(--vscode-charts-purple, #b180d7); }
+    .status-action.squash { color: var(--vscode-charts-orange, #d18616); }
+    .status-action.fixup { color: var(--vscode-charts-orange, #d18616); }
+    .status-action.edit { color: var(--vscode-charts-yellow, #cca700); }
+    .status-action.drop { color: var(--vscode-errorForeground, #f48771); }
+    .status-sha { flex-shrink: 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
+    #docked-actions {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px;
+      border-top: 1px solid var(--vscode-panel-border, transparent);
+      flex-shrink: 0;
+    }
+
+    /* ---------- state views ---------- */
+    .state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--vscode-descriptionForeground);
+      padding: 20px;
+      text-align: center;
+    }
+    .state .error-text { color: var(--vscode-errorForeground, #f48771); }
+
+    /* ---------- confirm modal ---------- */
+    #modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10;
+    }
+    #modal {
+      background: var(--vscode-editorWidget-background, #252526);
+      border: 1px solid var(--vscode-widget-border, #454545);
+      border-radius: 4px;
+      padding: 14px 16px;
+      max-width: 460px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    }
+    #modal h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+    #modal-summary {
+      margin: 0 0 14px;
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  </style>
+</head>
+<body>
+  <!-- transient banners, one per surface, all hidden by default -->
+  <div id="stale-banner" class="banner warn hidden" role="alert">
+    <span>The history behind this plan changed — it may be out of date. Your edits are kept.</span>
+    <button id="stale-reload" class="btn" title="Reload the plan for the same target">Reload plan</button>
+  </div>
+  <div id="conflict-banner" class="banner error hidden" role="alert">
+    <span id="conflict-text">Conflicts from this rebase need resolution.</span>
+    <button id="conflict-open" class="btn">Open conflicts view</button>
+  </div>
+  <div id="blocked-banner" class="banner warn hidden" role="alert">
+    <span id="blocked-text"></span>
+  </div>
+  <div id="finished-banner" class="banner ok hidden" role="status">
+    <span class="ok-mark" id="finished-mark">&#10003;</span>
+    <span id="finished-text">Rebase completed.</span>
+    <button id="finished-close" class="btn">Close</button>
+  </div>
+
+  <!-- plan mode: edit the todo, then execute -->
+  <section id="plan-view" class="hidden">
+    <header id="plan-header">
+      <h1>Rebase <span id="plan-branch"></span> onto <span class="onto-sha" id="plan-onto"></span></h1>
+      <p id="plan-meta"></p>
+    </header>
+    <ol id="todo-list"></ol>
+    <footer id="plan-actions">
+      <span id="todo-count"></span>
+      <span class="spacer"></span>
+      <button id="cancel" class="btn">Close</button>
+      <button id="execute" class="btn primary"></button>
+    </footer>
+  </section>
+
+  <!-- docked mode: an in-progress rebase (read-only view + controls) -->
+  <section id="docked-view" class="hidden">
+    <header id="docked-header">
+      <h1 id="docked-title">Rebase in progress</h1>
+      <p id="docked-sub"></p>
+    </header>
+    <div id="progress-track"><div id="progress-fill"></div></div>
+    <div id="todo-sections">
+      <section id="done-section">
+        <h2>Done</h2>
+        <ol id="done-list" class="status-list"></ol>
+      </section>
+      <section id="remaining-section">
+        <h2>Remaining</h2>
+        <ol id="remaining-list" class="status-list"></ol>
+      </section>
+    </div>
+    <footer id="docked-actions">
+      <button id="abort" class="btn danger"></button>
+      <span class="spacer" style="flex:1"></span>
+      <button id="skip" class="btn"></button>
+      <button id="continue" class="btn primary"></button>
+    </footer>
+  </section>
+
+  <!-- one-shot states -->
+  <section id="loading-view" class="state hidden"><p>Loading rebase plan…</p></section>
+  <section id="empty-view" class="state hidden">
+    <p id="empty-text">Nothing to rebase.</p>
+    <button id="empty-close" class="btn">Close</button>
+  </section>
+  <section id="error-view" class="state hidden">
+    <p class="error-text" id="error-text"></p>
+    <button id="error-close" class="btn">Close</button>
+  </section>
+
+  <!-- execution confirmation modal -->
+  <div id="modal-backdrop" class="hidden">
+    <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title">Execute this rebase?</h2>
+      <p id="modal-summary"></p>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn">Keep editing</button>
+        <button id="modal-confirm" class="btn primary">Rebase</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./rebase.js"></script>
+</body>
+</html>
