@@ -9,6 +9,7 @@
  * bypass the engine's epoch/undo tracking).
  */
 import * as vscode from 'vscode';
+import { showConflictsView } from './conflictFlow';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
 import type { BranchStatus, ForceMode, PullStrategy, RemoteInfo, RepoState } from './types';
 import { errorMessage, isDetachedError } from './util';
@@ -19,24 +20,19 @@ import { errorMessage, isDetachedError } from './util';
 export interface NetOpsContext {
   readonly client: EngineClient;
   readonly repoRoot: vscode.Uri;
-  /** Focuses the Commit view and expands its Conflicts section (the pull
-   *  conflict banner's "Open Conflict Files" button). */
-  readonly showConflicts: () => Promise<void>;
 }
 
-/** Build the shared net-ops context: the engine client, repo root, and
- *  the conflict-flow entry point (focuses the Commit view's conflicts
- *  section via its command, registered per-session in extension.ts).
+/** Build the shared net-ops context: the engine client and repo root.
  *  Lives here — next to the NetOpsContext type it constructs — so every
  *  consumer (palette commands, graph toolbar) imports it without pulling
- *  in the whole command module. */
+ *  in the whole command module. The pull conflict banner jumps straight
+ *  to the shared conflicts-bucket reveal (showConflictsView in
+ *  conflictFlow.ts — the same one the rebase panel's conflict notice
+ *  uses). */
 export function netOpsContext(client: EngineClient, state: RepoState): NetOpsContext {
   return {
     client,
     repoRoot: state.root,
-    showConflicts: async () => {
-      await vscode.commands.executeCommand('gitBamboo.commit.showConflicts');
-    },
   };
 }
 
@@ -263,7 +259,7 @@ function showPullError(ctx: NetOpsContext, err: unknown, branch: string): void {
       )
       .then((choice) => {
         if (choice === 'Open Conflict Files') {
-          void ctx.showConflicts();
+          void showConflictsView();
         }
       });
     return;

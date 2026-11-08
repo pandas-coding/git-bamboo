@@ -4080,3 +4080,134 @@ async fn start_rebase_rejects_detached_head_without_branch() -> anyhow::Result<(
     assert!(err.message.contains("detached"));
     Ok(())
 }
+
+/// The fs watcher must survive a repo root rm -rf + recreate: inotify
+/// watches are inode-based, so the session has to detect the root
+/// deletion, wait for the paths to reappear, and re-arm — mutations in
+/// the NEW directory must produce notifications again.
+#[tokio::test]
+async fn watcher_rearms_after_repo_recreate() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo)?;
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    std::fs::write(repo.join("a.txt"), "a\n")?;
+    git(&["add", "."])?;
+    git(&["commit", "-q", "-m", "c1"])?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _session = bamboo_engine::session::Session::open(&repo, tx).await?;
+
+    // Sanity: the watcher is alive — a worktree write produces a
+    // notification.
+    std::fs::write(repo.join("probe.txt"), "1\n")?;
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("no notification before recreate"))?;
+    assert!(ev.is_some());
+
+    // rm -rf + recreate: new inodes; the old watches are dead.
+    std::fs::remove_dir_all(&repo)?;
+    std::fs::create_dir(&repo)?;
+    git(&["init", "-q", "-b", "main"])?;
+    std::fs::write(repo.join("b.txt"), "b\n")?;
+    git(&["add", "."])?;
+    git(&["commit", "-q", "-m", "c2"])?;
+
+    // Drain everything produced by the rm -rf deletion classification and
+    // the recreate, so the probe assertion below can only pass on a LIVE
+    // event from the re-armed watcher.
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // The re-arm thread should fire a conservative refresh burst on the
+    // ORIGINAL channel once the repo reappears, and mutations in the new
+    // directory must produce notifications again. Retry-write probe2 until
+    // an event arrives (the recreate's git ops happened while the watcher
+    // was dead — only re-armed live events count).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut got = false;
+    loop {
+        std::fs::write(repo.join("probe2.txt"), "2\n")?;
+        match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(_)) => {
+                got = true;
+                break;
+            }
+            Ok(None) => anyhow::bail!("notification channel closed"),
+            Err(_) => {}
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    assert!(got, "watcher did not re-arm after repo recreate");
+    Ok(())
+}
+
+/// The undo snapshots, journal, and audit log must self-heal when the
+/// .git/bamboo tree vanishes under a live session (e.g. the repo dir was
+/// deleted and recreated — UndoEngine::new only creates the dirs once).
+#[tokio::test]
+async fn undo_self_heals_after_bamboo_dir_removed() -> anyhow::Result<()> {
+    let dir = test_repo()?;
+    let session = open_session(&dir).await?;
+
+    std::fs::remove_dir_all(dir.path().join(".git").join("bamboo"))?;
+
+    std::fs::write(dir.path().join("new.txt"), "new\n")?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Stage(vec![
+            "new.txt".to_string(),
+        ]))
+        .await?;
+    session
+        .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
+            message: "healed".to_string(),
+            amend: false,
+        })
+        .await?;
+
+    settle().await;
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 10,
+        anchor_commit: None,
+        epoch: 0,
+    };
+    let page = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
+    assert_eq!(page.commits.len(), 4);
+    assert!(page.commits[0].message.contains("healed"));
+
+    // The journal and audit log were recreated in the healed tree.
+    let entries = session.undo.list_transactions(10)?;
+    assert!(
+        entries.iter().any(|e| e.description.contains("healed") || e.description.contains("Stage")),
+        "expected journaled transactions after self-heal, got {:?}",
+        entries.iter().map(|e| &e.description).collect::<Vec<_>>()
+    );
+    assert!(dir.path().join(".git").join("bamboo").join("audit.log").exists());
+    Ok(())
+}

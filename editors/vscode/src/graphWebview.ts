@@ -5,6 +5,7 @@
  * owns the view lifecycle, webview options, and HTML generation.
  */
 import * as vscode from 'vscode';
+import { ConflictFlow } from './conflictFlow';
 import { EngineClient } from './engineClient';
 import { GraphSession } from './graphSession';
 import type { RepoState } from './types';
@@ -20,6 +21,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
     private readonly context: vscode.ExtensionContext,
     private readonly client: EngineClient,
     private readonly state: RepoState,
+    private readonly conflictFlow: ConflictFlow,
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -36,7 +38,7 @@ export class GraphWebviewProvider implements vscode.WebviewViewProvider, vscode.
     view.webview.html = buildWebviewHtml(this.context.extensionUri, view.webview, 'graph.html');
     // The session owns engine subscriptions; it is torn down when the
     // sidebar view is disposed so listeners never leak.
-    this.session = new GraphSession(this.client, this.state, view.webview, 'sidebar', this.context, () => {
+    this.session = new GraphSession(this.client, this.state, this.conflictFlow, view.webview, 'sidebar', this.context, () => {
       this.session = undefined;
     });
     this.viewDisposable?.dispose();

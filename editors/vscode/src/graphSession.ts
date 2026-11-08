@@ -8,9 +8,11 @@
  */
 import * as vscode from 'vscode';
 import { EngineClient, RpcError } from './engineClient';
+import { ConflictFlow } from './conflictFlow';
 import { openCommitDetailPanel } from './commitDetail';
 import { createContextTargetSlot } from './contextTargetSlot';
 import * as netOps from './netOps';
+import { runRebaseStep } from './rebaseControl';
 import type { GraphPage, RepoState } from './types';
 import {
   BRANCH_STATUS_DEBOUNCE_MS,
@@ -25,6 +27,14 @@ const EPOCH_MISMATCH = -32004;
 
 /** Debounce for viewport requests coming from scroll events. */
 const VIEWPORT_DEBOUNCE_MS = 16;
+
+/** Debounce for rebase-status refreshes: every rebase step (ours, the
+ *  panel's, or an external CLI's) moves HEAD/worktree/index in a burst,
+ *  and the banner only needs the settled state. */
+const REBASE_STATUS_DEBOUNCE_MS = 200;
+
+/** The rebase control ops the graph banner can request (webview → host). */
+const REBASE_CONTROLS = new Set(['continue', 'skip', 'abort']);
 
 /** The net-op kinds the graph toolbar can request (webview → host). */
 type NetOp = 'fetch' | 'pull' | 'push' | 'sync' | 'publish';
@@ -70,6 +80,8 @@ interface GraphViewMessage {
   id?: unknown;
   /** netOp payload: which toolbar operation the webview requested. */
   op?: unknown;
+  /** rebaseControl payload: which banner control the webview requested. */
+  rebaseOp?: unknown;
 }
 
 /** Which webview host owns a graph session — widths are persisted per host. */
@@ -116,6 +128,13 @@ export class GraphSession implements vscode.Disposable {
     () => void this.sendBranchStatus(),
     BRANCH_STATUS_DEBOUNCE_MS,
   );
+  /** Debounced rebaseStatus refresh (rebase step notification bursts). */
+  private readonly scheduleRebaseStatus = debounce(
+    () => void this.sendRebaseStatus(),
+    REBASE_STATUS_DEBOUNCE_MS,
+  );
+  /** Sequence number so stale getRebaseStatus responses are dropped. */
+  private rebaseStatusSeq = 0;
   /** Sequence number so stale getGraph responses are dropped. */
   private requestSeq = 0;
   private disposed = false;
@@ -124,6 +143,9 @@ export class GraphSession implements vscode.Disposable {
   constructor(
     private readonly client: EngineClient,
     private readonly state: RepoState,
+    /** Shared conflict flow: conflict-count queries for the rebase banner
+     *  (the same controller the Commit view and rebase panel use). */
+    private readonly conflictFlow: ConflictFlow,
     private readonly webview: vscode.Webview,
     /** Which host this session serves — width persistence is per-host. */
     private readonly host: GraphHost,
@@ -141,11 +163,17 @@ export class GraphSession implements vscode.Disposable {
       client.onNotification('refsChanged', () => {
         void this.sendRefs();
         this.scheduleBranchStatus();
+        // Rebase banner: any mutation that can change the on-disk rebase
+        // state schedules a disk-state re-read (debounced).
+        this.scheduleRebaseStatus();
       }),
       client.onNotification('headChanged', () => {
         void this.sendHead();
         this.scheduleBranchStatus();
+        this.scheduleRebaseStatus();
       }),
+      client.onNotification('worktreeChanged', () => this.scheduleRebaseStatus()),
+      client.onNotification('indexChanged', () => this.scheduleRebaseStatus()),
       { dispose: onDispose },
     );
     // Initial refs/HEAD are pushed from the 'ready' handler: messages posted
@@ -159,6 +187,7 @@ export class GraphSession implements vscode.Disposable {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.invalidateTimer) clearTimeout(this.invalidateTimer);
     this.scheduleBranchStatus.cancel();
+    this.scheduleRebaseStatus.cancel();
     // Unsubscribe engine notification listeners and webview subscriptions.
     for (const disposable of this.disposables) disposable.dispose();
     this.disposables.length = 0;
@@ -219,6 +248,9 @@ export class GraphSession implements vscode.Disposable {
       // webview, so the initial branchStatus rides on 'ready' too — a
       // postMessage from the constructor would be silently dropped.
       void this.sendBranchStatus();
+      // And the initial rebase banner state (a rebase already on disk —
+      // engine- or externally-started — shows immediately).
+      void this.sendRebaseStatus();
     } else if (message?.type === 'graphWidthChanged') {
       // null clears the override (back to auto width); update() with
       // undefined removes the key from globalState. The webview is a trust
@@ -260,6 +292,14 @@ export class GraphSession implements vscode.Disposable {
       const op = message.op;
       if (typeof op === 'string' && Object.hasOwn(NET_OPS, op)) {
         void this.runNetOp(op as NetOp);
+      }
+    } else if (message?.type === 'rebaseControl') {
+      // Rebase banner control click. Same trust-boundary discipline as
+      // netOp: the op is validated against the known control set before
+      // any engine write RPC runs.
+      const op = message.rebaseOp;
+      if (typeof op === 'string' && REBASE_CONTROLS.has(op)) {
+        void this.runRebaseControl(op as 'continue' | 'skip' | 'abort');
       }
     } else if (message?.type === 'openCommitDetail') {
       // Single-click on a commit row opens the detail panel — the chosen UX
@@ -358,6 +398,75 @@ export class GraphSession implements vscode.Disposable {
       // emits no refsChanged): the user just waited on a spinner and
       // deserves a settled state, and the RPC is cheap.
       this.scheduleBranchStatus();
+    }
+  }
+
+  /** Pushes the current on-disk rebase status so the webview can render
+   *  the banner: stopped (progress + stopped-at + conflict count, controls
+   *  enabled), running (read-only), or idle (banner hidden — CLI-started
+   *  and engine-started rebases are indistinguishable here by design: the
+   *  state is read from disk). The conflict count comes from the shared
+   *  conflict flow (the same engine status the Commit view's conflicts
+   *  bucket renders — one source of truth). Stale responses are dropped
+   *  by sequence number; failures keep the last pushed banner. */
+  private async sendRebaseStatus(): Promise<void> {
+    if (this.disposed) return;
+    const seq = ++this.rebaseStatusSeq;
+    try {
+      const status = await this.client.getRebaseStatus();
+      if (seq !== this.rebaseStatusSeq || this.disposed) return;
+      let conflicts: number | undefined;
+      if (status.state !== 'idle') {
+        const items = await this.conflictFlow.currentConflicts();
+        if (seq !== this.rebaseStatusSeq || this.disposed) return;
+        conflicts = items?.length ?? 0;
+      }
+      await this.webview.postMessage({ type: 'rebaseStatus', status, conflicts });
+    } catch (err) {
+      console.error('[git-bamboo] getRebaseStatus for graph failed:', err);
+    }
+  }
+
+  /** Runs one rebase banner control (continue/skip/abort) through the
+   *  shared rebase-step runner (rebaseControl.ts) — the same RPC,
+   *  in-flight guard, and failure classification the rebase panel's
+   *  docked view uses, no copies. A refused continue (unresolved
+   *  conflicts) is the engine's INVALID_ARGUMENT — surfaced as a warning
+   *  pointing at the Commit view's conflicts bucket. */
+  private async runRebaseControl(op: 'continue' | 'skip' | 'abort'): Promise<void> {
+    if (this.disposed) return;
+    await this.webview.postMessage({ type: 'rebaseControlState', active: true });
+    try {
+      const outcome = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Git Bamboo: rebase ${op}`,
+        },
+        () => runRebaseStep(this.client, op),
+      );
+      if (outcome.kind === 'refused') {
+        vscode.window.showWarningMessage(
+          `Git Bamboo: ${outcome.message} — resolve conflicts in the Commit view first.`,
+        );
+      } else if (outcome.kind === 'failed') {
+        vscode.window.showErrorMessage(
+          `Git Bamboo: rebase ${op} failed — ${outcome.message}`,
+        );
+      }
+      // 'result' and 'dropped' need no UI here: the shared runner already
+      // ran (or dropped) the op, and the settle call below refreshes the
+      // banner either way.
+    } catch (err) {
+      // runRebaseStep classifies instead of throwing; an escaping throw
+      // breaks that contract — log it instead of an unhandled rejection.
+      console.error('[git-bamboo] rebase control failed:', err);
+    } finally {
+      if (!this.disposed) {
+        await this.webview.postMessage({ type: 'rebaseControlState', active: false });
+      }
+      // Engine notifications also schedule this; the explicit call covers
+      // ops that moved nothing (and settles the banner immediately).
+      this.scheduleRebaseStatus();
     }
   }
 

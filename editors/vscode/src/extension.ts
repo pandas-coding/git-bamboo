@@ -10,11 +10,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import * as commands from './commands';
+import { ConflictFlow } from './conflictFlow';
 import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
 import { GraphWebviewProvider } from './graphWebview';
 import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
 import { openCommitDetailPanel } from './commitDetail';
+import { openRebasePlanPanel, registerRebasePanelSerializer, runRebasePanelCommand } from './rebasePanel';
 import { takeGraphContextTarget, type GraphContextCommit } from './graphSession';
 import { HeadContentProvider } from './headContent';
 import { HunkStagingController, STAGE_HUNK_COMMAND, UNSTAGE_HUNK_COMMAND } from './hunkStaging';
@@ -25,6 +27,7 @@ import { BRANCH_STATUS_DEBOUNCE_MS, debounce, errorMessage } from './util';
 let activeClient: EngineClient | undefined;
 let activeState: RepoState | undefined;
 let activeCommitView: CommitViewProvider | undefined;
+let activeConflictFlow: ConflictFlow | undefined;
 
 /** Shown when a command runs without a repository session (no repo folder
  *  open, or the engine failed to start): silent no-ops are terrible UX. */
@@ -40,11 +43,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Commands are registered unconditionally (even before a repo is open) so
   // palette entries never dead-end silently; handlers guard on the session.
   registerCommand(context, 'gitBamboo.openGraph', async () => {
-    if (!activeClient || !activeState) {
+    if (!activeClient || !activeState || !activeConflictFlow) {
       noSessionWarning();
       return;
     }
-    openGraphPanel(context, activeClient, activeState);
+    openGraphPanel(context, activeClient, activeState, activeConflictFlow);
   });
   registerCommand(context, 'gitBamboo.undo', () =>
     activeClient ? commands.undoLast(activeClient) : noSessionWarning());
@@ -133,6 +136,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.env.clipboard.writeText(commit.message);
       vscode.window.setStatusBarMessage('Git Bamboo: copied commit message', 3000);
     }));
+  // "Rebase onto this commit…": the entry into the rebase plan panel.
+  // The plan is fetched here (empty → "nothing to rebase" info, no panel);
+  // the panel itself gets the host-held onto as its trust anchor. Only
+  // valid from the graph context menu (palette entry is `when: false`).
+  registerCommand(context, 'gitBamboo.graph.rebaseOnto', () =>
+    withGraphTarget(async ({ client, commit }) => {
+      if (!activeConflictFlow) {
+        noSessionWarning();
+        return;
+      }
+      // Check if a rebase is already in progress — if so, open the panel
+      // directly (it will dock) instead of fetching a new plan (which
+      // fails when HEAD is detached).
+      try {
+        const status = await client.getRebaseStatus();
+        if (status.state !== 'idle') {
+          openRebasePlanPanel(context, client, activeConflictFlow, commit.id);
+          return;
+        }
+      } catch {
+        // Status unreadable: fall through — the plan fetch surfaces its
+        // own error banner if it fails.
+      }
+      let plan;
+      try {
+        plan = await client.getRebasePlan(commit.id);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Git Bamboo: rebase plan failed — ${errorMessage(err)}`);
+        return;
+      }
+      if (plan.commits.length === 0) {
+        vscode.window.showInformationMessage(
+          `Git Bamboo: nothing to rebase — the current branch is already based on ${commit.id.slice(0, 8)}`,
+        );
+        return;
+      }
+      openRebasePlanPanel(context, client, activeConflictFlow, commit.id);
+    }));
+  // Rebase-panel palette commands (hidden — `when: false` in
+  // package.json): thin wrappers over the open panel so keybindings and
+  // programmatic invocation have a stable surface. `execute` asks the
+  // webview to run its confirmation modal; the user entry point is the
+  // graph context menu.
+  for (const op of ['execute', 'continue', 'skip', 'abort', 'close'] as const) {
+    registerCommand(context, `gitBamboo.rebasePanel.${op}`, () => {
+      if (!runRebasePanelCommand(op)) {
+        vscode.window.showInformationMessage('Git Bamboo: no rebase panel is open.');
+      }
+    });
+  }
   registerCommand(context, 'gitBamboo.graph.createBranchAt', () =>
     withGraphTarget(async ({ client, commit }) => {
       const name = await promptBranchName(`Create branch at ${commit.id.slice(0, 8)}`);
@@ -319,8 +372,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const headContent = new HeadContentProvider(client, folder.uri);
   context.subscriptions.push(headContent);
 
+  // Shared conflict flow for the session: conflict queries, resolution
+  // RPCs, and merge-editor opens. Owned here (not by the Commit view) so
+  // the rebase panel and the net-ops flows share the same controller —
+  // one conflicts bucket, one merge-editor save tracking, no copies.
+  const conflictFlow = new ConflictFlow(client, folder.uri);
+  context.subscriptions.push(conflictFlow);
+  activeConflictFlow = conflictFlow;
+
   // Commit view: message box + change list + commit/amend, one webview.
-  const commitView = new CommitViewProvider(context, client, folder.uri);
+  const commitView = new CommitViewProvider(context, client, folder.uri, conflictFlow);
   activeCommitView = commitView;
   context.subscriptions.push(commitView);
   context.subscriptions.push(
@@ -338,14 +399,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Sidebar commit graph (compact mode) + editor-area graph panel (full
   // width mode) share the same webview bundle via GraphSession.
-  const graph = new GraphWebviewProvider(context, client, state);
+  const graph = new GraphWebviewProvider(context, client, state, conflictFlow);
   context.subscriptions.push(graph);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(GraphWebviewProvider.viewId, graph, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
   );
-  registerGraphPanelSerializer(context, client, state);
+  registerGraphPanelSerializer(context, client, state, conflictFlow);
+  // Rebase panel restores as the read-only docked view when a rebase is
+  // still on disk across a window reload (idle → empty state).
+  registerRebasePanelSerializer(context, client, conflictFlow);
 
   // Status bar branch item: branch name plus ahead/behind counts (↑n↓n;
   // omitted without an upstream, e.g. detached HEAD or an unpublished

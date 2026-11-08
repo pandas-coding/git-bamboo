@@ -12,9 +12,9 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
+import { ConflictFlow } from './conflictFlow';
 import { createContextTargetSlot } from './contextTargetSlot';
 import { isValidRepoPath, openResource, type CommitBucket } from './headContent';
-import { MergeEditorManager } from './mergeEditor';
 import { sideResolution } from './types';
 import type { ConflictResolution, StashEntry, StatusItem } from './types';
 import { errorMessage } from './util';
@@ -101,9 +101,12 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   /** Per-view subscriptions, torn down on re-resolution so listeners
    *  never double up (mirrors GraphWebviewProvider.teardownSession). */
   private viewDisposables: vscode.Disposable[] = [];
-  /** Merge-editor sessions for this repo's conflicts (tracks saves of
-   *  open merge-editor outputs and stages finished resolutions). */
-  private readonly mergeEditors: MergeEditorManager;
+  /** Shared conflict flow for this repo session: conflict queries,
+   *  resolution RPCs, and merge-editor opens (pull/stash and rebase
+   *  conflicts all flow through it — injected by the extension host,
+   *  which owns its lifetime so the rebase panel shares the same
+   *  merge-editor save tracking). */
+  private readonly conflictFlow: ConflictFlow;
   /** A showConflicts request that raced the webview's readiness (net-ops
    *  banner can fire before the view is resolved): replayed with the
    *  next status push. */
@@ -113,8 +116,9 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     private readonly context: vscode.ExtensionContext,
     private readonly client: EngineClient,
     private readonly root: vscode.Uri,
+    conflictFlow: ConflictFlow,
   ) {
-    this.mergeEditors = new MergeEditorManager(client, root);
+    this.conflictFlow = conflictFlow;
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -160,7 +164,8 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
     if (this.disposed) return;
     this.disposed = true;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    this.mergeEditors.dispose();
+    // The shared conflict flow outlives the view (the rebase panel and
+    // net-ops flows keep using it); its disposal belongs to the host.
     this.teardownView();
     this.view = undefined;
   }
@@ -366,64 +371,55 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
   }
 
   /** Resolve one conflicted file (webview "Accept Yours/Theirs" or
-   *  keep-file/keep-deletion buttons). Same flow shape as discard minus
-   *  the modal (each resolution is reversible enough via git); the engine
-   *  re-classifies the conflict at execution time and rejects a stale
-   *  snapshot with INVALID_ARGUMENT, surfaced here as a warning. */
+   *  keep-file/keep-deletion buttons) through the shared conflict flow
+   * (freshness cross-check against the last pushed status, engine RPC,
+   * engine-side re-validation). The outcome kinds map onto the same
+   * surfaces this view used before the extraction. */
   private async resolveConflict(relativePath: string, resolution: string): Promise<void> {
-    // Trust boundary: only repo-relative paths and the four known
-    // resolutions reach the engine write RPC.
-    const resolutions = new Set<ConflictResolution>(['ours', 'theirs', 'keep_ours', 'keep_theirs']);
-    if (!isValidRepoPath(relativePath) || !resolutions.has(resolution as ConflictResolution)) {
-      return;
-    }
-    // Freshness cross-check: the buttons were rendered against a status
-    // snapshot; require the file to still be listed as conflicted.
-    const current = this.lastItems.find(
-      (item) => item.path === relativePath && item.status === 'conflict',
+    const outcome = await this.conflictFlow.resolve(
+      relativePath,
+      resolution as ConflictResolution,
+      this.lastItems,
     );
-    if (current === undefined) {
-      vscode.window.showWarningMessage(
-        `Git Bamboo: ${path.posix.basename(relativePath)} is no longer conflicted — nothing was changed.`,
-      );
-      return;
-    }
-    try {
-      await this.client.resolveConflict(relativePath, resolution as ConflictResolution);
-      await this.doRefresh();
-    } catch (err) {
-      // INVALID_ARGUMENT = kind mismatch or stale path (engine message is
-      // user-readable); anything else is a real engine failure.
-      if (rpcErrorCode(err) === RpcErrorCode.INVALID_ARGUMENT) {
-        vscode.window.showWarningMessage(`Git Bamboo: ${errorMessage(err)}`);
-      } else {
-        vscode.window.showErrorMessage(
-          `Git Bamboo: resolving ${relativePath} failed — ${errorMessage(err)}`,
+    switch (outcome.kind) {
+      case 'resolved':
+        await this.doRefresh();
+        return;
+      case 'rejected':
+        return; // trust boundary: dropped silently
+      case 'stale':
+        vscode.window.showWarningMessage(
+          `Git Bamboo: ${path.posix.basename(relativePath)} is no longer conflicted — nothing was changed.`,
         );
-      }
+        return;
+      case 'engine-rejected':
+        // INVALID_ARGUMENT = kind mismatch or stale path (engine message
+        // is user-readable).
+        vscode.window.showWarningMessage(`Git Bamboo: ${outcome.message}`);
+        return;
+      case 'failed':
+        vscode.window.showErrorMessage(
+          `Git Bamboo: resolving ${relativePath} failed — ${outcome.message}`,
+        );
+        return;
     }
   }
 
   /** Open the 3-way merge editor for one conflicted file (webview
-   *  "Resolve in Merge Editor" button). */
+   *  "Resolve in Merge Editor" button) through the shared conflict flow;
+   * input titles follow the auto-detected merge/rebase order. */
   private async openMergeEditor(relativePath: string): Promise<void> {
-    if (!isValidRepoPath(relativePath)) return;
-    const current = this.lastItems.find(
-      (item) => item.path === relativePath && item.status === 'conflict',
-    );
-    if (current === undefined) {
+    const outcome = await this.conflictFlow.openMergeEditor(relativePath, this.lastItems);
+    if (outcome.kind === 'opened' || outcome.kind === 'rejected') return;
+    if (outcome.kind === 'stale') {
       vscode.window.showWarningMessage(
         `Git Bamboo: ${path.posix.basename(relativePath)} is no longer conflicted.`,
       );
       return;
     }
-    try {
-      await this.mergeEditors.openFor(relativePath, current.conflict_kind);
-    } catch (err) {
-      vscode.window.showErrorMessage(
-        `Git Bamboo: opening the merge editor for ${relativePath} failed — ${errorMessage(err)}`,
-      );
-    }
+    vscode.window.showErrorMessage(
+      `Git Bamboo: opening the merge editor for ${relativePath} failed — ${outcome.message}`,
+    );
   }
 
   /** Focus the Commit view and expand its Conflicts section (net-ops

@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 2：rebase 计划面板 + graph 集成 + 冲突流共享抽取
 date: 2026-10-30
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights
@@ -41,7 +41,7 @@ tags: [git, vscode-extension, ui]
 3. **入站消息协议与 host 校验（安全红线）** — 面板→host 消息集：`ready` / `executeRebase { onto, todo[] }` / `rebaseContinue` / `rebaseSkip` / `rebaseAbort` / `refreshPlan` / `panelReady`（UI 状态如折叠持久化如需要）。host 端逐字段校验：`onto` 过 ref 白名单校验；`todo` 数组长度 ≤ 500；每项 `id` 匹配 `/^[0-9a-f]{40,64}$/i`、`action ∈ {pick,reword,squash,drop}`、`message` ≤ 8192 无控制字符；越界一律丢弃 + 通知日志（不回显错误给 webview 以免探测）。校验通过才调 `engineClient` 的 Phase 1 RPC。引擎侧 -32005（stale 链）→ host 向 webview 发 `stale` 消息 → 面板顶部黄条"底层历史已变化，计划过期"+ 刷新按钮（**不清空用户编辑**，由用户决定刷新）。
 4. **面板 UI（webview rebase/）**：
    - todo 行：sha 前缀、subject、作者/时间次要文字、当前动作徽标（pick 默认无、reword/squash/drop 有色标）；hover 显隐按钮（opacity 模式）：动作下拉、上移/下移、删除（=drop）；行内拖拽排序（HTML5 DnD 或 pointer 拖拽，与既有 webview 交互风格一致——优先 HTML5 DnD 简单实现，20 条内交互量足够）。
-   - reword/squash 选中时行内展开消息编辑 textarea（squash 默认折叠消息 = 保留 git 折叠语义，自定义才填）；drop 行整体降不透明度保留位置可恢复（再点恢复 pick）。
+   - reword/squash 选中时行内展开消息编辑 textarea（squash 默认折叠消息 = 保留 git 折叠语义，自定义才填）。实现备注 2026-11-08：用单行 input 而非 textarea——引擎侧约束单段消息（拒绝控制字符含换行），单行输入即该约束的 UI 形态；drop 行整体降不透明度保留位置可恢复（再点恢复 pick）。
    - 底部：执行按钮（主按钮）+ 取消；执行前 modal 确认（复用既有确认 modal 模式）列出动作摘要（N pick / M squash / K drop / 重排）。
    - 图标/交互遵循 ICONS inline-SVG 与 hover-opacity 既有规范。
 5. **graph 右键入口** — `extension.ts` 注册 `gitBamboo.graph.rebaseOnto`：从 `contextTargetSlot` take 停靠的行 commit → 调 `getRebasePlan { onto: <该 commit>, branch: 当前分支 }` → 打开面板（数据随 ready 下发）；graph 行 `webview/context` contribution 加一条（`webviewSection` 正则 when 子句收敛，命令名 `Rebase onto this commit…`）。plan 为空链（upstream..branch 无 commit，如右键了本分支祖先）→ 信息提示不弹面板。
@@ -56,7 +56,7 @@ tags: [git, vscode-extension, ui]
 
 ## Acceptance Criteria
 
-- [ ] `npm run compile`（或既有等价 lint/build 流程）无错误；`cargo` 侧零改动（本阶段纯 TS/UI）。
+- [x] `npm run compile`（或既有等价 lint/build 流程）无错误；`cargo` 侧零改动（本阶段纯 TS/UI）。
 - [ ] **手测**：graph 右键 "Rebase onto…" 弹面板，todo 列表与 `git log upstream..branch` 一致。
 - [ ] **手测**：拖拽重排 + drop + squash + reword 自定义消息组合执行，`git log` 结果与计划一致（对照命令行 git 验证）。
 - [ ] **手测**：执行中产生冲突 → 面板停靠视图 + 提交视图冲突栏出现 rebase 冲突 → 三方合并编辑器（rebase 侧标签正确）→ 解决 + 继续 → 完成，graph 自动刷新。
