@@ -15,10 +15,9 @@
  * document (staged bucket → unstage). Targeting is derived statelessly
  * from the open diff tabs, so unrelated editors never get lenses.
  */
-import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
-import { ENGINE_SCHEME, INDEX_REVISION, isValidRepoPath } from './headContent';
+import { ENGINE_SCHEME, INDEX_REVISION, isValidRepoPath, toRelativePath } from './headContent';
 import { hunkNewInterval, type DiffHunk, type LineRange } from './types';
 import { errorMessage } from './util';
 
@@ -206,18 +205,12 @@ export class HunkStagingController implements vscode.Disposable {
       const original = input.original;
       if (original.scheme !== ENGINE_SCHEME) continue;
       if (uri.scheme === 'file' && original.query === INDEX_REVISION) {
-        return { path: this.relativePath(original), staged: false };
+        return { path: toRelativePath(this.root, original), staged: false };
       }
       if (uri.scheme === ENGINE_SCHEME && uri.query === INDEX_REVISION && original.query === 'HEAD') {
-        return { path: this.relativePath(uri), staged: true };
+        return { path: toRelativePath(this.root, uri), staged: true };
       }
     }
     return undefined;
-  }
-
-  /** Repo-relative slash path of a git-bamboo: URI, validated. */
-  private relativePath(uri: vscode.Uri): string {
-    const relative = path.relative(this.root.fsPath, uri.fsPath).replace(/\\/g, '/');
-    return relative;
   }
 }

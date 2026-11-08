@@ -245,10 +245,20 @@ export interface GetBlameResult {
   via: BlameVia;
 }
 
+/** The engine's placeholder object id for a line that exists only in the
+ *  blamed buffer: all zeros, at whatever width the repository's hash uses
+ *  (40 for SHA-1, 64 for SHA-256) — hence the run-of-zeros pattern rather
+ *  than one literal. Shared by isUncommittedBlame and the getBlame response
+ *  validator so the two cannot drift: a validator that rejected an id this
+ *  predicate accepts would throw away exactly the entries the UI knows how
+ *  to render, and one that accepted more would let an arbitrary string
+ *  reach surfaces that interpolate commit ids. */
+export const NULL_COMMIT_ID_RE = /^0+$/;
+
 /** True for the engine's "not committed yet" placeholder commit (the
  *  all-zero object id, SHA-1 or SHA-256 width). */
 export function isUncommittedBlame(commit: BlameCommit): boolean {
-  return /^0+$/.test(commit.id);
+  return NULL_COMMIT_ID_RE.test(commit.id);
 }
 
 /** The hunk's new-side action interval — the shared host/engine contract

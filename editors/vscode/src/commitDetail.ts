@@ -15,12 +15,11 @@
  * ever sends back paths, while every revision used in a diff URI is
  * derived from the host-held detail, never from webview fields.
  */
-import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
-import { commitRevisionUri, EMPTY_REVISION, isValidRepoPath } from './headContent';
+import { isValidRepoPath, openCommitFileDiff } from './headContent';
 import type { CommitDetail } from './types';
-import { COMMIT_ID_RE, errorMessage } from './util';
+import { COMMIT_ID_RE } from './util';
 import { buildWebviewHtml } from './webviewHtml';
 
 const PANEL_TYPE = 'gitBamboo.commitDetail';
@@ -162,40 +161,21 @@ class CommitDetailPanel {
     if (this.webviewReady) void this.panel.webview.postMessage({ type: 'commitDetail', detail });
   }
 
-  /** Opens the parent↔commit diff for a file row. Everything except the
-   *  row path (validated at the message boundary above) is derived from
-   *  the host-held detail; URI building re-validates paths internally
-   *  (resolveRepoPath), throwing into the catch below on failure. */
+  /** Opens the parent↔commit diff for a file row — the shared helper the
+   *  blame hover's "Open Changes" link also calls, so the two surfaces cannot
+   *  drift on the empty-left-side / rename / title rules. Everything except
+   *  the row path (validated at the message boundary above) is derived from
+   *  the host-held detail. */
   private async openChanges(filePath: string): Promise<void> {
     const detail = this.currentDetail;
     if (!detail) return;
-    const entry = detail.files.find((file) => file.path === filePath);
-    if (!entry) return;
-
-    const shortSha = detail.id.slice(0, 8);
-    let leftRef: string;
-    if (entry.status === 'A' || detail.parent_ids.length === 0) {
-      leftRef = EMPTY_REVISION; // added file or root commit: no parent side
-    } else {
-      const parent = detail.parent_ids[0]; // diff baseline
-      if (!COMMIT_ID_RE.test(parent)) return;
-      leftRef = parent;
-    }
-    // The file lived at old_path in the parent (rename); the new path at
-    // this commit.
-    const leftPath = entry.old_path ?? entry.path;
-
-    try {
-      const leftUri = commitRevisionUri(this.root, leftPath, leftRef);
-      const rightUri = commitRevisionUri(this.root, entry.path, detail.id);
-      const base = path.basename(entry.path);
-      const title =
-        leftRef === EMPTY_REVISION
-          ? `${base} (${shortSha})`
-          : `${base} (${shortSha}^) ↔ ${base} (${shortSha})`;
-      await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title);
-    } catch (err) {
-      vscode.window.showErrorMessage(`Git Bamboo: open changes failed — ${errorMessage(err)}`);
-    }
+    // Row paths only ever come from the detail that was pushed, but a message
+    // can be in flight across a re-target: a path this detail does not have
+    // opens nothing rather than a diff of an unknown path.
+    if (!detail.files.some((file) => file.path === filePath)) return;
+    // 'unresolved-parent' deliberately unmessaged here: the parent ids come
+    // from this same host-held detail, so an unusable one is an engine
+    // contract break the webview row could not act on anyway.
+    await openCommitFileDiff(this.root, detail, filePath);
   }
 }

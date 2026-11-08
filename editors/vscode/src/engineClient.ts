@@ -7,6 +7,7 @@
  * (notification). Pure Node — no vscode dependency, easy to unit test.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { NULL_COMMIT_ID_RE } from './types';
 import type {
   BlameEntry,
   BranchStatus,
@@ -31,6 +32,7 @@ import type {
   StashEntry,
   LineRange,
 } from './types';
+import { COMMIT_ID_RE } from './util';
 
 /** Engine JSON-RPC error codes the client acts on (beyond raw display). */
 export const RpcErrorCode = {
@@ -236,7 +238,8 @@ export class EngineClient {
    * Blame walks history, so the timeout is twice the other read RPCs. A
    * malformed response degrades to an empty entry list (the getDiff
    * convention) — blame surfaces then clear instead of rendering
-   * half-valid attributions.
+   * half-valid attributions — and is logged, because a silent clear is
+   * otherwise indistinguishable from a file that has nothing to blame.
    */
   async getBlame(
     path: string,
@@ -250,7 +253,11 @@ export class EngineClient {
     if (rev != null) params.rev = rev;
     if (contents != null) params.contents = contents;
     const result = await this.request<unknown>('getBlame', params, 30_000);
-    return isValidGetBlameResult(result) ? result : { rev: '', entries: [], via: 'gix' };
+    if (!isValidGetBlameResult(result)) {
+      console.error('[git-bamboo] malformed getBlame response:', result);
+      return { rev: '', entries: [], via: 'gix' };
+    }
+    return result;
   }
 
   /** Engine RPC `stageRanges`: stage the hunks of `path` intersecting
@@ -632,7 +639,14 @@ function isValidBlameEntry(value: unknown): value is BlameEntry {
   const commit = value.commit;
   if (!isRecord(commit)) return false;
   return (
+    // Shape-checked, not merely type-checked: the id is interpolated into the
+    // hover card's markdown and forwarded as a command argument, so anything
+    // but a real commit id or the all-zero "not committed yet" placeholder is
+    // rejected here rather than rendered. Rejecting drops the WHOLE response
+    // (annotations vanish, logged above) instead of showing attacker-shaped
+    // text over the user's code.
     typeof commit.id === 'string' &&
+    (COMMIT_ID_RE.test(commit.id) || NULL_COMMIT_ID_RE.test(commit.id)) &&
     typeof commit.author_name === 'string' &&
     typeof commit.author_email === 'string' &&
     typeof commit.author_time === 'number' &&

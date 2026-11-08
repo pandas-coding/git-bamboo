@@ -21,11 +21,16 @@
  * version): the engine joins commit metadata server-side, so a per-line or
  * per-entry RPC from here would be a protocol violation, not just slow.
  */
-import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { openCommitDetailPanel } from './commitDetail';
 import { EngineClient } from './engineClient';
-import { commitRevisionUri, EMPTY_REVISION, ENGINE_SCHEME, isValidRepoPath } from './headContent';
+import {
+  commitRevisionUri,
+  ENGINE_SCHEME,
+  isValidRepoPath,
+  openCommitFileDiff,
+  toRelativePath,
+} from './headContent';
 import { isUncommittedBlame, type BlameCommit, type BlameEntry, type GetBlameResult } from './types';
 import { COMMIT_ID_RE, debounce, errorMessage, relativeTime } from './util';
 
@@ -167,9 +172,19 @@ function documentKey(document: vscode.TextDocument): string {
 /** Cache key for one (path, rev, buffer) blame; `dirtyVersion` null means
  *  the worktree/saved content. Shared by deriveTarget and the
  *  annotatePrevious parent pre-check so a pre-fetched parent revision is a
- *  cache hit for the document opened afterwards. */
+ *  cache hit for the document opened afterwards.
+ *
+ *  `rev: null` must NOT render as 'HEAD': null asks the engine to blame the
+ *  WORKING-TREE bytes while 'HEAD' blames HEAD's blob, and the same path is
+ *  legitimately open both ways at once (a file editor next to the
+ *  `git-bamboo:<path>?HEAD` side of a staged diff). One key for both would
+ *  serve whichever rendered first to the other, painting attribution
+ *  computed for different bytes — shifted or garbage annotations on any file
+ *  whose worktree copy differs from HEAD. The placeholder cannot collide
+ *  with a real rev: deriveTarget only ever produces 'HEAD' or a 40–64 hex
+ *  sha. */
 function cacheKey(blamePath: string, rev: string | null, dirtyVersion: number | null): string {
-  return `${blamePath}\u0000${rev ?? 'HEAD'}\u0000${dirtyVersion === null ? 'worktree' : `v${dirtyVersion}`}`;
+  return `${blamePath}\u0000${rev ?? 'worktree-file'}\u0000${dirtyVersion === null ? 'worktree' : `v${dirtyVersion}`}`;
 }
 
 function isExpired(entry: CachedBlame): boolean {
@@ -245,12 +260,7 @@ export class BlameController implements vscode.Disposable {
         this.scheduleRender();
         this.scheduleLenses();
       }),
-      vscode.workspace.onDidSaveTextDocument((document) => {
-        // Saving does not fire a content change, but it turns a dirty-buffer
-        // blame into a worktree blame — re-render to drop the uncommitted
-        // labels the engine can no longer reproduce.
-        for (const editor of this.visibleEditorsFor(document)) this.render(editor);
-      }),
+      vscode.workspace.onDidSaveTextDocument((document) => this.onSaved(document)),
       vscode.workspace.onDidCloseTextDocument((document) => this.forgetDocument(document)),
     );
   }
@@ -287,6 +297,35 @@ export class BlameController implements vscode.Disposable {
     // unannotated until some later event re-triggered it.
     this.inflight.clear();
     this.renderVisibleEditors();
+    this.lensesChanged.fire();
+  }
+
+  /** Saving does not fire a content change, but it flips the target from a
+   *  dirty-buffer blame to a worktree blame — and the worktree key can still
+   *  hold the PRE-EDIT entry inside its TTL, which render() then serves
+   *  without revalidating (the uncommitted labels the save was supposed to
+   *  drop survive until the file watcher happens to fire invalidate()).
+   *  So drop that entry first.
+   *
+   *  The generation bump + inflight clear is invalidate()'s own supersession
+   *  machinery, reused rather than duplicated per key: a fetch that started
+   *  before the save read the old bytes and must not repopulate the key on
+   *  arrival, and only the generation counter can stop it. It is global, so
+   *  an in-flight refresh of ANOTHER document is discarded too — harmless,
+   *  because that document keeps its cached entry and re-fetches on its next
+   *  render (every scroll tick, edit and editor switch renders). */
+  private onSaved(document: vscode.TextDocument): void {
+    if (this.disposed) return;
+    // Documents blame is off for have no cached entry to go stale.
+    if (!this.enabled.has(documentKey(document))) return;
+    const target = this.blameTarget(document); // post-save target (memo keys on isDirty)
+    this.generation++;
+    this.inflight.clear();
+    if (target) this.cache.delete(target.key);
+    for (const editor of this.visibleEditorsFor(document)) this.render(editor);
+    // The cursor line's attribution can change with the save (an uncommitted
+    // line becomes a real commit), so the lens has to be recomputed too —
+    // provideLenses awaits the fresh fetch this just triggered.
     this.lensesChanged.fire();
   }
 
@@ -362,8 +401,10 @@ export class BlameController implements vscode.Disposable {
 
   /** `gitBamboo.blame.diffLine`: the introducing commit's diff for the
    *  blamed file — the commit-detail panel's "Open Changes" landing surface
-   *  (parent↔commit side-by-side). Commit-level precision only this phase:
-   *  the diff is not scrolled to the blamed line. */
+   *  (parent↔commit side-by-side), reached through the SAME shared helper so
+   *  the two surfaces cannot drift on the empty-side / rename / title rules.
+   *  Commit-level precision only this phase: the diff is not scrolled to the
+   *  blamed line. */
   async openCommitDiff(shaArg: unknown, pathArg: unknown): Promise<void> {
     if (typeof shaArg !== 'string' || !COMMIT_ID_RE.test(shaArg)) return;
     if (typeof pathArg !== 'string' || !isValidRepoPath(pathArg)) return;
@@ -374,31 +415,14 @@ export class BlameController implements vscode.Disposable {
       );
       return;
     }
-    const file = detail.files.find((entry) => entry.path === pathArg || entry.old_path === pathArg);
-    const newPath = file?.path ?? pathArg;
-    // The parent side lived at old_path when the commit renamed the file.
-    const oldPath = file?.old_path ?? pathArg;
-    const parent = detail.parent_ids[0];
-    const leftRef =
-      file?.status === 'A' || parent === undefined ? EMPTY_REVISION : parent;
-    if (leftRef !== EMPTY_REVISION && !COMMIT_ID_RE.test(leftRef)) {
+    // Unlike the commit-detail panel, this says the unresolved-parent case
+    // out loud: the blamed path arrives from a hover link rather than from
+    // the detail itself, so silence here would read as a dead link.
+    const outcome = await openCommitFileDiff(this.root, detail, pathArg);
+    if (outcome === 'unresolved-parent') {
       vscode.window.showErrorMessage(
         `Git Bamboo: cannot resolve the parent of ${shaArg.slice(0, 8)}`,
       );
-      return;
-    }
-    try {
-      const left = commitRevisionUri(this.root, oldPath, leftRef);
-      const right = commitRevisionUri(this.root, newPath, detail.id);
-      const base = path.basename(newPath);
-      const short = detail.id.slice(0, 8);
-      const title =
-        leftRef === EMPTY_REVISION
-          ? `${base} (${short})`
-          : `${base} (${short}^) ↔ ${base} (${short})`;
-      await vscode.commands.executeCommand('vscode.diff', left, right, title);
-    } catch (err) {
-      vscode.window.showErrorMessage(`Git Bamboo: open changes failed — ${errorMessage(err)}`);
     }
   }
 
@@ -646,17 +670,29 @@ export class BlameController implements vscode.Disposable {
   }
 
   /** The hover card for one line's blame entry. Trusted Markdown (it carries
-   *  command links); every argument embedded in a link is host-derived and
-   *  re-validated at the command boundary, and repository strings (author,
-   *  subject, renamed path) go through appendText so untrusted content can
-   *  neither forge a command URI nor break the layout. */
+   *  command links), trusted by ALLOWLIST: the boolean form would permit every
+   *  `command:` URI in the card, and this card is built from engine-supplied
+   *  strings — so only the two commands the links actually name can run.
+   *  Repository strings (author, subject, renamed path) go through appendText,
+   *  and the interpolated commit id is shape-validated before it reaches here
+   *  (engineClient's isValidBlameEntry accepts a hex sha or the all-zero
+   *  placeholder only), so nothing can close the code span and forge a link;
+   *  every argument is re-validated at the command boundary regardless. */
   private hoverMarkdown(target: BlameTarget, entry: BlameEntry): vscode.MarkdownString {
     const md = new vscode.MarkdownString(undefined, true);
-    md.isTrusted = true;
+    md.isTrusted = {
+      enabledCommands: [BLAME_SHOW_COMMIT_COMMAND, BLAME_DIFF_LINE_COMMAND],
+    };
     const commit = entry.commit;
     if (isUncommittedBlame(commit)) {
-      md.appendMarkdown(`**${NOT_COMMITTED_LABEL}**\n\n`);
-      md.appendText(commit.summary);
+      md.appendMarkdown(`**${NOT_COMMITTED_LABEL}**`);
+      // The engine synthesizes this placeholder's summary as the very same
+      // phrase, so echoing it reads as a stutter — only a summary that says
+      // something else earns a second line.
+      if (commit.summary.length > 0 && commit.summary !== NOT_COMMITTED_LABEL) {
+        md.appendMarkdown('\n\n');
+        md.appendText(commit.summary);
+      }
       return md;
     }
     const author = commit.author_name.trim() || commit.author_email;
@@ -738,8 +774,11 @@ export class BlameController implements vscode.Disposable {
   }
 
   private store(key: string, entry: CachedBlame): void {
+    // Real LRU: Map iteration order is INSERTION order and `set` on an
+    // existing key does not move it, so a refreshed (i.e. hot) key has to be
+    // re-inserted or it can be the one evicted while cold keys survive.
+    this.cache.delete(key);
     this.cache.set(key, entry);
-    // Map iteration order is insertion order → evict the oldest.
     while (this.cache.size > MAX_CACHE_ENTRIES) {
       const oldest = this.cache.keys().next();
       if (oldest.done) return;
@@ -790,7 +829,7 @@ export class BlameController implements vscode.Disposable {
   private deriveTarget(document: vscode.TextDocument): BlameTarget | undefined {
     const uri = document.uri;
     if (uri.scheme !== 'file' && uri.scheme !== ENGINE_SCHEME) return undefined;
-    const relative = path.relative(this.root.fsPath, uri.fsPath).replace(/\\/g, '/');
+    const relative = toRelativePath(this.root, uri);
     // The provider-side validation, applied on the way in: a URI crafted to
     // escape the repository never reaches the engine.
     if (!isValidRepoPath(relative)) return undefined;
@@ -869,22 +908,23 @@ export class BlameController implements vscode.Disposable {
     editor.setDecorations(this.lineHighlightType, []);
   }
 
-  /** Drop the toggle state and cached blame of a closed document (its
-   *  dirty-version keys would otherwise survive until eviction). */
+  /** Drop the per-document state of a closed document. Cache keys are NOT
+   *  swept here: a key's path prefix is shared with the `git-bamboo:` revision
+   *  documents of the same file, which may still be open and annotated, and
+   *  MAX_CACHE_ENTRIES already bounds the map. The relative path is computed
+   *  inline instead of via deriveTarget because that one has side effects on a
+   *  document it reads — a closed buffer would be getText()'d and could post a
+   *  "buffer too large to blame unsaved" status message for a file the user
+   *  just closed. */
   private forgetDocument(document: vscode.TextDocument): void {
     const key = documentKey(document);
     this.enabled.delete(key);
     this.highlighted.delete(key);
     this.targets.delete(key);
-    // deriveTarget, not blameTarget: the memo was just dropped and a closed
-    // document must not re-populate it.
-    const target = this.deriveTarget(document);
-    if (!target) return;
-    this.warned.delete(target.path);
-    const prefix = `${target.path}\u0000`;
-    for (const stale of this.cache.keys()) {
-      if (stale.startsWith(prefix)) this.cache.delete(stale);
-    }
+    const uri = document.uri;
+    if (uri.scheme !== 'file' && uri.scheme !== ENGINE_SCHEME) return;
+    const relative = toRelativePath(this.root, uri);
+    if (isValidRepoPath(relative)) this.warned.delete(relative);
   }
 }
 
