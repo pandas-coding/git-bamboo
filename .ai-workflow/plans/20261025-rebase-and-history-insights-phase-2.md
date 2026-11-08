@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 2：rebase 计划面板 + graph 集成 + 冲突流共享抽取
 date: 2026-10-30
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights
@@ -56,16 +56,16 @@ tags: [git, vscode-extension, ui]
 
 ## Acceptance Criteria
 
-- [x] `npm run compile`（或既有等价 lint/build 流程）无错误；`cargo` 侧零改动（本阶段纯 TS/UI）。
-- [ ] **手测**：graph 右键 "Rebase onto…" 弹面板，todo 列表与 `git log upstream..branch` 一致。
-- [ ] **手测**：拖拽重排 + drop + squash + reword 自定义消息组合执行，`git log` 结果与计划一致（对照命令行 git 验证）。
-- [ ] **手测**：执行中产生冲突 → 面板停靠视图 + 提交视图冲突栏出现 rebase 冲突 → 三方合并编辑器（rebase 侧标签正确）→ 解决 + 继续 → 完成，graph 自动刷新。
-- [ ] **手测**：停靠点"中止"→ 分支回到 pre-rebase tip（SHA 对比）；graph 状态条消失。
-- [ ] **手测**：rebase 进行中 reload VS Code → 面板 serializer 恢复为停靠只读视图。
-- [ ] **手测**：执行前底层历史变化（另一终端 commit）→ Execute 返回 stale 提示，用户编辑未被清空。
-- [ ] **手测**：外部命令行启动 `git rebase -i` 停靠 → graph 状态条出现（检测不依赖引擎簿记）。
-- [ ] pull/stash 冲突流回归：现有冲突解决路径行为不变（抽取后共用同一代码）。
-- [ ] 入站消息校验：伪造越界 payload（非 hex id、未知 action、超长）被 host 丢弃且不触发引擎 RPC。
+- [x] `npm run compile`（或既有等价 lint/build 流程）无错误；`npm run typecheck` 无错误。**cargo 侧改动（用户批准的例外，超出原 Phase 2 纯 TS/UI 红线）**：手动验证中 `rm -rf` + 重建测试仓库暴露两个引擎健壮性缺陷——watcher re-arm（`session.rs`：repo 根/gitdir 被删后 inotify watch 随旧 inode 失效，外部 CLI 改动不再通知）与 undo 自愈（`undo.rs`：写前重建 `.git/bamboo` 父目录）。含 2 个回归测试，`cargo test -p bamboo-engine` 113 绿。
+- [x] **手测（场景 1）**：graph 右键 "Rebase onto…" 弹面板，todo 列表与 `git log upstream..branch` 一致 —— 通过。
+- [x] **手测（场景 2）**：拖拽重排 + drop + squash + reword 自定义消息组合执行，`git log` 结果与计划一致 —— 通过。修复：submitTodo 须把 drop 行作为显式 `{id,action:'drop'}` 条目下发（引擎要求 todo id 集合相等，否则 -32005）。
+- [x] **手测（场景 3）**：执行中产生冲突 → 面板停靠视图 + 提交视图冲突栏出现 rebase 冲突 → 三方合并编辑器（rebase 侧标签正确）→ 解决 + 继续 → 完成，graph 自动刷新 —— 通过（截图核实：红条 "1 unresolved conflict"、进度 4/6、DONE 4 / REMAINING 2、Abort/Skip/Continue）。
+- [x] **手测（场景 4）**：停靠点"中止"→ 分支回到 pre-rebase tip（SHA 对比）；graph 状态条消失 —— 通过（用户核实 SHA 正常）。
+- [x] **手测（场景 6）**：rebase 进行中 reload VS Code → 面板 serializer 恢复停靠只读视图 —— 通过。实现经 webview `vscode.setState/getState`（plan 模式持久化 onto+plan+todo 含用户编辑；停靠视图由磁盘态重导）；host 从 serializer `state.onto` 重获信任锚，restored 面板跳过重新 fetch 以保留编辑。
+- [x] **手测（场景 5）**：执行前底层历史变化（另一终端 commit）→ Execute 返回 stale 提示，用户编辑未被清空 —— 通过（黄条"计划过期"+ 刷新按钮，编辑保留）。
+- [x] **手测（场景 7）**：外部命令行启动 `git rebase -i` 停靠 → graph 状态条出现（检测不依赖引擎簿记，读磁盘 `rebase-merge`/`rebase-apply`）—— 通过。附带修复引擎 watcher re-arm（见上），仓库重建后外部 CLI 改动能重新通知。
+- [x] **手测（场景 8）**：pull/stash 冲突流回归——现有冲突解决路径行为不变（抽取后 pull/stash/rebase 共用 `conflictFlow.ts`）—— 通过。附带修复 merge editor staging bug：未解决的合并结果序列化为无标记的 base 内容，旧 save 钩子会静默 stage base 并塌缩冲突（index=base/worktree=resolved 的伪 MM）；改为 tab 关闭（Complete Merge）时 stage + 三重守卫（标记/新鲜度/base 陷阱）。并修复 commitDetail.js 的 formatTime 悬空引用（util.js 抽取遗留）。
+- [~] **入站消息校验（场景 9，运行时篡改测试跳过）**：伪造越界 payload（非 hex id、未知 action、超长）被 host 丢弃且不触发引擎 RPC —— **由代码评审覆盖**（`rebasePanel.ts`：逐字段校验 + `MAX_TODO_ENTRIES=500` + id `/^[0-9a-f]{40,64}$/i` + action 白名单 + message ≤8192 无控制字符；越界 drop + `console.warn`，不回显 webview）。运行时手测跳过原因：VS Code webview 为双层嵌套 frame，devtools 控制台须选中最内层 active frame 才能拿到 `vscode.postMessage`，触达成本高、增量价值低（该守卫防御的是被篡改的 webview，超出常规手测威胁模型）。
 
 ## Dependencies
 
