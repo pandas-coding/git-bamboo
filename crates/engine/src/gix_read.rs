@@ -1,5 +1,5 @@
 use anyhow::Context;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, info, warn};
 
@@ -1500,137 +1500,194 @@ pub fn read_blame_with(
     }
 
     let current_epoch = session.current_epoch();
+    // `via` for the early returns below, where no implementation ran: report
+    // the one that WOULD have, so a caller that forced the porcelain backend
+    // is not told the gix path answered (the equivalence tests check this).
+    let nominal_via = match backend {
+        BlameBackend::GitPorcelainOnly => BlameVia::GitPorcelain,
+        BlameBackend::GixThenGitFallback => BlameVia::Gix,
+    };
+
+    // STAGE 1 — everything that needs the repository: resolve the revision,
+    // decide which bytes are blamed, run the gix walk. The lock is scoped to
+    // this block because stage 2 may spawn `git blame`, and a reader must not
+    // sit on the session locks across a process spawn (the convention
+    // `read_commit_detail` documents): a slow or hung child would otherwise
+    // stall every other read, and the write queue with it.
     // Poison-tolerant locks, as in every other read: a panicked request
     // handler must not take down the whole connection.
-    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+    let (rev_out, blamed_commit, gix_hunks, porcelain_total) = {
+        let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
 
-    let Some(blamed_commit) = resolve_blame_commit(&repo, rev_spec)? else {
-        // Unborn HEAD (a repo without a single commit): there is nothing to
-        // attribute lines to. Empty entries instead of an error, so toggling
-        // blame in a fresh repo is a no-op the client need not special-case
-        // — the same convention `read_blob` uses for an absent path.
-        return Ok(GetBlameResult {
-            rev: String::new(),
-            entries: Vec::new(),
-            via: BlameVia::Gix,
-        });
-    };
-    let rev_out = blamed_commit.to_string();
-
-    // Which bytes the walk attributes lines to, mirroring `git blame`'s own
-    // semantics so the porcelain fallback agrees by construction instead of
-    // by luck:
-    //   contents given          → the caller's buffer is the blamed file
-    //   no contents, no rev     → the WORKTREE file is the blamed file
-    //   no contents, rev given  → the file as of that revision
-    // The worktree case is what a gutter renders against. Blaming HEAD's
-    // blob for a file the editor shows with extra lines would misalign
-    // every annotation below the first change — the line numbers on the
-    // wire refer to the blamed content, so that content has to be the
-    // content the user is looking at.
-    let blamed = match (&req.contents, req.rev.as_deref()) {
-        (Some(_), _) => BlamedContent::Buffer,
-        (None, None) => BlamedContent::Worktree,
-        (None, Some(_)) => BlamedContent::Revision,
-    };
-    // A file deleted from the worktree has no lines to annotate: answer
-    // empty rather than blaming HEAD's copy (which would render against a
-    // buffer that is gone) or letting `git blame` fail on a missing path.
-    let worktree_bytes = match blamed {
-        BlamedContent::Worktree => std::fs::read(session.repo_path.join(&req.path)).ok(),
-        _ => None,
-    };
-    if matches!(blamed, BlamedContent::Worktree) && worktree_bytes.is_none() {
-        debug!(path = %req.path, "blame: worktree file missing, nothing to annotate");
-        return Ok(GetBlameResult {
-            rev: rev_out,
-            entries: Vec::new(),
-            via: BlameVia::Gix,
-        });
-    }
-    let contents_bytes: Option<&[u8]> = match (&blamed, &worktree_bytes) {
-        (BlamedContent::Buffer, _) => req.contents.as_deref().map(str::as_bytes),
-        (BlamedContent::Worktree, Some(bytes)) => Some(bytes),
-        _ => None,
-    };
-
-    // A path that is not in the blamed commit's tree has no history to
-    // suspect. When there IS content to show (an unsaved new file, or an
-    // untracked one) every line is by definition new, so attribute it all
-    // to the null id — which is also what both implementations would have
-    // to be talked into, since neither blames a path absent from the
-    // revision. With no content either (absent path, or a `rev` that
-    // predates the file) answer empty, the convention `read_blob` uses.
-    // `via` is nominal on these paths: no implementation ran.
-    if !path_in_commit_tree(&repo, blamed_commit, &req.path)? {
-        let entries = match contents_bytes {
-            Some(bytes) if !bytes.is_empty() => vec![BlameEntry {
-                start_line: 0,
-                len: count_blame_lines(bytes) as u32,
-                commit: uncommitted_blame_commit(),
-                source_path: None,
-            }],
-            _ => Vec::new(),
+        let Some(blamed_commit) = resolve_blame_commit(&repo, rev_spec)? else {
+            // Unborn HEAD (a repo without a single commit): there is nothing
+            // to attribute lines to. Empty entries instead of an error, so
+            // toggling blame in a fresh repo is a no-op the client need not
+            // special-case — the same convention `read_blob` uses for an
+            // absent path.
+            return Ok(GetBlameResult {
+                rev: String::new(),
+                entries: Vec::new(),
+                via: nominal_via,
+            });
         };
-        return Ok(GetBlameResult {
-            rev: rev_out,
-            entries,
-            via: BlameVia::Gix,
-        });
-    }
+        let rev_out = blamed_commit.to_string();
 
-    // Line endings have to match what the walk diffs against (see
-    // `normalize_blame_eol`); `None` means the revision's own blob is the
-    // blamed content and there is nothing to convert.
-    let normalized = match contents_bytes {
-        Some(bytes) => Some(normalize_blame_eol(&repo, blamed_commit, &req.path, bytes)?),
-        None => None,
-    };
-    let blame_bytes: Option<&[u8]> = normalized.as_deref();
+        // Which bytes the walk attributes lines to, mirroring `git blame`'s
+        // own semantics so the porcelain fallback agrees by construction
+        // instead of by luck:
+        //   contents given          → the caller's buffer is the blamed file
+        //   no contents, no rev     → the WORKTREE file is the blamed file
+        //   no contents, rev given  → the file as of that revision
+        // The worktree case is what a gutter renders against. Blaming HEAD's
+        // blob for a file the editor shows with extra lines would misalign
+        // every annotation below the first change — the line numbers on the
+        // wire refer to the blamed content, so that content has to be the
+        // content the user is looking at.
+        let blamed = match (&req.contents, req.rev.as_deref()) {
+            (Some(_), _) => BlamedContent::Buffer,
+            (None, None) => BlamedContent::Worktree,
+            (None, Some(_)) => BlamedContent::Revision,
+        };
+        // A worktree path with no regular file behind it (deleted, a symlink,
+        // a directory) has no lines to annotate: answer empty rather than
+        // blaming HEAD's copy — which would render against a buffer that is
+        // gone — or letting `git blame` fail on a missing path.
+        let worktree_bytes = match blamed {
+            BlamedContent::Worktree => read_worktree_blame_bytes(&session.repo_path, &req.path)?,
+            _ => None,
+        };
+        if matches!(blamed, BlamedContent::Worktree) && worktree_bytes.is_none() {
+            debug!(path = %req.path, "blame: no worktree file to annotate");
+            return Ok(GetBlameResult {
+                rev: rev_out,
+                entries: Vec::new(),
+                via: nominal_via,
+            });
+        }
+        let contents_bytes: Option<&[u8]> = match (&blamed, &worktree_bytes) {
+            (BlamedContent::Buffer, _) => req.contents.as_deref().map(str::as_bytes),
+            (BlamedContent::Worktree, Some(bytes)) => Some(bytes),
+            _ => None,
+        };
 
-    let (raw, via) = match backend {
-        BlameBackend::GitPorcelainOnly => (
-            // Only a caller-supplied buffer goes over stdin. The worktree
-            // case deliberately passes nothing: git reads the file itself
-            // and applies its own filters, which is the semantics mirrored
-            // above.
-            blame_via_git(
-                &session.repo_path,
-                &req.path,
-                req.rev.as_deref(),
-                req.contents.as_deref(),
-            )?,
-            BlameVia::GitPorcelain,
-        ),
-        BlameBackend::GixThenGitFallback => {
-            match blame_via_gix(&repo, &req.path, blamed_commit, blame_bytes)
-                .and_then(|outcome| hunks_from_gix(&outcome, &req.path))
-            {
-                Ok(hunks) => (hunks, BlameVia::Gix),
-                Err(e) => {
-                    // The fallback is a degradation, not a silent one: log
-                    // it here and report it on the wire (`via`) so a file
-                    // that always takes this path stays diagnosable.
-                    warn!(
-                        path = %req.path,
-                        error = %e,
-                        "gix blame failed; falling back to git blame --porcelain"
-                    );
-                    (
-                        blame_via_git(
-                            &session.repo_path,
-                            &req.path,
-                            req.rev.as_deref(),
-                            req.contents.as_deref(),
-                        )?,
-                        BlameVia::GitPorcelain,
-                    )
+        // A path that is not in the blamed commit's tree has no history to
+        // suspect. When there IS content to show (an unsaved new file, or an
+        // untracked one) every line is by definition new, so attribute it all
+        // to the null id — which is also what both implementations would have
+        // to be talked into, since neither blames a path absent from the
+        // revision. With no content either (absent path, or a `rev` that
+        // predates the file) answer empty, the convention `read_blob` uses.
+        if tree_entry_at(&repo, blamed_commit, &req.path)?.is_none() {
+            let entries = match contents_bytes {
+                Some(bytes) if !bytes.is_empty() => {
+                    vec![BlameEntry {
+                        start_line: 0,
+                        len: blame_line_count(bytes)?,
+                        commit: uncommitted_blame_commit(),
+                        source_path: None,
+                    }]
                 }
+                _ => Vec::new(),
+            };
+            return Ok(GetBlameResult {
+                rev: rev_out,
+                entries,
+                via: nominal_via,
+            });
+        }
+
+        // Line endings have to match what the walk diffs against (see
+        // `normalize_blame_eol`); `None` means the revision's own blob is the
+        // blamed content and there is nothing to convert.
+        let normalized = match contents_bytes {
+            Some(bytes) => Some(normalize_blame_eol(
+                &repo,
+                blamed_commit,
+                &req.path,
+                bytes,
+            )?),
+            None => None,
+        };
+        let blame_bytes: Option<&[u8]> = normalized.as_deref();
+
+        let gix_hunks = match backend {
+            BlameBackend::GitPorcelainOnly => None,
+            BlameBackend::GixThenGitFallback => Some(
+                blame_via_gix(&repo, &req.path, blamed_commit, blame_bytes)
+                    .and_then(|outcome| hunks_from_gix(&outcome, &req.path)),
+            ),
+        };
+        // What the porcelain fallback's hunks must add up to, when that is
+        // predictable. An OWNED cow means we converted line endings, so git
+        // will convert them its own way (a path-level `.gitattributes` can
+        // override `core.autocrlf`) and a total computed here would be a
+        // guess; the revision's blob is not read either, because porcelain
+        // may never run. Both are settled in stage 3, only if it did.
+        let porcelain_total = match &normalized {
+            Some(std::borrow::Cow::Borrowed(bytes)) => {
+                PorcelainTotal::Lines(count_blame_lines(bytes))
             }
+            Some(std::borrow::Cow::Owned(_)) => PorcelainTotal::Deferred,
+            None => PorcelainTotal::RevisionBlob,
+        };
+        (rev_out, blamed_commit, gix_hunks, porcelain_total)
+    };
+
+    // STAGE 2 — the porcelain fallback, with no session lock held.
+    let (raw, via) = match gix_hunks {
+        Some(Ok(hunks)) => (hunks, BlameVia::Gix),
+        other => {
+            // The fallback is a degradation, not a silent one: log it here and
+            // report it on the wire (`via`) so a file that always takes this
+            // path stays diagnosable.
+            if let Some(Err(e)) = &other {
+                warn!(
+                    path = %req.path,
+                    error = %e,
+                    "gix blame failed; falling back to git blame --porcelain"
+                );
+            }
+            (
+                // Only a caller-supplied buffer goes over stdin, and it goes
+                // RAW: git applies its own clean filter to `--contents=-`,
+                // which is the same conversion `normalize_blame_eol` mirrors
+                // for the gix path. The worktree case deliberately passes
+                // nothing — git reads the file itself.
+                blame_via_git(
+                    &session.repo_path,
+                    &req.path,
+                    req.rev.as_deref(),
+                    req.contents.as_deref(),
+                )?,
+                BlameVia::GitPorcelain,
+            )
         }
     };
 
+    // STAGE 3 — the metadata join, which needs the repository again (cache
+    // misses are decoded from objects) and the cache.
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+    if via == BlameVia::GitPorcelain {
+        // The gix path validates its own tiling before it may answer; the
+        // fallback has to satisfy the same invariant, or the line numbers on
+        // the wire describe a file the client is not looking at. (A file
+        // edited between stage 1's read and git's own surfaces here as a
+        // mismatch — the honest answer, and the client asks again on the next
+        // keystroke pause.)
+        let expected = match porcelain_total {
+            PorcelainTotal::Lines(n) => Some(n),
+            PorcelainTotal::RevisionBlob => {
+                Some(match blob_at_path(&repo, blamed_commit, &req.path)? {
+                    Some(blob) => count_blame_lines(&blob.data),
+                    None => 0,
+                })
+            }
+            PorcelainTotal::Deferred => None,
+        };
+        validate_hunk_tiling(&raw, expected, &req.path)?;
+    }
     let entries = join_blame_metadata(&repo, &cache, &raw)?;
 
     // Epoch TOCTOU guard, same shape as read_graph_page: if the watcher
@@ -1706,13 +1763,15 @@ fn resolve_blame_commit(
     }
 }
 
-/// Whether `path` exists in `commit`'s tree (see the absent-path early
-/// return in `read_blame_with`).
-fn path_in_commit_tree(
+/// The object id `path` names in `commit`'s tree, or None when the path is
+/// absent. Shared by the three places that ask "what is at this path" — the
+/// absent-path early return, the CR probe, and the porcelain line count —
+/// which each used to walk commit → tree → entry themselves.
+fn tree_entry_at(
     repo: &gix::Repository,
     commit: gix::ObjectId,
     path: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<gix::ObjectId>> {
     let tree = repo
         .find_object(commit)
         .map_err(|e| anyhow::anyhow!("commit {commit} not found: {e}"))?
@@ -1723,7 +1782,70 @@ fn path_in_commit_tree(
     Ok(tree
         .lookup_entry_by_path(path)
         .map_err(|e| anyhow::anyhow!("path {path:?} lookup failed: {e}"))?
-        .is_some())
+        .map(|e| e.id().detach()))
+}
+
+/// The blob `path` names in `commit`'s tree, or None when the path is absent.
+/// A symlink IS a blob (its content is the target path); a subtree is not, and
+/// neither has lines to compare or count.
+fn blob_at_path<'repo>(
+    repo: &'repo gix::Repository,
+    commit: gix::ObjectId,
+    path: &str,
+) -> anyhow::Result<Option<gix::Blob<'repo>>> {
+    let Some(id) = tree_entry_at(repo, commit, path)? else {
+        return Ok(None);
+    };
+    match repo.find_object(id) {
+        Ok(obj) => Ok(obj.try_into_blob().ok()),
+        Err(e) => Err(anyhow::anyhow!("blob {id} of {path:?} unreadable: {e}")),
+    }
+}
+
+/// Read the worktree file a blame walk annotates.
+///
+/// None means "nothing to annotate": a deleted path, a symlink, or a
+/// directory. Symlinks are refused deliberately — this is the only read that
+/// opens a client-named path itself, and the containment check upstream is
+/// LEXICAL, so a tracked symlink (`notes/secret -> ../../.ssh/id_rsa`) passes
+/// it and `fs::read` would follow it out of the worktree. Blaming the link's
+/// own blob (what `git blame` does) is not the alternative either: that numbers
+/// lines against a one-line target path while the editor shows the resolved
+/// file, so every annotation below line 1 would be wrong.
+///
+/// A file that is present but unreadable IS an error, not None: a permissions
+/// or I/O failure should surface once as a structured error rather than render
+/// as "this file has no history".
+fn read_worktree_blame_bytes(
+    root: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let full = root.join(path);
+    let meta = match std::fs::symlink_metadata(&full) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("cannot stat {path:?}: {e}")),
+    };
+    if meta.file_type().is_symlink() {
+        warn!(path = %path, "blame: refusing to follow a symlink out of the worktree");
+        return Ok(None);
+    }
+    if !meta.is_file() {
+        debug!(path = %path, "blame: not a regular file, nothing to annotate");
+        return Ok(None);
+    }
+    if meta.len() as usize > MAX_BLAME_CONTENTS_BYTES {
+        return Err(BambooError::invalid_argument(format!(
+            "getBlame: {path:?} is {} bytes, above the {} byte limit; \
+             blame a revision of it instead",
+            meta.len(),
+            MAX_BLAME_CONTENTS_BYTES
+        ))
+        .into());
+    }
+    std::fs::read(&full)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("cannot read {path:?}: {e}"))
 }
 
 /// Run gix-blame over the whole file.
@@ -1754,10 +1876,10 @@ fn blame_via_gix(
         since: None,
         // Rename tracking on (copies off) so a renamed file's history does
         // not stop at the rename with every older line attributed to the
-        // renaming commit. Note this is where the gix path intentionally
-        // differs from `git blame`'s default, which does NOT follow renames
-        // without `-C`; the porcelain fallback therefore reports coarser
-        // attribution, which is part of why `via` is on the wire.
+        // renaming commit. `git blame` follows renames by default too, so the
+        // porcelain fallback reports the same `source_path` — asserted in
+        // `blame_follows_renames_and_reports_the_source_path`. Detected COPIES
+        // are where the two differ: neither backend looks for them here.
         rewrites: Some(gix::diff::Rewrites {
             copies: None,
             percentage: Some(0.5),
@@ -1793,27 +1915,13 @@ fn blame_via_gix(
     Ok(outcome)
 }
 
-/// Convert a gix outcome into raw hunks, validating that the entries TILE
-/// the blamed content. `start_in_blamed_file` is a TOKEN index into the
-/// blob split by `byte_lines` (newline included in the token), so the sum of
-/// all `len`s must equal the blob's line count and every entry must start
-/// where the previous one ended. A mismatch means our line model and gix's
-/// disagree (CRLF, no trailing newline, a filter boundary), and returning
-/// partial attribution would silently mislabel every line after the gap —
-/// better to fall back to porcelain.
+/// Convert a gix outcome into raw hunks, validating that the entries TILE the
+/// blamed content.
 fn hunks_from_gix(outcome: &gix::blame::Outcome, path: &str) -> anyhow::Result<Vec<RawBlameHunk>> {
-    let line_count = count_blame_lines(&outcome.blob);
-    let mut hunks = Vec::with_capacity(outcome.entries.len());
-    let mut covered: u32 = 0;
-    for e in &outcome.entries {
-        if e.start_in_blamed_file != covered {
-            anyhow::bail!(
-                "gix blame for {path:?} is not contiguous at line {covered} (entry starts at {})",
-                e.start_in_blamed_file
-            );
-        }
-        covered = covered.saturating_add(e.len.get());
-        hunks.push(RawBlameHunk {
+    let hunks = outcome
+        .entries
+        .iter()
+        .map(|e| RawBlameHunk {
             start_line: e.start_in_blamed_file,
             len: e.len.get(),
             commit_id: e.commit_id.to_string(),
@@ -1824,14 +1932,60 @@ fn hunks_from_gix(outcome: &gix::blame::Outcome, path: &str) -> anyhow::Result<V
                 .as_ref()
                 .map(|n| String::from_utf8_lossy(n).into_owned())
                 .filter(|n| n != path),
-        });
-    }
-    if covered as usize != line_count {
-        anyhow::bail!(
-            "gix blame for {path:?} covers {covered} lines but the blamed content has {line_count}"
-        );
-    }
+        })
+        .collect::<Vec<_>>();
+    // `start_in_blamed_file` is a TOKEN index into the blob split by
+    // `byte_lines` (newline included in the token), so the blob's own line
+    // count is the total the hunks must reach.
+    validate_hunk_tiling(&hunks, Some(count_blame_lines(&outcome.blob)), path)?;
     Ok(hunks)
+}
+
+/// Reject a hunk list that does not describe a whole file: hunks must be
+/// contiguous, start at line 0, and — when `expected` is known — cover exactly
+/// the blamed content's lines.
+///
+/// A mismatch means our line model and the implementation's disagree (CRLF, no
+/// trailing newline, a filter boundary, a parse bug), and answering anyway
+/// would silently mislabel every line after the gap: better to fail. For the
+/// gix path the error triggers the porcelain fallback; for porcelain itself it
+/// is a structured error, since there is nothing left to fall back to.
+fn validate_hunk_tiling(
+    hunks: &[RawBlameHunk],
+    expected: Option<usize>,
+    path: &str,
+) -> anyhow::Result<()> {
+    let mut covered: u32 = 0;
+    for h in hunks {
+        if h.start_line != covered {
+            anyhow::bail!(
+                "blame for {path:?} is not contiguous at line {covered} (next hunk starts at {})",
+                h.start_line
+            );
+        }
+        covered = covered.saturating_add(h.len);
+    }
+    if let Some(expected) = expected {
+        if covered as usize != expected {
+            anyhow::bail!(
+                "blame for {path:?} covers {covered} lines but the blamed content has {expected}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What the porcelain fallback's hunks must add up to. Settled in stage 3 of
+/// `read_blame_with`, only if porcelain actually ran.
+#[derive(Debug, Clone, Copy)]
+enum PorcelainTotal {
+    /// A known line count.
+    Lines(usize),
+    /// The blamed revision's blob: read it then, not before.
+    RevisionBlob,
+    /// Not predictable — we converted line endings, so git's own conversion
+    /// decides the line model. Contiguity is still checked.
+    Deferred,
 }
 
 /// Convert CRLF line endings in the blamed bytes to LF — the way git's
@@ -1906,37 +2060,25 @@ fn blob_has_cr(
     commit: gix::ObjectId,
     path: &str,
 ) -> anyhow::Result<bool> {
-    let tree = repo
-        .find_object(commit)
-        .map_err(|e| anyhow::anyhow!("commit {commit} not found: {e}"))?
-        .try_into_commit()
-        .map_err(|e| anyhow::anyhow!("{commit} is not a commit: {e}"))?
-        .tree()
-        .map_err(|e| anyhow::anyhow!("tree of {commit} unreadable: {e}"))?;
-    let Some(entry) = tree
-        .lookup_entry_by_path(path)
-        .map_err(|e| anyhow::anyhow!("path {path:?} lookup failed: {e}"))?
-    else {
-        return Ok(false);
-    };
-    let Ok(obj) = repo.find_object(entry.id().detach()) else {
-        return Ok(false);
-    };
-    // A symlink or a tree at that path: no bytes to compare.
-    let Ok(blob) = obj.try_into_blob() else {
-        return Ok(false);
-    };
-    Ok(blob.data.contains(&b'\r'))
+    Ok(match blob_at_path(repo, commit, path)? {
+        Some(blob) => blob.data.contains(&b'\r'),
+        None => false,
+    })
 }
 
 /// Line count under the tokenizer gix-blame uses (`byte_lines`: the newline
 /// is part of the token). An empty blob has zero lines; a final line without
 /// a trailing newline still counts as one.
 fn count_blame_lines(blob: &[u8]) -> usize {
-    if blob.is_empty() {
-        return 0;
-    }
     blob.split_inclusive(|b| *b == b'\n').count()
+}
+
+/// `count_blame_lines` as the u32 the wire type uses. More than four billion
+/// lines cannot happen, but a silent `as` truncation would put line numbers on
+/// the wire that do not describe the content.
+fn blame_line_count(blob: &[u8]) -> anyhow::Result<u32> {
+    u32::try_from(count_blame_lines(blob))
+        .map_err(|_| anyhow::anyhow!("blamed content has more lines than u32::MAX"))
 }
 
 /// `git blame --porcelain` — the fallback for when the gix path fails
@@ -1954,6 +2096,12 @@ fn blame_via_git(
     contents: Option<&str>,
 ) -> anyhow::Result<Vec<RawBlameHunk>> {
     let mut cmd = std::process::Command::new("git");
+    // `core.quotepath=false`: porcelain C-quotes any non-ASCII path
+    // (`filename "notes-\303\251.md"`), and a quoted name is neither
+    // displayable in the hover nor a path the client can open for
+    // annotate-previous. `-z` does not help — blame quotes the filename
+    // either way.
+    cmd.arg("-c").arg("core.quotepath=false");
     cmd.arg("blame").arg("--porcelain");
     if contents.is_some() {
         // `-` = read the blamed contents from stdin, so an unsaved buffer
@@ -1970,6 +2118,10 @@ fn blame_via_git(
     cmd.arg("--").arg(path);
     cmd.current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // git would otherwise opportunistically refresh the index, i.e. take
+        // `index.lock` — which the write queue needs. Blame can fire once per
+        // keystroke pause, so a read must never contend for it.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(if contents.is_some() {
             std::process::Stdio::piped()
         } else {
@@ -1981,12 +2133,20 @@ fn blame_via_git(
 
     let mut child = cmd.spawn()?;
     if let Some(contents) = contents {
-        use std::io::Write;
-        // EPIPE here just means git died early; its stderr is the real
-        // error, so a failed write is deliberately ignored.
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(contents.as_bytes());
-        }
+        // Written from a thread, not inline: stdout and stderr are pipes
+        // nobody drains until `wait_with_output`, so a child that fills a
+        // 64 KiB pipe while we are still writing up to 8 MiB would block
+        // forever — and take a blocking-pool thread with it.
+        let bytes = contents.as_bytes().to_vec();
+        let mut stdin = child.stdin.take();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            // EPIPE here just means git died early; its stderr is the real
+            // error, so a failed write is deliberately ignored.
+            if let Some(mut stdin) = stdin.take() {
+                let _ = stdin.write_all(&bytes);
+            }
+        });
     }
     let out = child.wait_with_output()?;
     if !out.status.success() {
@@ -2105,8 +2265,12 @@ fn join_blame_metadata(
     hunks: &[RawBlameHunk],
 ) -> anyhow::Result<Vec<BlameEntry>> {
     let mut ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for h in hunks {
-        if h.commit_id != NULL_COMMIT_ID && !ids.contains(&h.commit_id) {
+        // A file whose lines come from two or three commits is the common
+        // case, so dedupe before decoding anything — O(1) per hunk rather
+        // than a linear scan of `ids`.
+        if h.commit_id != NULL_COMMIT_ID && seen.insert(h.commit_id.as_str()) {
             ids.push(h.commit_id.clone());
         }
     }

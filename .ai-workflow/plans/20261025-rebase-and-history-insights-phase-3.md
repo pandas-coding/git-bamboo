@@ -60,8 +60,8 @@ tags: [git, rust, vscode-extension, ui]
   CRLF 转换、工作区已删除文件、unborn HEAD/路径不存在、非法参数（含路径逃逸）、
   以及 porcelain 回退在上述全部形态上的等价性。
 - [x] `getBlame` 响应含每 entry 的 commit 元数据（author/time/summary），客户端单次往返可渲染（无逐行回查）。
-  —— 引擎侧经 redb commit 缓存做一次 join（`commits: {id: BlameCommit}`，含
-  `author_name`/`author_email`/`author_time`/`summary`；null id 合成 "Not Committed Yet"），
+  —— 引擎侧经 redb commit 缓存做一次 join（`entries[].commit: BlameCommit`，含
+  `author_name`/`author_email`/`author_time`/`committer_time`/`summary`；null id 合成 "Not Committed Yet"），
   `blame.ts` 只从这一份响应渲染 gutter/hover/lens。未提交行的 `BlameCommit` 无命令链接。
 - [x] gix 路径显式传 commit-graph（代码断言/注释可见）；`via` 字段区分实现路径。
   —— `gix_read.rs` 的 `repo.commit_graph_if_enabled()` 显式传入 `blame::file`（带注释说明
@@ -84,9 +84,10 @@ tags: [git, rust, vscode-extension, ui]
 
 ## Implementation Notes（2026-11-09，实现期偏离与补充）
 
-- `GetBlameResult = { rev, via, entries, commits }`：plan 草图只画了 `entries`。`commits`
-  （id → 元数据）是验收项 2「单次往返可渲染」的落地形式，`via` 是验收项 3，`rev` 供
-  annotate-previous 沿链续走。
+- `GetBlameResult = { rev, via, entries }`：plan 草图只画了 `entries`。元数据按草图**内联**在
+  `entries[].commit`（`BlameCommit`），而不是 `commits: {id: BlameCommit}` 映射——一个文件通常
+  只有两三个 commit，去重省下的字节远小于客户端查表的复杂度，故保持草图形状。`via` 是验收项 3，
+  `rev` 供 annotate-previous 沿链续走。
 - **blame 的是哪一份字节**按 `git blame` 语义三选一（plan 未定义，实现中发现必须定义，否则
   entry 行号与客户端实际渲染的文档错位）：给了 `contents` → 客户端缓冲，against `rev`/HEAD；
   无 `contents` 无 `rev` → 工作区文件 against HEAD；无 `contents` 有 `rev` → 该修订版 blob。
@@ -104,8 +105,32 @@ tags: [git, rust, vscode-extension, ui]
 - 脏缓冲 `contents` 上限 8 MiB：服务端帧上限是 16 MiB 且超限直接断连，压在其下才能带内返回
   `INVALID_ARGUMENT` + "先保存、改 blame 工作区副本" 的提示。扩展侧另设 2 MiB 文本上限，
   保证 JSON 转义后必然小于帧上限；超限时退化为 blame 已保存文件并在状态栏说明一次。
-- 回退条件不止"gix 报错"：gix 成功但 entries 未连续铺满 blob 时同样回退 porcelain
-  （`hunks_from_gix` 校验 + 等价性测试），宁可换实现也不交付错位归属。
+- 回退条件不止"gix 报错"：gix 成功但 hunks 未连续铺满被 blame 的内容时同样回退 porcelain
+  （`validate_hunk_tiling` + 等价性测试），宁可换实现也不交付错位归属。porcelain 自己的输出
+  也要过同一条校验——它后面没有可回退的实现了，故校验失败直接返回结构化错误。
+- 评审后修正（同分支）：
+  - **锁作用域**：`read_blame_with` 拆成三段，porcelain 子进程在**不持有** `gix_repo`/`cache`
+    锁时运行（与 `read_commit_detail` 的"读不得跨进程持锁"约定一致），否则一个卡住的 git
+    会拖住整个 session 的读与写队列。
+  - **符号链接**：worktree 读取用 `symlink_metadata`，链接一律不跟随（返回空标注）——上游
+    收敛校验是词法的，被跟踪的链接（`notes/secret -> ../../.ssh/id_rsa`）能过校验并被
+    `fs::read` 读出仓库外内容。同一读取补上 8 MiB 上限（worktree 文件不受帧上限约束），
+    并把"存在但读不了"（权限/IO）从静默空标注改成结构化错误。
+  - **porcelain 路径名**：加 `-c core.quotepath=false`，否则非 ASCII 路径被 C 转义
+    （`"notes-\303\251.md"`），hover 不可读且客户端无法用它打开 annotate-previous；`-z` 无效。
+    另加 `GIT_OPTIONAL_LOCKS=0`：blame 可能每个键入停顿都触发，读不应去抢 `index.lock`。
+  - **stdin 死锁**：`--contents=-` 的缓冲改由子线程写入。stdout/stderr 在
+    `wait_with_output` 之前无人排空，最多 8 MiB 的写入与 64 KiB 管道会互相阻塞。
+  - **`via` 语义**：早退路径（unborn HEAD、路径不在树中、worktree 无可标注内容）原先硬编码
+    `Gix`，现报告"本来会跑的那条"（强制 porcelain 的等价性测试因此才真正校验到该字段）。
+  - rename 注释纠正：`git blame` **默认**跟随重命名（已实测），故两条路径的 `source_path`
+    一致（等价性测试断言）；差异只在 copy 检测，两边都不开。
+  - **扩展侧缓存键**（评审发现的真缺陷）：`rev: null`（工作区字节）与 `rev: 'HEAD'`（HEAD 的
+    blob）曾折叠成同一个键，同一文件同时以两种形态打开时（文件编辑器 + 暂存 diff 的
+    `?HEAD` 一侧）会互相串用标注；现 null 渲染为独立占位符。hover 的 `isTrusted` 从布尔
+    改为命令白名单，并对 entry 的 commit id 做形状校验（不合格则整份响应丢弃 + 记录日志）；
+    保存时主动失效对应缓存键（原来只能等 watcher 通知）；两个 "Open Changes" 入口合并为
+    `openCommitFileDiff`，`toRelativePath` 单一实现。
 
 ## Dependencies
 

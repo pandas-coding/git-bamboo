@@ -4525,6 +4525,34 @@ async fn blame_follows_renames_and_reports_the_source_path() -> anyhow::Result<(
             "a rename must surface the path the lines came from"
         );
     }
+
+    // `git blame` follows renames by default too, so the fallback must report
+    // the SAME source path — otherwise annotate-previous would open a
+    // different file depending on which implementation happened to answer.
+    let forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "new.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(forced.via, bamboo_protocol::BlameVia::GitPorcelain);
+    assert_eq!(blamed_lines(&forced), blamed_lines(&result));
+    assert_eq!(
+        forced
+            .entries
+            .iter()
+            .map(|e| e.source_path.as_deref())
+            .collect::<Vec<_>>(),
+        result
+            .entries
+            .iter()
+            .map(|e| e.source_path.as_deref())
+            .collect::<Vec<_>>(),
+        "rename attribution must not depend on which implementation ran"
+    );
     Ok(())
 }
 
@@ -4678,6 +4706,11 @@ async fn blame_of_an_unsaved_new_file_is_all_uncommitted() -> anyhow::Result<()>
         bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
     )?;
     assert_eq!(blamed_lines(&forced), blamed_lines(&result));
+    assert_eq!(
+        forced.via,
+        bamboo_protocol::BlameVia::GitPorcelain,
+        "the absent-path early return must still name the backend the caller asked for"
+    );
 
     // An empty buffer has no lines, so no hunks (a zero-length hunk would
     // break the tiling invariant the client renders from).
@@ -4835,6 +4868,27 @@ async fn blame_rejects_invalid_arguments_as_structured_errors() -> anyhow::Resul
         bamboo.message
     );
 
+    // A worktree file has no wire framing to bound it at all, so the read is
+    // capped the same way: without it one request would make the engine slurp
+    // an arbitrarily large file and hand gix-blame a second copy of it.
+    std::fs::write(
+        fx.dir.path().join("huge.log"),
+        vec![b'x'; 8 * 1024 * 1024 + 1],
+    )?;
+    let err = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "huge.log".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )
+    .expect_err("an oversized worktree file must be rejected");
+    let bamboo = err
+        .downcast_ref::<bamboo_protocol::BambooError>()
+        .expect("the worktree size cap must stay a structured error too");
+    assert_eq!(bamboo.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+
     // A revision that does not exist is a git error, not an input error —
     // the client cannot fix it by changing the request shape, and hiding it
     // would render "no annotations" for a typo.
@@ -4871,6 +4925,19 @@ async fn blame_of_absent_path_and_unborn_head_is_empty_not_an_error() -> anyhow:
     )?;
     assert!(absent.entries.is_empty());
     assert_eq!(absent.rev, fx.three);
+    // An early return names the backend that WOULD have run, not a hardcoded
+    // "gix": `via` is on the wire so a forced backend stays visible even when
+    // it never got to blame anything.
+    let absent_forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "no/such/file.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(absent_forced.via, bamboo_protocol::BlameVia::GitPorcelain);
 
     // Unborn HEAD (a repo without a single commit): empty entries and an
     // empty rev, so the client renders nothing instead of an error toast.
@@ -4892,6 +4959,16 @@ async fn blame_of_absent_path_and_unborn_head_is_empty_not_an_error() -> anyhow:
     )?;
     assert_eq!(result.rev, "");
     assert!(result.entries.is_empty());
+    let unborn_forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "new.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(unborn_forced.via, bamboo_protocol::BlameVia::GitPorcelain);
     Ok(())
 }
 
@@ -4996,5 +5073,49 @@ async fn blame_of_a_worktree_deleted_file_is_empty() -> anyhow::Result<()> {
     let result = fx.blame(&session)?;
     assert!(result.entries.is_empty());
     assert_eq!(result.rev, fx.three);
+    Ok(())
+}
+
+/// A worktree symlink must not be followed. Blame is the only read that opens
+/// a client-named path itself, and the containment check upstream is LEXICAL:
+/// `link.txt` passes it while pointing anywhere on the filesystem. Following
+/// the link would read — and attribute lines of — a file outside the
+/// repository, and blaming the link's own blob (what `git blame` does) would
+/// number lines against a one-line target path while the editor shows the
+/// resolved file. Empty annotations are the honest answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn blame_of_a_worktree_symlink_is_empty_not_a_read_outside_the_repo() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("id_rsa"), "SECRET\nSECRET2\nSECRET3\n")?;
+    // An absolute target: nothing about the requested path hints at it.
+    std::os::unix::fs::symlink(
+        outside.path().join("id_rsa"),
+        fx.dir.path().join("link.txt"),
+    )?;
+    let session = open_session(&fx.dir).await?;
+    let req = bamboo_protocol::GetBlame {
+        path: "link.txt".to_string(),
+        rev: None,
+        contents: None,
+    };
+    let result = bamboo_engine::gix_read::read_blame(&session, &req)?;
+    assert!(
+        result.entries.is_empty(),
+        "a symlink has no lines to annotate, got {:?}",
+        result.entries
+    );
+    assert_eq!(result.rev, fx.three);
+
+    // Both backends decide the blamed content before they run, so the
+    // porcelain path cannot be the one that leaks either.
+    let forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &req,
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert!(forced.entries.is_empty());
+    assert_eq!(forced.via, bamboo_protocol::BlameVia::GitPorcelain);
     Ok(())
 }
