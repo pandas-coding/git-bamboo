@@ -10,6 +10,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import * as commands from './commands';
+import {
+  BLAME_ANNOTATE_PREVIOUS_COMMAND,
+  BLAME_DIFF_LINE_COMMAND,
+  BLAME_JUMP_TO_COMMIT_COMMAND,
+  BLAME_SHOW_COMMIT_COMMAND,
+  BLAME_TOGGLE_COMMAND,
+  BlameController,
+} from './blame';
 import { ConflictFlow } from './conflictFlow';
 import { CommitViewProvider } from './commitView';
 import { EngineClient } from './engineClient';
@@ -28,6 +36,7 @@ let activeClient: EngineClient | undefined;
 let activeState: RepoState | undefined;
 let activeCommitView: CommitViewProvider | undefined;
 let activeConflictFlow: ConflictFlow | undefined;
+let activeBlame: BlameController | undefined;
 
 /** Shown when a command runs without a repository session (no repo folder
  *  open, or the engine failed to start): silent no-ops are terrible UX. */
@@ -305,6 +314,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     await activeCommitView.showConflicts();
   });
+  // Blame (phase 3): gutter annotations + hover + cursor-line CodeLens.
+  // Registered unconditionally like every other command so the palette and
+  // the editor/title button never dead-end silently; the controller only
+  // exists once a repository session is up.
+  registerCommand(context, BLAME_TOGGLE_COMMAND, () =>
+    activeBlame ? activeBlame.toggle() : noSessionWarning());
+  registerCommand(context, BLAME_SHOW_COMMIT_COMMAND, (sha) =>
+    activeBlame ? activeBlame.showCommit(sha) : noSessionWarning());
+  // The CodeLens "jump to introducing commit" lands on the same commit
+  // detail panel as the hover link — a separate command id keeps the two
+  // entry points independently keybindable.
+  registerCommand(context, BLAME_JUMP_TO_COMMIT_COMMAND, (sha) =>
+    activeBlame ? activeBlame.showCommit(sha) : noSessionWarning());
+  registerCommand(context, BLAME_DIFF_LINE_COMMAND, (sha, blamePath) =>
+    activeBlame ? activeBlame.openCommitDiff(sha, blamePath) : noSessionWarning());
+  registerCommand(context, BLAME_ANNOTATE_PREVIOUS_COMMAND, (uri, line) =>
+    activeBlame ? activeBlame.annotatePrevious(uri, line) : noSessionWarning());
+
   registerCommand(context, 'gitBamboo.commitView.copyPath', async () => {
     if (!activeCommitView) {
       noSessionWarning();
@@ -396,6 +423,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(hunkStaging);
   registerCommand(context, STAGE_HUNK_COMMAND, (path, range) => hunkStaging.stageHunk(path, range));
   registerCommand(context, UNSTAGE_HUNK_COMMAND, (path, range) => hunkStaging.unstageHunk(path, range));
+
+  // Blame annotations (phase 3): one getBlame round trip per (path, rev,
+  // buffer version) drives the gutter decorations, the hover card and the
+  // cursor-line CodeLens actions. OFF by default; the toggle opts each
+  // editor in.
+  const blame = new BlameController(context, client, folder.uri);
+  activeBlame = blame;
+  context.subscriptions.push(blame);
 
   // Sidebar commit graph (compact mode) + editor-area graph panel (full
   // width mode) share the same webview bundle via GraphSession.
@@ -521,6 +556,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   onNotification(client, context, 'worktreeChanged', () => {
     commitView.refresh();
     hunkStaging.refreshLenses();
+    // Blame attributes the worktree/HEAD content the watcher just saw move.
+    blame.invalidate();
   });
   onNotification(client, context, 'indexChanged', (params) => {
     state.epoch = numberField(params, 'epoch', state.epoch);
@@ -529,12 +566,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the hunk CodeLenses re-render against the new index state.
     headContent.notifyIndexChanged();
     hunkStaging.refreshLenses();
+    // Staging changes which lines are still "not committed yet".
+    blame.invalidate();
   });
   onNotification(client, context, 'headChanged', () => {
     void refreshHead();
     scheduleBranchStatus();
     commitView.refresh();
     hunkStaging.refreshLenses();
+    // HEAD moved: every cached (path, HEAD) attribution is stale.
+    blame.invalidate();
   });
 
   // Enables commandPalette `when: git-bamboo:active` visibility rules.
@@ -546,6 +587,7 @@ export async function deactivate(): Promise<void> {
   activeClient = undefined;
   activeState = undefined;
   activeCommitView = undefined;
+  activeBlame = undefined;
 }
 
 /**

@@ -809,6 +809,102 @@ pub struct UndoEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Blame (line-level attribution)
+// ---------------------------------------------------------------------------
+
+/// `getBlame` request: attribute every line of one file to the commit that
+/// introduced it (JetBrains "Annotate" / `git blame` semantics).
+///
+/// The engine joins commit metadata server-side so a client can render
+/// gutter annotations and hover cards from ONE round trip — it must never
+/// issue one RPC per line or per entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBlame {
+    /// Repository-relative path (validated engine-side like every other
+    /// path argument: non-empty, no leading `-`, no control characters).
+    pub path: String,
+    /// Revision to walk back from; `None` means HEAD. Anything that
+    /// resolves to a commit is accepted (branch, tag, sha, `HEAD~2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// Unsaved editor buffer to blame instead of the file on disk
+    /// (dirty-buffer blame). Lines that exist only in `contents` are
+    /// attributed to the null commit id, i.e. "not committed yet".
+    /// Size-capped engine-side; an oversized buffer must be saved first
+    /// (INVALID_ARGUMENT).
+    ///
+    /// With `rev`, this selects WHICH BYTES get annotated. The returned
+    /// line numbers refer to that content, so it has to be the content the
+    /// caller renders — the same rule `git blame` follows:
+    ///   contents given          → the buffer, blamed against `rev`/HEAD
+    ///   no contents, no rev     → the worktree file, blamed against HEAD
+    ///   no contents, rev given  → the file as of that revision
+    /// A worktree file that has been deleted annotates as empty (nothing to
+    /// show) rather than falling back to HEAD's copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
+}
+
+/// Commit metadata attached to every blame entry — enough for the gutter
+/// text and the hover card, without a second RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlameCommit {
+    /// Full hex object id. The all-zero id means "not committed yet" (dirty
+    /// buffer lines): the name/email/summary are then display strings rather
+    /// than repository data, and both times are 0.
+    pub id: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Author time, Unix seconds.
+    pub author_time: i64,
+    /// Committer time, Unix seconds.
+    pub committer_time: i64,
+    /// Subject line (first line) of the commit message.
+    pub summary: String,
+}
+
+/// One hunk of consecutive lines attributed to a single commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlameEntry {
+    /// First line of the hunk in the blamed file, 0-BASED (editor line =
+    /// `start_line + 1`), mirroring `gix_blame::BlameEntry`.
+    pub start_line: u32,
+    /// Number of lines in the hunk (>= 1).
+    pub len: u32,
+    pub commit: BlameCommit,
+    /// The file's path in `commit` when it differs from the blamed path
+    /// (i.e. the file was renamed somewhere after that commit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+/// Which implementation produced the entries. Surfaced so the porcelain
+/// fallback stays observable instead of being a silent degradation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlameVia {
+    /// gix-blame, in-process and commit-graph accelerated (the default).
+    Gix,
+    /// `git blame --porcelain` fallback, taken when the gix path fails
+    /// (large/pathological files, or an API boundary we do not cover).
+    GitPorcelain,
+}
+
+/// `getBlame` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetBlameResult {
+    /// Resolved commit id of the blamed revision (empty string for an
+    /// unborn HEAD, where `entries` is empty). Clients key their render
+    /// cache on `(path, rev)`.
+    pub rev: String,
+    /// Hunks in ascending `start_line` order. Coverage is total: they tile
+    /// every line of the blamed content (asserted engine-side against the
+    /// blob's line count before the response is built).
+    pub entries: Vec<BlameEntry>,
+    pub via: BlameVia,
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC notification types (server → client)
 // ---------------------------------------------------------------------------
 

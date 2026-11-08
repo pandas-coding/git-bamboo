@@ -4211,3 +4211,911 @@ async fn undo_self_heals_after_bamboo_dir_removed() -> anyhow::Result<()> {
     assert!(dir.path().join(".git").join("bamboo").join("audit.log").exists());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Blame (getBlame)
+// ---------------------------------------------------------------------------
+
+/// Commit the staged changes in `dir` as `author` at a fixed timestamp and
+/// return the new HEAD's sha. Identity comes from the environment (all four
+/// variables), so the fixture repo needs no `user.*` config.
+fn blame_commit(
+    dir: &std::path::Path,
+    msg: &str,
+    author: &str,
+    date: &str,
+) -> anyhow::Result<String> {
+    let email = format!("{}@example.com", author.to_lowercase());
+    let out = Command::new("git")
+        .args(["commit", "-q", "-m", msg])
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", author)
+        .env("GIT_AUTHOR_EMAIL", &email)
+        .env("GIT_COMMITTER_NAME", author)
+        .env("GIT_COMMITTER_EMAIL", &email)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git commit {msg:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()?;
+    Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+}
+
+/// The blame fixture: `f.txt` evolving over three commits, each by a
+/// different author at a distinct timestamp so attribution is unambiguous.
+///
+/// ```text
+///   one   (Ann, 2026-01-01)  f.txt = a   b   c
+///   two   (Bob, 2026-01-02)  f.txt = a   B2  c   d   e     line 2 rewritten, 4-5 appended
+///   three (Cyd, 2026-01-03)  f.txt = a   B2  c   d   E5  f  line 5 rewritten, 6 appended
+/// ```
+///
+/// Expected HEAD attribution, 0-based line → introducing commit:
+/// `0→one, 1→two, 2→one, 3→two, 4→three, 5→three`.
+struct BlameFixture {
+    dir: tempfile::TempDir,
+    one: String,
+    two: String,
+    three: String,
+}
+
+impl BlameFixture {
+    /// Blame `f.txt` at HEAD through the engine's read path.
+    fn blame(
+        &self,
+        session: &std::sync::Arc<bamboo_engine::session::Session>,
+    ) -> anyhow::Result<bamboo_protocol::GetBlameResult> {
+        bamboo_engine::gix_read::read_blame(
+            session,
+            &bamboo_protocol::GetBlame {
+                path: "f.txt".to_string(),
+                rev: None,
+                contents: None,
+            },
+        )
+    }
+
+    /// The committed content of `f.txt` (what HEAD blames).
+    fn head_content(&self) -> anyhow::Result<String> {
+        Ok(std::fs::read_to_string(self.dir.path().join("f.txt"))?)
+    }
+}
+
+fn blame_repo() -> anyhow::Result<BlameFixture> {
+    let dir = tempfile::tempdir()?;
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    };
+
+    git(&["init", "-q", "-b", "main"])?;
+    // Pin line endings: a CRLF conversion on checkout would change the
+    // blamed bytes and with them the expected line count.
+    git(&["config", "core.autocrlf", "false"])?;
+
+    std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n")?;
+    git(&["add", "."])?;
+    let one = blame_commit(dir.path(), "one", "Ann", "2026-01-01T00:00:00Z")?;
+
+    std::fs::write(dir.path().join("f.txt"), "a\nB2\nc\nd\ne\n")?;
+    git(&["add", "."])?;
+    let two = blame_commit(dir.path(), "two", "Bob", "2026-01-02T00:00:00Z")?;
+
+    std::fs::write(dir.path().join("f.txt"), "a\nB2\nc\nd\nE5\nf\n")?;
+    git(&["add", "."])?;
+    let three = blame_commit(dir.path(), "three", "Cyd", "2026-01-03T00:00:00Z")?;
+
+    Ok(BlameFixture {
+        dir,
+        one,
+        two,
+        three,
+    })
+}
+
+/// Expand hunks into one commit id per line — the invariant clients render
+/// from, and the only shape both blame implementations must agree on.
+fn blamed_lines(result: &bamboo_protocol::GetBlameResult) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in &result.entries {
+        for _ in 0..e.len {
+            out.push(e.commit.id.clone());
+        }
+    }
+    out
+}
+
+/// Assert the hunks tile the file exactly: ascending, contiguous, no empty
+/// hunk, and covering all `line_count` lines. A gap would silently mislabel
+/// every line after it, which is why the engine checks this too.
+fn assert_tiles(result: &bamboo_protocol::GetBlameResult, line_count: u32) {
+    let mut next = 0;
+    for e in &result.entries {
+        assert_eq!(
+            e.start_line, next,
+            "hunks must be contiguous and ascending: {:?}",
+            result.entries
+        );
+        assert!(e.len >= 1, "empty hunk at line {}", e.start_line);
+        next += e.len;
+    }
+    assert_eq!(next, line_count, "hunks must cover every line");
+}
+
+/// The commit metadata of the hunk covering `line` (0-based).
+fn commit_at_line(
+    result: &bamboo_protocol::GetBlameResult,
+    line: u32,
+) -> &bamboo_protocol::BlameCommit {
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| line >= e.start_line && line < e.start_line + e.len)
+        .unwrap_or_else(|| panic!("no blame entry covers line {line}: {:?}", result.entries));
+    &entry.commit
+}
+
+#[tokio::test]
+async fn blame_attributes_each_line_to_its_introducing_commit() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+
+    let result = fx.blame(&session)?;
+    assert_eq!(result.via, bamboo_protocol::BlameVia::Gix);
+    assert_eq!(
+        result.rev, fx.three,
+        "rev must be the resolved HEAD commit id clients cache on"
+    );
+    assert_tiles(&result, 6);
+    assert_eq!(
+        blamed_lines(&result),
+        vec![
+            fx.one.clone(),
+            fx.two.clone(),
+            fx.one.clone(),
+            fx.two.clone(),
+            fx.three.clone(),
+            fx.three.clone()
+        ]
+    );
+
+    // Metadata is joined engine-side: one round trip must be enough to
+    // render gutter text AND the hover card, so no field may be empty.
+    let two = commit_at_line(&result, 1);
+    assert_eq!(two.id, fx.two);
+    assert_eq!(two.author_name, "Bob");
+    assert_eq!(two.author_email, "bob@example.com");
+    assert_eq!(two.summary, "two");
+    assert!(two.author_time > 0, "author time must be joined");
+    assert_eq!(
+        two.committer_time, two.author_time,
+        "the fixture commits with the same timestamp, so both must match"
+    );
+
+    // Distinct commits keep distinct timestamps (the fixture's ordering).
+    assert!(
+        commit_at_line(&result, 0).author_time < commit_at_line(&result, 1).author_time
+            && commit_at_line(&result, 1).author_time < commit_at_line(&result, 4).author_time,
+        "author times must follow history order"
+    );
+
+    // Adjacent lines from one commit collapse into a single hunk — the
+    // response is hunks, not one record per line (a 5k-line file would
+    // otherwise ship 5k entries).
+    assert!(
+        result.entries.len() < 6,
+        "adjacent same-commit lines must merge, got {:?}",
+        result.entries
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_at_an_explicit_revision_stops_at_that_revision() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+
+    // `f.txt` as of commit two: 5 lines, and the line three rewrote is
+    // still Bob's.
+    let by_sha = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: Some(fx.two.clone()),
+            contents: None,
+        },
+    )?;
+    assert_eq!(by_sha.rev, fx.two);
+    assert_tiles(&by_sha, 5);
+    assert_eq!(
+        blamed_lines(&by_sha),
+        vec![
+            fx.one.clone(),
+            fx.two.clone(),
+            fx.one.clone(),
+            fx.two.clone(),
+            fx.two.clone()
+        ]
+    );
+
+    // Revspecs with `~`/`^` must be accepted, not rejected by the input
+    // validation: annotate-previous walks the chain with `<sha>^`.
+    let by_revspec = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: Some("HEAD~1".to_string()),
+            contents: None,
+        },
+    )?;
+    assert_eq!(by_revspec.rev, fx.two);
+    assert_eq!(blamed_lines(&by_revspec), blamed_lines(&by_sha));
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_follows_renames_and_reports_the_source_path() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&["config", "core.autocrlf", "false"])?;
+
+    std::fs::write(dir.path().join("old.txt"), "x\ny\nz\n")?;
+    git(&["add", "."])?;
+    let created = blame_commit(dir.path(), "created", "Ann", "2026-01-01T00:00:00Z")?;
+
+    // A pure rename: no content change, so similarity is 100% and rename
+    // tracking must see it. Without `rewrites` every line would be pinned
+    // to this commit and the file's real history would be lost.
+    git(&["mv", "old.txt", "new.txt"])?;
+    let renamed = blame_commit(dir.path(), "renamed", "Bob", "2026-01-02T00:00:00Z")?;
+    assert_ne!(created, renamed);
+
+    let session = open_session(&dir).await?;
+    let result = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "new.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )?;
+    assert_eq!(result.via, bamboo_protocol::BlameVia::Gix);
+    assert_tiles(&result, 3);
+    assert_eq!(
+        blamed_lines(&result),
+        vec![created.clone(); 3],
+        "all lines predate the rename, so all belong to the creating commit"
+    );
+    for e in &result.entries {
+        assert_eq!(
+            e.source_path.as_deref(),
+            Some("old.txt"),
+            "a rename must surface the path the lines came from"
+        );
+    }
+
+    // `git blame` follows renames by default too, so the fallback must report
+    // the SAME source path — otherwise annotate-previous would open a
+    // different file depending on which implementation happened to answer.
+    let forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "new.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(forced.via, bamboo_protocol::BlameVia::GitPorcelain);
+    assert_eq!(blamed_lines(&forced), blamed_lines(&result));
+    assert_eq!(
+        forced
+            .entries
+            .iter()
+            .map(|e| e.source_path.as_deref())
+            .collect::<Vec<_>>(),
+        result
+            .entries
+            .iter()
+            .map(|e| e.source_path.as_deref())
+            .collect::<Vec<_>>(),
+        "rename attribution must not depend on which implementation ran"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_of_a_dirty_buffer_marks_uncommitted_lines() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+    let committed = fx.head_content()?;
+
+    // The unsaved buffer inserts one line at the top: that line has no
+    // commit, the rest keep their attribution (shifted by one).
+    let buffer = format!("TOP\n{committed}");
+    let result = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: None,
+            contents: Some(buffer.clone()),
+        },
+    )?;
+    assert_eq!(result.via, bamboo_protocol::BlameVia::Gix);
+    assert_tiles(&result, 7);
+
+    let uncommitted = commit_at_line(&result, 0);
+    assert_eq!(
+        uncommitted.id, "0000000000000000000000000000000000000000",
+        "buffer-only lines attribute to the null id"
+    );
+    assert_eq!(uncommitted.author_name, "Not Committed Yet");
+    assert_eq!(uncommitted.author_time, 0);
+    assert_eq!(
+        blamed_lines(&result)[1..],
+        blamed_lines(&fx.blame(&session)?)[..],
+        "the committed lines keep their attribution"
+    );
+
+    // Blame is a read: the buffer must not reach the disk, and the worktree
+    // must still hold the committed content.
+    assert_eq!(fx.head_content()?, committed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_without_contents_annotates_the_worktree_file() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+    let null_id = "0".repeat(40);
+
+    // One line appended on disk but not committed. With no `contents` the
+    // blamed file is the one the user is looking at: blaming HEAD's blob
+    // instead would return 6 tiles for a 7-line buffer, i.e. every
+    // annotation below the change on the wrong line.
+    std::fs::write(fx.dir.path().join("f.txt"), "a\nB2\nc\nd\nE5\nf\nNEW\n")?;
+    let result = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )?;
+    assert_eq!(result.via, bamboo_protocol::BlameVia::Gix);
+    assert_tiles(&result, 7);
+    assert_eq!(
+        blamed_lines(&result),
+        vec![
+            fx.one.clone(),
+            fx.two.clone(),
+            fx.one.clone(),
+            fx.two.clone(),
+            fx.three.clone(),
+            fx.three.clone(),
+            null_id.clone(),
+        ]
+    );
+    assert_eq!(commit_at_line(&result, 6).author_name, "Not Committed Yet");
+
+    // An explicit revision is a history question, not a worktree one: the
+    // file as of that commit, dirty worktree notwithstanding.
+    let at_head = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: Some("HEAD".to_string()),
+            contents: None,
+        },
+    )?;
+    assert_tiles(&at_head, 6);
+    assert_eq!(at_head.rev, fx.three);
+    assert!(
+        !blamed_lines(&at_head).contains(&null_id),
+        "nothing is uncommitted in a revision's own blob"
+    );
+
+    // The porcelain fallback reads the worktree file itself, so it must land
+    // on the same attribution for both questions.
+    for rev in [None, Some("HEAD".to_string())] {
+        let forced = bamboo_engine::gix_read::read_blame_with(
+            &session,
+            &bamboo_protocol::GetBlame {
+                path: "f.txt".to_string(),
+                rev: rev.clone(),
+                contents: None,
+            },
+            bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+        )?;
+        assert_eq!(forced.via, bamboo_protocol::BlameVia::GitPorcelain);
+        let expected = if rev.is_none() { &result } else { &at_head };
+        assert_eq!(
+            blamed_lines(&forced),
+            blamed_lines(expected),
+            "the fallback must not attribute lines differently (rev = {rev:?})"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_of_an_unsaved_new_file_is_all_uncommitted() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+    let null_id = "0".repeat(40);
+
+    // `scratch.txt` exists only as an editor buffer: there is no committed
+    // version to walk, so every line is "not committed yet" rather than an
+    // error — and rather than the two implementations disagreeing, since
+    // neither git nor gix blames a path that is absent from the revision.
+    let buffer = "one\ntwo\nthree"; // no trailing newline on purpose
+    let req = |contents: Option<&str>| bamboo_protocol::GetBlame {
+        path: "scratch.txt".to_string(),
+        rev: None,
+        contents: contents.map(str::to_string),
+    };
+    let result = bamboo_engine::gix_read::read_blame(&session, &req(Some(buffer)))?;
+    assert_eq!(result.rev, fx.three);
+    assert_tiles(&result, 3);
+    assert_eq!(
+        result.entries.len(),
+        1,
+        "a uniformly uncommitted file is one hunk"
+    );
+    assert_eq!(blamed_lines(&result), vec![null_id.clone(); 3]);
+    assert_eq!(result.entries[0].commit.author_name, "Not Committed Yet");
+    assert_eq!(result.entries[0].commit.summary, "Uncommitted changes");
+
+    // Same answer through the porcelain backend: the wire shape must not
+    // depend on which implementation would have run.
+    let forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &req(Some(buffer)),
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(blamed_lines(&forced), blamed_lines(&result));
+    assert_eq!(
+        forced.via,
+        bamboo_protocol::BlameVia::GitPorcelain,
+        "the absent-path early return must still name the backend the caller asked for"
+    );
+
+    // An empty buffer has no lines, so no hunks (a zero-length hunk would
+    // break the tiling invariant the client renders from).
+    let empty = bamboo_engine::gix_read::read_blame(&session, &req(Some("")))?;
+    assert!(empty.entries.is_empty());
+    assert_eq!(empty.rev, fx.three);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_porcelain_fallback_matches_the_gix_path() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+    let req = bamboo_protocol::GetBlame {
+        path: "f.txt".to_string(),
+        rev: None,
+        contents: None,
+    };
+
+    let gix = bamboo_engine::gix_read::read_blame(&session, &req)?;
+    let porcelain = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &req,
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+
+    // `via` is on the wire precisely so a silently degraded read stays
+    // visible; the two paths must not claim to be each other.
+    assert_eq!(gix.via, bamboo_protocol::BlameVia::Gix);
+    assert_eq!(porcelain.via, bamboo_protocol::BlameVia::GitPorcelain);
+    assert_eq!(porcelain.rev, gix.rev);
+
+    assert_tiles(&porcelain, 6);
+    assert_eq!(
+        blamed_lines(&porcelain),
+        blamed_lines(&gix),
+        "line attribution must not depend on which implementation ran"
+    );
+    assert_eq!(
+        commit_at_line(&porcelain, 1).author_name,
+        commit_at_line(&gix, 1).author_name,
+        "metadata comes from the same engine-side join, so it must agree"
+    );
+    // Porcelain emits one record per LINE; the parser merges them back into
+    // hunks, otherwise the client would see a different shape per backend.
+    assert!(
+        porcelain.entries.len() < 6,
+        "porcelain records must be merged into hunks, got {:?}",
+        porcelain.entries
+    );
+
+    // The dirty-buffer path has its own fallback shape (`--contents=-` fed
+    // over stdin), so it is compared separately.
+    let buffer = format!("TOP\n{}", fx.head_content()?);
+    let dirty = |contents: Option<String>| bamboo_protocol::GetBlame {
+        path: "f.txt".to_string(),
+        rev: None,
+        contents,
+    };
+    let gix_dirty = bamboo_engine::gix_read::read_blame(&session, &dirty(Some(buffer.clone())))?;
+    let porcelain_dirty = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &dirty(Some(buffer)),
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_tiles(&porcelain_dirty, 7);
+    assert_eq!(blamed_lines(&porcelain_dirty), blamed_lines(&gix_dirty));
+    assert_eq!(
+        commit_at_line(&porcelain_dirty, 0).id,
+        "0000000000000000000000000000000000000000"
+    );
+    assert_eq!(
+        commit_at_line(&porcelain_dirty, 0).author_name,
+        commit_at_line(&gix_dirty, 0).author_name,
+        "the null id's metadata is synthesized engine-side, so both paths agree"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_rejects_invalid_arguments_as_structured_errors() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+
+    let invalid_arg = |r: anyhow::Result<bamboo_protocol::GetBlameResult>| {
+        let err = r.expect_err("expected the request to be rejected");
+        let bamboo = err.downcast_ref::<bamboo_protocol::BambooError>().expect(
+            "input errors must stay structured (INVALID_ARGUMENT), not degrade to git errors",
+        );
+        assert_eq!(bamboo.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+    };
+
+    // Option-like paths are git's own argument parser hazard.
+    invalid_arg(bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "--upload-pack=x".to_string(),
+            rev: None,
+            contents: None,
+        },
+    ));
+    invalid_arg(bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: String::new(),
+            rev: None,
+            contents: None,
+        },
+    ));
+
+    // Path traversal: blame is the read that opens a worktree FILE from this
+    // argument (every other one hands it to git, which refuses to leave the
+    // repository), so absolute paths and `..` are rejected before anything is
+    // joined onto the worktree root. (A Windows-style `C:\...` is caught by
+    // the same `is_absolute` check on Windows; on Unix it is an odd but
+    // harmless relative filename that stays inside the repository.)
+    for escaping in ["/etc/passwd", "../outside.txt", "sub/../../outside.txt"] {
+        invalid_arg(bamboo_engine::gix_read::read_blame(
+            &session,
+            &bamboo_protocol::GetBlame {
+                path: escaping.to_string(),
+                rev: None,
+                contents: None,
+            },
+        ));
+    }
+    invalid_arg(bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: Some("--all".to_string()),
+            contents: None,
+        },
+    ));
+
+    // An oversized buffer is rejected in band with a save-first hint: the
+    // 16 MiB framing cap would otherwise close the connection instead.
+    let too_big = "x".repeat(8 * 1024 * 1024 + 1);
+    let err = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: None,
+            contents: Some(too_big),
+        },
+    )
+    .expect_err("oversized contents must be rejected");
+    let bamboo = err
+        .downcast_ref::<bamboo_protocol::BambooError>()
+        .expect("the size cap must be a structured error");
+    assert_eq!(bamboo.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+    assert!(
+        bamboo.message.contains("save"),
+        "the message must tell the client what to do: {}",
+        bamboo.message
+    );
+
+    // A worktree file has no wire framing to bound it at all, so the read is
+    // capped the same way: without it one request would make the engine slurp
+    // an arbitrarily large file and hand gix-blame a second copy of it.
+    std::fs::write(
+        fx.dir.path().join("huge.log"),
+        vec![b'x'; 8 * 1024 * 1024 + 1],
+    )?;
+    let err = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "huge.log".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )
+    .expect_err("an oversized worktree file must be rejected");
+    let bamboo = err
+        .downcast_ref::<bamboo_protocol::BambooError>()
+        .expect("the worktree size cap must stay a structured error too");
+    assert_eq!(bamboo.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
+
+    // A revision that does not exist is a git error, not an input error —
+    // the client cannot fix it by changing the request shape, and hiding it
+    // would render "no annotations" for a typo.
+    let err = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: Some("deadbeefdeadbeef".to_string()),
+            contents: None,
+        },
+    )
+    .expect_err("an unknown revision must fail");
+    let bamboo = err
+        .downcast_ref::<bamboo_protocol::BambooError>()
+        .expect("unknown revisions stay structured too");
+    assert_eq!(bamboo.code, bamboo_protocol::BambooError::GIT_ERROR);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_of_absent_path_and_unborn_head_is_empty_not_an_error() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let session = open_session(&fx.dir).await?;
+
+    // Untracked/absent path: toggling blame on such a file is a no-op, the
+    // same convention read_blob uses ("" instead of an error).
+    let absent = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "no/such/file.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )?;
+    assert!(absent.entries.is_empty());
+    assert_eq!(absent.rev, fx.three);
+    // An early return names the backend that WOULD have run, not a hardcoded
+    // "gix": `via` is on the wire so a forced backend stays visible even when
+    // it never got to blame anything.
+    let absent_forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "no/such/file.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(absent_forced.via, bamboo_protocol::BlameVia::GitPorcelain);
+
+    // Unborn HEAD (a repo without a single commit): empty entries and an
+    // empty rev, so the client renders nothing instead of an error toast.
+    let empty = tempfile::tempdir()?;
+    let out = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(empty.path())
+        .output()?;
+    assert!(out.status.success());
+    std::fs::write(empty.path().join("new.txt"), "line\n")?;
+    let session = open_session(&empty).await?;
+    let result = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "new.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )?;
+    assert_eq!(result.rev, "");
+    assert!(result.entries.is_empty());
+    let unborn_forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "new.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(unborn_forced.via, bamboo_protocol::BlameVia::GitPorcelain);
+    Ok(())
+}
+
+/// A repo with `core.autocrlf=true`: the worktree copy carries CRLF while
+/// the blob keeps LF, and git converts before comparing. Blame has to
+/// convert the same way, or every line of every file on a Windows checkout
+/// reads "Not Committed Yet" — the exact failure the eol normalization in
+/// `gix_read` exists to prevent.
+fn crlf_repo() -> anyhow::Result<(tempfile::TempDir, String)> {
+    let dir = tempfile::tempdir()?;
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git").args(args).current_dir(dir.path()).output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&["config", "core.autocrlf", "true"])?;
+    // Committed with LF, as git stores it after the clean filter.
+    std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n")?;
+    git(&["add", "."])?;
+    let one = blame_commit(dir.path(), "one", "Ann", "2026-01-01T00:00:00Z")?;
+    Ok((dir, one))
+}
+
+#[tokio::test]
+async fn blame_converts_crlf_the_way_git_does() -> anyhow::Result<()> {
+    let (dir, one) = crlf_repo()?;
+    let null_id = "0".repeat(40);
+
+    // The worktree copy: CRLF line endings throughout plus one genuinely
+    // new line. Only that new line is uncommitted; the rest are `one`'s,
+    // which is what `git blame --porcelain -- f.txt` reports here.
+    std::fs::write(dir.path().join("f.txt"), "a\r\nb\r\nQ\r\nc\r\n")?;
+    let session = open_session(&dir).await?;
+
+    // No `contents` and no `rev`: blame the worktree file, which is what a
+    // gutter renders against.
+    let worktree = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+    )?;
+    assert_tiles(&worktree, 4);
+    assert_eq!(
+        blamed_lines(&worktree),
+        vec![one.clone(), one.clone(), null_id.clone(), one.clone()],
+        "a CRLF worktree copy must not make committed lines look uncommitted"
+    );
+
+    // The same bytes arriving as an unsaved editor buffer (what VS Code
+    // sends for a dirty document) must behave identically.
+    let buffer = bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: None,
+            contents: Some("a\r\nb\r\nQ\r\nc\r\n".to_string()),
+        },
+    )?;
+    assert_eq!(
+        blamed_lines(&buffer),
+        blamed_lines(&worktree),
+        "buffer and worktree blame are the same question"
+    );
+
+    // And the porcelain fallback, which delegates the conversion to git,
+    // must agree — that equivalence is the point of the normalization.
+    let porcelain = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "f.txt".to_string(),
+            rev: None,
+            contents: None,
+        },
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert_eq!(
+        blamed_lines(&porcelain),
+        blamed_lines(&worktree),
+        "the fallback must not attribute lines differently"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn blame_of_a_worktree_deleted_file_is_empty() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    // Deleted on disk but still in HEAD: there are no lines to annotate, so
+    // the answer is empty rather than HEAD's attribution (which would render
+    // against a buffer that is gone) or a git error on a missing path.
+    std::fs::remove_file(fx.dir.path().join("f.txt"))?;
+    let session = open_session(&fx.dir).await?;
+    let result = fx.blame(&session)?;
+    assert!(result.entries.is_empty());
+    assert_eq!(result.rev, fx.three);
+    Ok(())
+}
+
+/// A worktree symlink must not be followed. Blame is the only read that opens
+/// a client-named path itself, and the containment check upstream is LEXICAL:
+/// `link.txt` passes it while pointing anywhere on the filesystem. Following
+/// the link would read — and attribute lines of — a file outside the
+/// repository, and blaming the link's own blob (what `git blame` does) would
+/// number lines against a one-line target path while the editor shows the
+/// resolved file. Empty annotations are the honest answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn blame_of_a_worktree_symlink_is_empty_not_a_read_outside_the_repo() -> anyhow::Result<()> {
+    let fx = blame_repo()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("id_rsa"), "SECRET\nSECRET2\nSECRET3\n")?;
+    // An absolute target: nothing about the requested path hints at it.
+    std::os::unix::fs::symlink(
+        outside.path().join("id_rsa"),
+        fx.dir.path().join("link.txt"),
+    )?;
+    let session = open_session(&fx.dir).await?;
+    let req = bamboo_protocol::GetBlame {
+        path: "link.txt".to_string(),
+        rev: None,
+        contents: None,
+    };
+    let result = bamboo_engine::gix_read::read_blame(&session, &req)?;
+    assert!(
+        result.entries.is_empty(),
+        "a symlink has no lines to annotate, got {:?}",
+        result.entries
+    );
+    assert_eq!(result.rev, fx.three);
+
+    // Both backends decide the blamed content before they run, so the
+    // porcelain path cannot be the one that leaks either.
+    let forced = bamboo_engine::gix_read::read_blame_with(
+        &session,
+        &req,
+        bamboo_engine::gix_read::BlameBackend::GitPorcelainOnly,
+    )?;
+    assert!(forced.entries.is_empty());
+    assert_eq!(forced.via, bamboo_protocol::BlameVia::GitPorcelain);
+    Ok(())
+}

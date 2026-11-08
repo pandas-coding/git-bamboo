@@ -2,13 +2,14 @@
  * Revision-content diff infrastructure (extracted from the old scmProvider):
  * the ENGINE_SCHEME TextDocumentContentProvider that serves blob content at
  * any validated revision (HEAD, a full commit sha, or the synthetic empty
- * revision) for vscode.diff side-by-sides, plus openResource, commitRevisionUri
- * and repo-path validation helpers.
+ * revision) for vscode.diff side-by-sides, plus openResource, commitRevisionUri,
+ * the shared parent↔commit file diff and repo-path helpers.
  */
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { EngineClient } from './engineClient';
-import { COMMIT_ID_RE } from './util';
+import type { CommitDetail } from './types';
+import { COMMIT_ID_RE, errorMessage } from './util';
 
 export const ENGINE_SCHEME = 'git-bamboo';
 
@@ -144,6 +145,63 @@ export function indexUri(root: vscode.Uri, relativePath: string): vscode.Uri {
   return commitRevisionUri(root, relativePath, INDEX_REVISION);
 }
 
+/** Outcome of openCommitFileDiff. `failed` = vscode.diff threw and the
+ *  shared error message was already shown; `unresolved-parent` is reported
+ *  by the CALLER, because only the caller knows whether its id source makes
+ *  that a user-facing problem or an unreachable contract break. */
+export type CommitFileDiffOutcome = 'opened' | 'failed' | 'unresolved-parent';
+
+/**
+ * Open the parent↔commit diff of one file of `detail`. ONE implementation on
+ * purpose: the commit-detail panel's "Open Changes" row and the blame hover's
+ * "Open Changes" link must land on byte-identical sides, and the rule set
+ * (empty left side for added files / root commits, old_path on the left of a
+ * rename, `base (short^) ↔ base (short)` title) is exactly the kind of detail
+ * two copies drift on — see
+ * .ai-workflow/learnings/20260930-second-consumer-triggers-shared-extraction.md.
+ *
+ * `filePath` is matched against the detail's new paths first and its
+ * old_paths second: a blame hover can name the path the file had in the
+ * PARENT revision (annotatePrevious opens exactly those documents), which the
+ * detail lists only as `old_path`. A path the detail does not contain at all
+ * still opens, both sides at `filePath` — the blame caller arrives with an
+ * engine-reported path it cannot cross-check, and a diff of that path is more
+ * useful than a silent no-op. Callers whose path is guaranteed to come from
+ * the same detail (the webview rows) guard on membership themselves.
+ */
+export async function openCommitFileDiff(
+  root: vscode.Uri,
+  detail: CommitDetail,
+  filePath: string,
+): Promise<CommitFileDiffOutcome> {
+  const entry =
+    detail.files.find((file) => file.path === filePath) ??
+    detail.files.find((file) => file.old_path === filePath);
+  const parent = detail.parent_ids[0]; // diff baseline
+  // Added file or root commit: no parent side, so the left is the synthetic
+  // empty revision (the provider serves '' for it without an engine call).
+  const leftRef = entry?.status === 'A' || parent === undefined ? EMPTY_REVISION : parent;
+  if (leftRef !== EMPTY_REVISION && !COMMIT_ID_RE.test(leftRef)) return 'unresolved-parent';
+  // The file lived at old_path in the parent when the commit renamed it.
+  const leftPath = entry?.old_path ?? filePath;
+  const rightPath = entry?.path ?? filePath;
+  try {
+    const left = commitRevisionUri(root, leftPath, leftRef);
+    const right = commitRevisionUri(root, rightPath, detail.id);
+    const base = path.basename(rightPath);
+    const short = detail.id.slice(0, 8);
+    const title =
+      leftRef === EMPTY_REVISION
+        ? `${base} (${short})`
+        : `${base} (${short}^) ↔ ${base} (${short})`;
+    await vscode.commands.executeCommand('vscode.diff', left, right, title);
+    return 'opened';
+  } catch (err) {
+    vscode.window.showErrorMessage(`Git Bamboo: open changes failed — ${errorMessage(err)}`);
+    return 'failed';
+  }
+}
+
 /**
  * Opens a working-tree change as a diff. The bucket decides the sides
  * (VS Code SCM semantics, which hunk staging relies on):
@@ -210,7 +268,11 @@ function resolveRepoPath(root: vscode.Uri, relativePath: string): vscode.Uri {
   return vscode.Uri.joinPath(root, ...relativePath.split('/'));
 }
 
-/** Repo-relative path (forward slashes) for engine write requests. */
-function toRelativePath(root: vscode.Uri, uri: vscode.Uri): string {
+/** Repo-relative path (forward slashes) for engine requests. THE one
+ *  implementation: blame targets, hunk-staging lens targets and revision
+ *  content all address the engine by this path, and a copy that forgot the
+ *  backslash normalization would send Windows paths the engine cannot
+ *  resolve. Callers still validate the result with isValidRepoPath. */
+export function toRelativePath(root: vscode.Uri, uri: vscode.Uri): string {
   return path.relative(root.fsPath, uri.fsPath).replace(/\\/g, '/');
 }

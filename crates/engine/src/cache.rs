@@ -23,6 +23,14 @@ pub struct CachedCommit {
     pub author_email: String,
     pub author_time: i64,
     pub parent_ids: Vec<String>,
+    /// Committer timestamp, added for blame: `getBlame` serves both author
+    /// and committer time per entry, and reusing this table means one
+    /// decode feeds the graph AND the gutter. `Option` + `default` so a
+    /// cache file written before the field existed still deserializes —
+    /// such an entry reads back as a PARTIAL hit and is refreshed by the
+    /// next decode rather than answered as epoch 0 or thrown away.
+    #[serde(default)]
+    pub committer_time: Option<i64>,
 }
 
 pub struct Cache {
