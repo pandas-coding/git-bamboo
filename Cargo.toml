@@ -9,7 +9,11 @@ authors = ["Git Bamboo Contributors"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-gix = "0.87"
+# `blame` is already part of gix's default features (via `extras`), but it is
+# named explicitly: getBlame calls `gix::blame::file` directly, so a future
+# `default-features = false` trim must break the build here rather than
+# silently drop blame support.
+gix = { version = "0.87", features = ["blame"] }
 redb = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

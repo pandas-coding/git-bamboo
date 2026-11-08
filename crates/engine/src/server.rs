@@ -9,12 +9,12 @@ use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
     BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
-    Discard, Fetch, GetBlob, GetBranchStatus, GetCommitDetail, GetDiff, GetGraph, GetHeadResult,
-    GetRebasePlan, GetRebaseStatus, GetRemotes, GetStatus, GraphPage, HeadChanged, IndexChanged,
-    Initialize, InitializeResult, ListUndoStack, OutputResult, Pull, Push, RefsChanged, RemoteInfo,
-    RebaseAbort, RebaseContinue, RebaseSkip, ResolveConflict, StashDrop, StashEntry, StashPop,
-    StashPush, Stage, StageRanges, StartRebase, StatusItem, SwitchBranch, Undo, UndoResponse,
-    Unstage, UnstageRanges, WorktreeChanged,
+    Discard, Fetch, GetBlame, GetBlob, GetBranchStatus, GetCommitDetail, GetDiff, GetGraph,
+    GetHeadResult, GetRebasePlan, GetRebaseStatus, GetRemotes, GetStatus, GraphPage, HeadChanged,
+    IndexChanged, Initialize, InitializeResult, ListUndoStack, OutputResult, Pull, Push,
+    RefsChanged, RemoteInfo, RebaseAbort, RebaseContinue, RebaseSkip, ResolveConflict, StashDrop,
+    StashEntry, StashPop, StashPush, Stage, StageRanges, StartRebase, StatusItem, SwitchBranch,
+    Undo, UndoResponse, Unstage, UnstageRanges, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session, WriteOutcome};
@@ -407,6 +407,25 @@ impl BambooServer {
                     e.downcast::<BambooError>()
                         .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
                 })?;
+                to_json_value(&result)
+            }
+            "getBlame" => {
+                // Read RPC — blame never writes, so it bypasses the write
+                // queue entirely. Commit metadata is joined engine-side
+                // (see gix_read::read_blame) so the client can render the
+                // gutter and the hover card from this one response.
+                let req: GetBlame = parse_params("getBlame", params)?;
+                let result =
+                    spawn_blocking_read(session, move |s| crate::gix_read::read_blame(s, &req))
+                        .await
+                        .map_err(|e| {
+                            // Structured errors matter here: INVALID_ARGUMENT
+                            // tells the client its buffer is too big to blame
+                            // unsaved (save first), EPOCH_MISMATCH tells it to
+                            // retry after a repository change.
+                            e.downcast::<BambooError>()
+                                .unwrap_or_else(|e| BambooError::git_error(e.to_string()))
+                        })?;
                 to_json_value(&result)
             }
             "stageRanges" => {

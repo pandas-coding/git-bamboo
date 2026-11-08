@@ -242,7 +242,7 @@ pub enum WriteResult {
 /// Validate a positional path argument before it reaches git. Arguments are
 /// passed as argv (no shell), but git itself is an option parser: a path
 /// like `-A` or `--all` would be interpreted as a flag.
-fn validate_path_arg(p: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_path_arg(p: &str) -> anyhow::Result<()> {
     if p.is_empty() {
         anyhow::bail!("path argument must not be empty");
     }
