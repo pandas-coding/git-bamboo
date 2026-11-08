@@ -160,6 +160,32 @@
         "when": "false"
       },
       {
+        "command": "gitBamboo.blame.toggle",
+        "title": "Toggle Blame Annotations",
+        "category": "Git Bamboo",
+        "icon": "$(history)"
+      },
+      {
+        "command": "gitBamboo.blame.showCommit",
+        "title": "Show Blamed Commit",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.blame.diffLine",
+        "title": "Open Blamed Commit Changes",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.blame.jumpToCommit",
+        "title": "Jump to Introducing Commit",
+        "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.blame.annotatePrevious",
+        "title": "Annotate Previous Revision",
+        "category": "Git Bamboo"
+      },
+      {
         "command": "gitBamboo.commitView.openChanges",
         "title": "Open Changes",
         "category": "Git Bamboo"
@@ -213,6 +239,13 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "gitBamboo.blame.toggle",
+          "when": "git-bamboo:active && (resourceScheme == file || resourceScheme == git-bamboo)",
+          "group": "navigation"
+        }
+      ],
       "view/title": [
         {
           "command": "gitBamboo.refreshChanges",
@@ -340,6 +373,26 @@
         {
           "command": "gitBamboo.commitView.discardAllUntracked",
           "when": "git-bamboo:active"
+        },
+        {
+          "command": "gitBamboo.blame.toggle",
+          "when": "git-bamboo:active"
+        },
+        {
+          "command": "gitBamboo.blame.showCommit",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.blame.diffLine",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.blame.jumpToCommit",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.blame.annotatePrevious",
+          "when": "false"
         }
       ],
       "webview/context": [

@@ -8,12 +8,14 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import type {
+  BlameEntry,
   BranchStatus,
   CommitDetail,
   CommitFile,
   ConflictResolution,
   DiffHunk,
   ForceMode,
+  GetBlameResult,
   GetDiffResult,
   GetHeadResult,
   GetRebasePlanResult,
@@ -217,6 +219,38 @@ export class EngineClient {
   async getDiff(path: string, staged: boolean): Promise<GetDiffResult> {
     const result = await this.request<unknown>('getDiff', { path, staged }, 15_000);
     return isValidGetDiffResult(result) ? result : { binary: false, hunks: [] };
+  }
+
+  /**
+   * Engine RPC `getBlame`: line attribution for one file. Which bytes are
+   * annotated follows `git blame` (and the returned line numbers refer to
+   * them, so they must be the bytes the caller renders):
+   *   contents given         → the unsaved buffer, blamed against rev/HEAD
+   *   no contents, no rev    → the worktree file, blamed against HEAD
+   *   no contents, rev given → the file as of that revision
+   * Lines that exist only in the buffer come back under the all-zero commit
+   * id ("not committed yet"). Commit metadata is joined engine-side, so ONE
+   * round trip carries everything a gutter annotation or hover card needs;
+   * callers must never fan out per entry.
+   *
+   * Blame walks history, so the timeout is twice the other read RPCs. A
+   * malformed response degrades to an empty entry list (the getDiff
+   * convention) — blame surfaces then clear instead of rendering
+   * half-valid attributions.
+   */
+  async getBlame(
+    path: string,
+    rev?: string | null,
+    contents?: string | null,
+  ): Promise<GetBlameResult> {
+    const params: Record<string, unknown> = { path };
+    // Omitted (not null) when absent: omitting `rev` is what asks for the
+    // worktree file, and skipping `contents` keeps the frame small — a dirty
+    // buffer can be megabytes.
+    if (rev != null) params.rev = rev;
+    if (contents != null) params.contents = contents;
+    const result = await this.request<unknown>('getBlame', params, 30_000);
+    return isValidGetBlameResult(result) ? result : { rev: '', entries: [], via: 'gix' };
   }
 
   /** Engine RPC `stageRanges`: stage the hunks of `path` intersecting
@@ -574,6 +608,36 @@ function isValidGetDiffResult(value: unknown): value is GetDiffResult {
       typeof (h as DiffHunk).new_start === 'number' &&
       typeof (h as DiffHunk).new_lines === 'number' &&
       Array.isArray((h as DiffHunk).lines),
+  );
+}
+
+/** Validate a `getBlame` response field-by-field: one wrong type would
+ *  otherwise render a bogus author/time over the user's code. */
+function isValidGetBlameResult(value: unknown): value is GetBlameResult {
+  if (!isRecord(value)) return false;
+  if (typeof value.rev !== 'string' || !Array.isArray(value.entries)) return false;
+  if (value.via !== 'gix' && value.via !== 'git-porcelain') return false;
+  return value.entries.every(isValidBlameEntry);
+}
+
+function isValidBlameEntry(value: unknown): value is BlameEntry {
+  if (!isRecord(value)) return false;
+  if (typeof value.start_line !== 'number' || typeof value.len !== 'number') return false;
+  if (
+    value.source_path !== undefined &&
+    typeof value.source_path !== 'string'
+  ) {
+    return false;
+  }
+  const commit = value.commit;
+  if (!isRecord(commit)) return false;
+  return (
+    typeof commit.id === 'string' &&
+    typeof commit.author_name === 'string' &&
+    typeof commit.author_email === 'string' &&
+    typeof commit.author_time === 'number' &&
+    typeof commit.committer_time === 'number' &&
+    typeof commit.summary === 'string'
   );
 }
 

@@ -195,6 +195,62 @@ export interface LineRange {
   end: number;
 }
 
+// ---------------------------------------------------------------------------
+// Blame (engine phase 3: getBlame)
+// ---------------------------------------------------------------------------
+
+/** Commit metadata the engine joins onto every blame entry — enough to
+ *  render gutter annotations and hover cards without a second RPC (the
+ *  client must never fan out per entry). */
+export interface BlameCommit {
+  /** Full hex object id. ALL ZEROS = "not committed yet" (a line that only
+   *  exists in the blamed buffer): the identity fields are then display
+   *  strings rather than repository data and both times are 0. */
+  id: string;
+  author_name: string;
+  author_email: string;
+  /** Unix seconds. */
+  author_time: number;
+  /** Unix seconds. */
+  committer_time: number;
+  /** Subject line (first line) of the commit message. */
+  summary: string;
+}
+
+/** One hunk of consecutive lines attributed to a single commit. */
+export interface BlameEntry {
+  /** First line of the hunk in the blamed file, 0-BASED (editor line =
+   *  `start_line + 1`). */
+  start_line: number;
+  /** Hunk length in lines (>= 1). Hunks tile the whole blamed content in
+   *  ascending order. */
+  len: number;
+  commit: BlameCommit;
+  /** The file's path in `commit` when it differs from the blamed path, i.e.
+   *  the file was renamed somewhere after that commit — the path to open
+   *  when walking back to the commit's parent revision. */
+  source_path?: string;
+}
+
+/** Which implementation produced the entries (kept observable so the
+ *  porcelain fallback is never a silent degradation). */
+export type BlameVia = 'gix' | 'git-porcelain';
+
+/** Result of the engine's `getBlame` RPC. */
+export interface GetBlameResult {
+  /** Resolved commit id of the blamed revision; empty string for an unborn
+   *  HEAD, where `entries` is empty. */
+  rev: string;
+  entries: BlameEntry[];
+  via: BlameVia;
+}
+
+/** True for the engine's "not committed yet" placeholder commit (the
+ *  all-zero object id, SHA-1 or SHA-256 width). */
+export function isUncommittedBlame(commit: BlameCommit): boolean {
+  return /^0+$/.test(commit.id);
+}
+
 /** The hunk's new-side action interval — the shared host/engine contract
  *  (engine `RawHunk::new_side_interval`): 1-based inclusive with a floor of
  *  line 1 and a minimum width of one, so empty new sides stay addressable. */
