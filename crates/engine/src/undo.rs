@@ -203,6 +203,10 @@ impl UndoEngine {
             epoch_at_creation: epoch,
             success,
         };
+        // Self-heal a vanished undo tree (see write_durable).
+        if let Some(dir) = self.journal_path.parent() {
+            fs::create_dir_all(dir)?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -769,6 +773,10 @@ impl UndoEngine {
             "transaction_id": transaction_id,
         });
 
+        // Self-heal a vanished bamboo tree (see write_durable).
+        if let Some(dir) = self.audit_log.parent() {
+            fs::create_dir_all(dir)?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -868,6 +876,13 @@ fn rebase_in_progress_on_disk(git_dir: &Path) -> bool {
 /// Write `data` to `path` durably: create/truncate, write, fsync the file,
 /// then fsync the parent directory so the file entry itself survives.
 fn write_durable(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    // Self-heal a vanished undo tree: the directories are created once in
+    // UndoEngine::new, but a live engine session can outlive a repo
+    // directory replacement (rm -rf + recreate), after which the paths
+    // exist again only as a fresh, empty .git.
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let mut file = File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(data)?;

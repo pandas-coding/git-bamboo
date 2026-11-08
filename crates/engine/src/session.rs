@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,6 +69,11 @@ const MAX_EVENTS_PER_BATCH: usize = 4096;
 /// many .git files).
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(50);
 
+/// Poll interval of the watcher re-arm thread while the repo root is gone
+/// (rm -rf + recreate): inotify watches are inode-based and do not survive
+/// the recreate, so the session waits for the paths to reappear.
+const REARM_POLL: Duration = Duration::from_millis(250);
+
 pub struct Session {
     pub repo_path: PathBuf,
     /// The resolved git directory (differs from `repo_path/.git` for linked
@@ -92,6 +97,9 @@ pub struct Session {
     rebase_tx: std::sync::Mutex<Option<u64>>,
     notify_tx: mpsc::UnboundedSender<EngineEvent>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// True while a re-arm thread is waiting for a deleted repo root to
+    /// reappear (guards against spawning more than one).
+    rearm_pending: AtomicBool,
 }
 
 impl Session {
@@ -135,6 +143,7 @@ impl Session {
             rebase_tx: std::sync::Mutex::new(None),
             notify_tx,
             watcher: Mutex::new(None),
+            rearm_pending: AtomicBool::new(false),
         });
 
         // Start the single-consumer write queue. It only holds a Weak
@@ -326,7 +335,17 @@ impl Session {
                         }
                     }
                     let Some(session) = weak.upgrade() else { break };
+                    // Deletion of a watched root itself (rm -rf of the repo
+                    // or its gitdir) kills the inode-based watches; schedule
+                    // a re-arm so a recreate resumes notifications.
+                    let root_removed = batch.iter().any(|ev| {
+                        matches!(ev.kind, notify::EventKind::Remove(_))
+                            && ev.paths.iter().any(|p| p == &repo_path || p == &git_dir)
+                    });
                     process_event_batch(&session, &repo_path, &git_dir, batch);
+                    if root_removed {
+                        session.schedule_watcher_rearm();
+                    }
                 }
                 debug!("fs watcher thread exiting");
             })
@@ -336,6 +355,53 @@ impl Session {
             .watcher
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(watcher);
+    }
+
+    /// Re-arm the fs watcher after the repo root (or gitdir) was deleted.
+    /// A polling thread waits for the paths to reappear, replaces the dead
+    /// watcher, and emits a conservative full-refresh notification burst:
+    /// the recreate happened while no watcher was live, so clients must
+    /// assume everything changed. Exits silently when the session is
+    /// replaced (re-initialize) or dropped.
+    fn schedule_watcher_rearm(self: &Arc<Self>) {
+        if self.rearm_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        info!(
+            path = %self.repo_path.display(),
+            "repo root removed; scheduling fs watcher re-arm"
+        );
+        let weak = Arc::downgrade(self);
+        let repo_path = self.repo_path.clone();
+        let git_dir = self.git_dir.clone();
+        std::thread::Builder::new()
+            .name("bamboo-watcher-rearm".into())
+            .spawn(move || {
+                loop {
+                    let Some(session) = weak.upgrade() else { return };
+                    if repo_path.is_dir() && git_dir.exists() {
+                        session.start_fs_watcher();
+                        session.rearm_pending.store(false, Ordering::SeqCst);
+                        let epoch = session.bump_epoch();
+                        let new_head = std::fs::read_to_string(git_dir.join("HEAD"))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        session.emit(EngineEvent::HeadChanged { new_head, epoch });
+                        session.emit(EngineEvent::RefsChanged {
+                            changed_refs: Vec::new(),
+                            epoch,
+                        });
+                        session.emit(EngineEvent::IndexChanged { epoch });
+                        session.emit(EngineEvent::GraphInvalidated { epoch });
+                        session.emit(EngineEvent::WorktreeChanged { paths: Vec::new() });
+                        debug!(path = %repo_path.display(), "fs watcher re-armed after repo recreate");
+                        return;
+                    }
+                    std::thread::sleep(REARM_POLL);
+                }
+            })
+            .ok();
     }
 }
 
