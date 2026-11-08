@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 3：JetBrains 式 blame（引擎 getBlame + 标注/悬停/导航）
 date: 2026-10-30
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights
@@ -52,9 +52,21 @@ tags: [git, rust, vscode-extension, ui]
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p bamboo-engine` 全绿（含 blame 归属/rename/脏缓冲/回退测试）；`cargo clippy` 无新告警。
-- [ ] `getBlame` 响应含每 entry 的 commit 元数据（author/time/summary），客户端单次往返可渲染（无逐行回查）。
-- [ ] gix 路径显式传 commit-graph（代码断言/注释可见）；`via` 字段区分实现路径。
+- [x] `cargo test -p bamboo-engine` 全绿（含 blame 归属/rename/脏缓冲/回退测试）；`cargo clippy` 无新告警。
+  —— `cargo test -p bamboo-engine` **124 绿**（其中 11 个 blame 测试）；`cargo test --workspace` 全绿
+  （protocol 25 绿）；`cargo clippy --workspace --all-targets` 只剩 1 条**既有**告警
+  （`engine_tests.rs:4138` while-let，非本次改动）。blame 测试覆盖：逐行归属、显式 rev、
+  rename（`source_path`）、脏缓冲（null id + 已提交行不变）、**工作区 vs 修订版内容选择**、
+  CRLF 转换、工作区已删除文件、unborn HEAD/路径不存在、非法参数（含路径逃逸）、
+  以及 porcelain 回退在上述全部形态上的等价性。
+- [x] `getBlame` 响应含每 entry 的 commit 元数据（author/time/summary），客户端单次往返可渲染（无逐行回查）。
+  —— 引擎侧经 redb commit 缓存做一次 join（`commits: {id: BlameCommit}`，含
+  `author_name`/`author_email`/`author_time`/`summary`；null id 合成 "Not Committed Yet"），
+  `blame.ts` 只从这一份响应渲染 gutter/hover/lens。未提交行的 `BlameCommit` 无命令链接。
+- [x] gix 路径显式传 commit-graph（代码断言/注释可见）；`via` 字段区分实现路径。
+  —— `gix_read.rs` 的 `repo.commit_graph_if_enabled()` 显式传入 `blame::file`（带注释说明
+  "不传则静默不用"）；回退（gix 报错或 entry 未铺满 blob）报 `via = "git-porcelain"`，
+  正常路径报 `"gix"`；等价性测试断言两条路径的归属与元数据完全一致。
 - [ ] **手测**：toggle blame → gutter 出现作者/时间标注；颜色弱化不干扰代码阅读。
 - [ ] **手测**：悬停行 → 该行 commit 详情 + 跳 commit 面板/diff 入口可用。
 - [ ] **手测**：CodeLens 当前行"跳转引入 commit" → commitDetail 打开正确 commit。
@@ -62,6 +74,38 @@ tags: [git, rust, vscode-extension, ui]
 - [ ] **手测**：脏缓冲（未保存修改）blame 不报错（contents 路径）；保存后重渲染。
 - [ ] **手测**：大文件（>1000 行、多变更）滚动流畅（viewport 切片生效，无明显卡顿；50ms 级交互）。
 - [ ] engine 通知（切换分支/外部 commit）后 blame 缓存失效重渲染（TTL + 通知双通道）。
+
+> **手测项状态（2026-11-09）**：实现完成、自动项全绿，但上述 7 条需要真实 VS Code 会话，
+> 本轮未执行（按 plan-status-hygiene 显式记录，故 status 停在 `in-progress` 而非 `done`）。
+> 跑法：`scripts/make-blame-test-repo.sh`（默认 `/tmp/git-bamboo-blame-manual`，`--force` 重建）
+> 生成确定性仓库并在其中写入 `MANUAL-TESTS.md`——每条验收项都有对应场景与期望值
+> （三层 annotate-previous 链、被相似度检测识别的 rename、单文件三种归属、1500 行大文件、
+> 脏工作区 + 未跟踪文件、切换分支触发失效）。
+
+## Implementation Notes（2026-11-09，实现期偏离与补充）
+
+- `GetBlameResult = { rev, via, entries, commits }`：plan 草图只画了 `entries`。`commits`
+  （id → 元数据）是验收项 2「单次往返可渲染」的落地形式，`via` 是验收项 3，`rev` 供
+  annotate-previous 沿链续走。
+- **blame 的是哪一份字节**按 `git blame` 语义三选一（plan 未定义，实现中发现必须定义，否则
+  entry 行号与客户端实际渲染的文档错位）：给了 `contents` → 客户端缓冲，against `rev`/HEAD；
+  无 `contents` 无 `rev` → 工作区文件 against HEAD；无 `contents` 有 `rev` → 该修订版 blob。
+  工作区已删除 → 空 entries（不回退去 blame HEAD 的副本）。推论：`git-bamboo:` 只读修订版
+  文档必须**显式**传 `rev`，省略即等于"我要工作区那份"。
+- `core.autocrlf` 转换（plan 未提）：Windows 检出是 CRLF、blob 是 LF，不转换会让整文件读成
+  "Not Committed Yet"。只查 `core.autocrlf`，且仅在 blob 自身无 CR 时转换，使 gix 与
+  porcelain 两条路径在不发生转换的仓库里保持等价。**边界**：`.gitattributes` 的 `text=`/`eol=`、
+  LFS、`ident`、自定义 clean filter 不生效——完整 filter 管线（`filter_pipeline`）每次 blame
+  都要读 index，对一个纯展示功能代价过高，代码注释已写明。
+- 路径收敛校验：blame 是唯一把客户端 path 直接拼到工作区根去 `open` 的读（其余读都把 path
+  交给 git），故拒绝绝对路径 / `..` / Windows 前缀，返回结构化 `INVALID_ARGUMENT`。
+- `CachedCommit` 增加 `committer_time: Option<i64>`（`#[serde(default)]`，旧缓存条目仍可读；
+  `None` 视为**部分命中**并重新解码，不当 0 用）：blame 的元数据 join 与 graph 读共用同一条目。
+- 脏缓冲 `contents` 上限 8 MiB：服务端帧上限是 16 MiB 且超限直接断连，压在其下才能带内返回
+  `INVALID_ARGUMENT` + "先保存、改 blame 工作区副本" 的提示。扩展侧另设 2 MiB 文本上限，
+  保证 JSON 转义后必然小于帧上限；超限时退化为 blame 已保存文件并在状态栏说明一次。
+- 回退条件不止"gix 报错"：gix 成功但 entries 未连续铺满 blob 时同样回退 porcelain
+  （`hunks_from_gix` 校验 + 等价性测试），宁可换实现也不交付错位归属。
 
 ## Dependencies
 
