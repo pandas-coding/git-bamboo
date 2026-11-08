@@ -188,7 +188,10 @@ git add -A
 commit_as Dee dee@example.com "2026-08-14T19:40:00Z" "Edit two big.log lines"
 
 # --- side branch: a different config.json (Ann) ---------------------------
-git branch other HEAD~4
+# Branched from the TIP, not from an older commit: the worktree is left dirty
+# below, and a branch that also changed headline.txt would make `git switch
+# other` (scenario 7) abort with "local changes would be overwritten".
+git branch other HEAD
 git switch -q other
 cat > src/config.json <<'EOF'
 {
@@ -237,6 +240,10 @@ cat > MANUAL-TESTS.md <<'EOF'
       父↔该 commit 的 `notes/headline.txt` diff。
 - [ ] 悬停未提交行（第 2 行 `...and keeps running`）→ 显示 **Uncommitted changes**，
       无命令链接。
+- [ ] 悬停**作者时间 ≠ 提交时间**的 commit（rebase/amend 过的历史）→ 卡片多一行
+      `Committed <绝对时间> (<相对时间>)`。本仓库生成时两者相等，所以默认**不**显示；
+      验证：`git switch other && git commit --amend --no-edit --date='2026-02-01T10:00:00Z'`，
+      再悬停 `src/config.json` 第 3 行 → 日历行为 2026-02-01（作者），Committed 行为今天。
 - [ ] 悬停 `notes/guide.md` 第 3 行 → 归属 Bob（2026-02-11，`Document the notes file`），
       卡片提示该行来自重命名前的路径（`Renamed at this commit from notes/README.md`）。
 

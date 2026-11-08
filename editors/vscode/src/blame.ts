@@ -668,7 +668,17 @@ export class BlameController implements vscode.Disposable {
       md.appendText(commit.author_email);
     }
     const when = new Date(commit.author_time * 1000).toLocaleString();
-    md.appendMarkdown(`\n\n$(calendar) ${when} (${relativeTime(commit.author_time)})\n\n`);
+    md.appendMarkdown(`\n\n$(calendar) ${when} (${relativeTime(commit.author_time)})`);
+    // A rebased or amended commit keeps its author date and gains a new
+    // committer date; that gap IS the story for history the rebase flow
+    // rewrote, so surface it rather than shipping the field unread.
+    if (commit.committer_time > 0 && commit.committer_time !== commit.author_time) {
+      const committed = new Date(commit.committer_time * 1000).toLocaleString();
+      md.appendMarkdown(
+        `\n\n$(history) Committed ${committed} (${relativeTime(commit.committer_time)})`,
+      );
+    }
+    md.appendMarkdown('\n\n');
     md.appendMarkdown(`$(git-commit) \`${commit.id.slice(0, 8)}\``);
     if (commit.summary.length > 0) {
       md.appendMarkdown(' · ');
