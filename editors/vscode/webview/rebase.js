@@ -9,12 +9,15 @@
  * Host protocol (see src/rebasePanel.ts):
  *   outbound: { type: 'ready' }
  *             { type: 'executeRebase', onto, todo: [{ id, action, message? }] }
+ *               — every plan entry is included (dropped rows as explicit
+ *               'drop' entries); the engine freshness-gates on id-set
+ *               equality with the current upstream..branch chain
  *             { type: 'rebaseContinue' | 'rebaseSkip' | 'rebaseAbort' }
  *             { type: 'refreshPlan' } / { type: 'openConflicts' } / { type: 'close' }
- *   inbound:  { type: 'plan', onto, branch, upstream, commits } (host-validated)
+ *   inbound:  { type: 'plan', onto, branch, commits } (host-validated)
  *             { type: 'status', status, conflictCount?, reason? }
  *             { type: 'stale' } / { type: 'blocked', message } / { type: 'finished', outcome }
- *             { type: 'executing', active, op? } / { type: 'requestExecute' }
+ *             { type: 'executing', active } / { type: 'requestExecute' }
  *             { type: 'loading' } / { type: 'empty' } / { type: 'error', message }
  *
  * Inbound payloads are field-validated by the host before they are
@@ -29,6 +32,7 @@
  * host-pushed plan replaces the todo.
  */
 import { iconSvg } from './icons.js';
+import { formatTime, shortSha } from './util.js';
 
 const vscode = acquireVsCodeApi();
 
@@ -53,7 +57,6 @@ const els = {
   todoCount: document.getElementById('todo-count'),
   execute: document.getElementById('execute'),
   cancel: document.getElementById('cancel'),
-  dockedTitle: document.getElementById('docked-title'),
   dockedSub: document.getElementById('docked-sub'),
   progressFill: document.getElementById('progress-fill'),
   doneList: document.getElementById('done-list'),
@@ -101,30 +104,28 @@ let executing = false;
 /** Drag source index (HTML5 DnD is initiated from the row handle only). */
 let dragIndex = -1;
 
-/* ---------------------------------------------------------------- helpers */
+/* ------------------------------------------------------------ helpers */
 
-function shortSha(id) {
-  return typeof id === 'string' && id.length >= 7 ? id.slice(0, 7) : String(id);
-}
-
-/** Mirrors commitDetail.js's formatTime (webviews are separate bundles;
- *  a ~10-line JS duplication here is by design). */
-function formatTime(unixSeconds) {
-  try {
-    return new Date(unixSeconds * 1000).toLocaleString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',
-    });
-  } catch {
-    return '';
-  }
-}
+// shortSha/formatTime come from the shared ./util.js chunk.
 
 function setMode(next) {
   mode = next;
   for (const [name, el] of Object.entries(els.views)) {
     el.classList.toggle('hidden', name !== next);
+  }
+  persistState();
+}
+
+/** Persists the plan-editor state across window reloads (VS Code hands
+ *  it back via getState() and to the host serializer's state param).
+ *  Only plan mode survives: docked/empty views are re-derived from disk
+ *  state by the host on restore. `onto` rides at the top level so the
+ *  serializer can regain the host-side trust anchor. */
+function persistState() {
+  if (mode === 'plan' && plan) {
+    vscode.setState({ mode: 'plan', onto: plan.onto, plan, todo });
+  } else {
+    vscode.setState(undefined);
   }
 }
 
@@ -139,6 +140,7 @@ function clearBanners() {
 function setBusyIndicator(active) {
   executing = active;
   for (const button of actionButtons) button.disabled = active;
+  if (!active) updateTodoCount(); // re-apply the all-dropped disable
   // Update the label span, not textContent — the leading icon is trusted
   // static markup (icons.js) and must survive the toggle.
   const label = els.execute.lastElementChild;
@@ -151,7 +153,6 @@ function setPlan(message) {
   plan = {
     onto: String(message.onto ?? ''),
     branch: String(message.branch ?? ''),
-    upstream: String(message.upstream ?? ''),
     commits: message.commits,
   };
   todo = plan.commits.map((commit) => ({
@@ -186,6 +187,12 @@ function renderTodo() {
 function updateTodoCount() {
   const active = todo.filter((entry) => !entry.dropped).length;
   els.todoCount.textContent = active + ' of ' + todo.length + ' commits';
+  // Execute needs at least one non-dropped row: an all-dropped plan is a
+  // no-op (nothing to replay) — say so on the button instead of letting
+  // the confirm modal dead-end silently.
+  els.execute.disabled = executing || active === 0;
+  els.execute.title =
+    active === 0 ? 'Nothing to replay — every commit is dropped' : 'Execute the rebase plan';
 }
 
 /** Builds one todo row. All commit metadata goes in via textContent. */
@@ -201,6 +208,15 @@ function todoRow(entry, index) {
   handle.innerHTML = iconSvg('dragHandle');
   handle.addEventListener('mousedown', () => {
     row.draggable = true;
+    // Disarm on release-without-drag: otherwise the row stays armed and a
+    // later press-drag (e.g. selecting text in the message input) hijacks
+    // the gesture into a row drag. Native drags suppress mouseup (dragend
+    // resets instead); this one-shot listener removes itself either way.
+    const release = () => {
+      row.draggable = false;
+      window.removeEventListener('mouseup', release);
+    };
+    window.addEventListener('mouseup', release);
   });
   row.addEventListener('dragstart', (event) => {
     if (!row.draggable) {
@@ -261,6 +277,7 @@ function todoRow(entry, index) {
     rebuildRowActions(row, entry, index);
     updateRowMessage(row, entry);
     updateTodoCount();
+    persistState();
   });
   row.appendChild(select);
 
@@ -272,7 +289,7 @@ function todoRow(entry, index) {
   subject.textContent = entry.subject || shortSha(entry.id);
   const meta = document.createElement('span');
   meta.className = 'meta';
-  meta.textContent = (entry.author || '') + (entry.time ? ' · ' + formatTime(entry.time) : '');
+  meta.textContent = (entry.author || '') + (entry.time ? ' · ' + formatTime(entry.time, false) : '');
   line.appendChild(subject);
   line.appendChild(meta);
   row.appendChild(line);
@@ -350,6 +367,7 @@ function restoreEntry(row, entry) {
   if (index >= 0) rebuildRowActions(row, entry, index);
   updateRowMessage(row, entry);
   updateTodoCount();
+  persistState();
 }
 
 /** (Re)builds a row's inline message editor for the current action. */
@@ -369,6 +387,7 @@ function updateRowMessage(row, entry) {
   input.setAttribute('aria-label', 'Message for ' + entry.action);
   input.addEventListener('input', () => {
     entry.message = input.value;
+    persistState();
   });
   wrap.appendChild(input);
 }
@@ -387,27 +406,35 @@ function moveEntry(from, to) {
   const [entry] = todo.splice(from, 1);
   todo.splice(clamped, 0, entry);
   renderTodo();
+  persistState();
 }
 
-/** Submits the edited todo: dropped rows excluded; message only sent when
- *  non-empty for reword/squash (empty = git folding semantics). */
+/** Submits the edited todo: EVERY plan entry is sent — drops are explicit
+ *  'drop' entries, because the engine requires the todo's id set to equal
+ *  the current upstream..branch chain exactly (a stale snapshot must
+ *  never silently lose commits). Omitting dropped rows instead of
+ *  sending them trips that freshness gate and the engine refuses the
+ *  plan as stale. message only sent when non-empty for reword/squash
+ *  (empty = git folding semantics). An all-drop plan never reaches here
+ *  (the Execute button is disabled and openModal guards). */
 function submitTodo() {
   const payload = [];
   for (const entry of todo) {
-    if (entry.dropped) continue;
-    const item = { id: entry.id, action: entry.action };
-    if ((entry.action === 'reword' || entry.action === 'squash') && entry.message) {
+    const item = { id: entry.id, action: entry.dropped ? 'drop' : entry.action };
+    if (!entry.dropped && (entry.action === 'reword' || entry.action === 'squash') && entry.message) {
       item.message = entry.message;
     }
     payload.push(item);
   }
-  if (payload.length === 0) return; // nothing to replay; keep the editor open
   vscode.postMessage({ type: 'executeRebase', onto: plan.onto, todo: payload });
 }
 
 /* --------------------------------------------------------- confirm modal */
 
 function openModal() {
+  // All-dropped plan = nothing to execute (the Execute button is
+  // disabled for it; this guards the hidden-command path).
+  if (todo.every((entry) => entry.dropped)) return;
   const counts = { pick: 0, reword: 0, squash: 0 };
   let dropped = 0;
   for (const entry of todo) {
@@ -459,6 +486,14 @@ function setStatus(message) {
     }
     return;
   }
+  // A non-idle push while the plan editor is up means a rebase started
+  // elsewhere (an external CLI run, or another surface) — user edits win,
+  // the push is ignored (the graph banner reports that run). This panel
+  // docks only through its own execute/step outcomes, when `executing`
+  // is still true and the push is the RPC result, never an unsolicited
+  // clobber of the editor. Exception: forceDock (from openWithOnto when
+  // the panel opens mid-rebase) explicitly requests docking.
+  if (mode === 'plan' && !executing && !message.forceDock) return;
   // Entering the docked view replaces whatever was shown (a start/step
   // outcome). Once docked, later status pushes only update data — a
   // `blocked` notice pushed right after a status (refused continue)
@@ -484,22 +519,37 @@ function setStatus(message) {
 function renderDocked(status, stopped, reason) {
   const msgnum = typeof status.msgnum === 'number' ? status.msgnum : undefined;
   const end = typeof status.end === 'number' ? status.end : undefined;
-  if (msgnum !== undefined && end && end > 0) {
-    els.progressFill.style.width = Math.round((msgnum / end) * 100) + '%';
+  // git bumps msgnum when an entry STARTS (a conflict stop already counts
+  // the stopped entry), so completed progress = msgnum - 1.
+  const completed = msgnum !== undefined ? Math.max(msgnum - 1, 0) : undefined;
+  if (completed !== undefined && end && end > 0) {
+    els.progressFill.style.width = Math.round((completed / end) * 100) + '%';
   } else {
     els.progressFill.style.width = '0';
   }
-  els.dockedTitle.textContent = 'Rebase in progress';
   let sub = '';
-  if (msgnum !== undefined && end) sub = msgnum + ' / ' + end;
+  if (completed !== undefined && end) sub = completed + ' / ' + end;
   if (stopped) {
     sub += (sub ? ' — ' : '') + 'stopped at ' + shortSha(status.stopped_sha || '');
     if (reason === 'conflict') sub += ' (conflict)';
     else if (reason === 'reword_stop') sub += ' (waiting for message)';
   }
   els.dockedSub.textContent = sub;
-  renderStatusList(els.doneList, status.done || []);
-  renderStatusList(els.remainingList, status.remaining || [], status.stopped_sha);
+  let done = status.done || [];
+  let remaining = status.remaining || [];
+  if (stopped && status.stopped_sha) {
+    // git appends an entry to `done` when it STARTS executing it, so the
+    // stopped entry sits at the tail of done although it is NOT complete.
+    // Move it to the head of remaining — the current, highlighted entry.
+    const idx = done.findIndex((entry) => entry.id === status.stopped_sha);
+    if (idx >= 0) {
+      const current = done[idx];
+      done = done.filter((_, i) => i !== idx);
+      remaining = [current, ...remaining];
+    }
+  }
+  renderStatusList(els.doneList, done);
+  renderStatusList(els.remainingList, remaining, stopped ? status.stopped_sha : undefined);
 }
 
 function renderStatusList(list, entries, stoppedSha) {
@@ -640,6 +690,26 @@ window.addEventListener('keydown', (event) => {
     closeModal();
   }
 });
+
+// Restore plan-editor state from a previous window session (VS Code
+// survives reloads with getState); the host regains its trust anchor
+// from the same blob via the serializer's state param. Docked views are
+// NOT restored here — the host re-derives them from disk on 'ready'.
+const savedState = vscode.getState();
+if (
+  savedState &&
+  savedState.mode === 'plan' &&
+  savedState.plan &&
+  Array.isArray(savedState.plan.commits) &&
+  Array.isArray(savedState.todo) &&
+  savedState.todo.length === savedState.plan.commits.length
+) {
+  plan = savedState.plan;
+  todo = savedState.todo;
+  renderPlanHeader();
+  renderTodo();
+  setMode('plan');
+}
 
 // The host's first data push rides on this ready handshake: postMessage
 // for 'ready' instead of the host pushing at construction time (the

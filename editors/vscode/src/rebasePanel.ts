@@ -15,13 +15,13 @@
  *             { type: 'refreshPlan' }
  *             { type: 'openConflicts' }
  *             { type: 'close' }
- *   outbound: { type: 'plan', onto, branch, upstream, commits }
+ *   outbound: { type: 'plan', onto, branch, commits }
  *             { type: 'status', status, conflictCount?, reason? }
  *             { type: 'stale' }            — engine -32005: plan expired
  *             { type: 'blocked', message } — continue refused (unresolved
  *                                            conflicts / rebase wedged)
  *             { type: 'finished', outcome }— rebase done or aborted
- *             { type: 'executing', active, op? }
+ *             { type: 'executing', active }
  *             { type: 'requestExecute' }   — hidden palette command echo
  *             { type: 'loading' } / { type: 'empty' } / { type: 'error', message }
  *
@@ -41,7 +41,8 @@
  */
 import * as vscode from 'vscode';
 import { ConflictFlow, showConflictsView } from './conflictFlow';
-import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
+import { EngineClient } from './engineClient';
+import { runRebaseStart, runRebaseStep } from './rebaseControl';
 import type {
   GetRebaseStatusResult,
   RebaseTodoEntry,
@@ -115,9 +116,16 @@ export function registerRebasePanelSerializer(
 ): void {
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(PANEL_TYPE, {
-      deserializeWebviewPanel: async (panel: vscode.WebviewPanel) => {
+      deserializeWebviewPanel: async (panel: vscode.WebviewPanel, state: unknown) => {
         if (activePanel) return; // a live panel wins over the restored shell
-        activePanel = new RebasePanel(context, panel, client, conflictFlow, undefined);
+        // The webview persists its plan-editor blob via vscode.setState();
+        // VS Code hands the same blob here so the host regains the onto
+        // trust anchor (executeRebase validation needs it post-restore).
+        const onto =
+          state && typeof state === 'object' && typeof (state as { onto?: unknown }).onto === 'string'
+            ? (state as { onto: string }).onto
+            : undefined;
+        activePanel = new RebasePanel(context, panel, client, conflictFlow, onto, onto !== undefined);
       },
     }),
   );
@@ -196,6 +204,15 @@ class RebasePanel implements vscode.Disposable {
   /** Monotonic fetch sequence: a re-target mid-flight drops the older
    *  getRebasePlan response. */
   private fetchSeq = 0;
+  /** The onto whose plan fetch is currently in flight (same-target
+   *  single-flight: a refreshPlan flood cannot drive concurrent
+   *  getRebasePlan RPCs — a re-target to a different onto still
+   *  supersedes via fetchSeq). */
+  private planFetchInFlightFor: string | undefined;
+  /** Monotonic status sequence: pushStatus runs from both the debounced
+   *  notification refresh and the execute/step paths, so an older
+   * getRebaseStatus snapshot must never overwrite a newer one. */
+  private statusSeq = 0;
   /** In-flight rebase RPC guard: one start/continue/skip/abort at a time. */
   private executing = false;
   /** Last engine-reported stop reason, replayed with status pushes so the
@@ -218,8 +235,16 @@ class RebasePanel implements vscode.Disposable {
     private client: EngineClient,
     conflictFlow: ConflictFlow,
     onto: string | undefined,
+    restored = false,
   ) {
-    this.pendingOnto = onto;
+    if (restored) {
+      // Serializer restore: the webview re-renders its persisted plan
+      // itself; the host only regains the trust anchor (no re-fetch —
+      // that would clobber the restored edits).
+      this.onto = onto;
+    } else {
+      this.pendingOnto = onto;
+    }
     this.conflictFlow = conflictFlow;
     panel.webview.html = buildWebviewHtml(context.extensionUri, panel.webview, 'rebase.html');
     this.messageSub = panel.webview.onDidReceiveMessage((message: RebasePanelMessage) =>
@@ -241,6 +266,7 @@ class RebasePanel implements vscode.Disposable {
     if (this.disposed) return;
     this.disposed = true;
     this.fetchSeq++; // any in-flight plan fetch for this panel is dead
+    this.statusSeq++; // any in-flight status refresh is dead too
     this.messageSub.dispose();
     this.scheduleStatusRefresh.cancel();
     for (const disposable of this.disposables) disposable.dispose();
@@ -259,7 +285,31 @@ class RebasePanel implements vscode.Disposable {
     this.lastStopReason = undefined;
     this.bindNotifications();
     this.panel.reveal();
-    if (this.webviewReady) void this.fetchAndPushPlan(onto);
+    if (this.webviewReady) void this.openWithOnto(onto);
+  }
+
+  /** Opening (or re-targeting) a panel at an onto normally shows the plan
+   *  editor — but when a rebase is already on disk (CLI-started, or
+   *  engine-started from another surface) the plan editor would be a lie:
+   *  the todo ids it fetches belong to history that is actively being
+   *  rewritten, and executing it can only fail. Per the plan spec, a
+   *  fresh panel opened mid-rebase docks directly as the read-only view
+   *  (progress + continue/skip/abort). An open plan-mode panel keeps its
+   *  edits instead — that case is the webview's plan-mode status guard,
+   *  not this one. */
+  private async openWithOnto(onto: string): Promise<void> {
+    try {
+      const status = await this.client.getRebaseStatus();
+      if (this.disposed || this.pendingOnto !== onto) return;
+      if (status.state !== 'idle') {
+        await this.pushStatus(true); // forceDock: bypass plan-mode guard
+        return;
+      }
+    } catch {
+      // Status unreadable: fall through — the plan fetch surfaces its
+      // own error banner if it fails.
+    }
+    void this.fetchAndPushPlan(onto);
   }
 
   /** Subscribes the panel to the engine's mutation notifications (see the
@@ -287,10 +337,14 @@ class RebasePanel implements vscode.Disposable {
       case 'ready':
         // First point where pushes reach the webview — the initial data
         // rides on this handshake (constructor postMessages are dropped).
+        // One-shot: a repeated 'ready' must not re-trigger the plan fetch
+        // (the webview is a trust boundary; unbounded plan RPCs are an
+        // amplification surface).
+        if (this.webviewReady) return;
         this.webviewReady = true;
         if (this.pendingOnto) {
           const onto = this.pendingOnto;
-          void this.fetchAndPushPlan(onto);
+          void this.openWithOnto(onto);
         } else {
           void this.pushStatus(); // serializer restore: docked or idle view
         }
@@ -336,34 +390,43 @@ class RebasePanel implements vscode.Disposable {
   }
 
   /** Fetches the plan for `onto` and pushes it; superseded fetches (a
-   *  re-target mid-flight) are dropped. */
+   *  re-target mid-flight) are dropped. Same-target single-flight: a
+   *  flood of refreshPlan/ready messages cannot drive concurrent
+   *  getRebasePlan RPCs against the engine. */
   private async fetchAndPushPlan(onto: string): Promise<void> {
-    const seq = ++this.fetchSeq;
-    this.push({ type: 'loading' });
-    let plan;
+    if (this.planFetchInFlightFor === onto) return;
+    this.planFetchInFlightFor = onto;
     try {
-      plan = await this.client.getRebasePlan(onto);
-    } catch (err) {
+      const seq = ++this.fetchSeq;
+      this.push({ type: 'loading' });
+      let plan;
+      try {
+        plan = await this.client.getRebasePlan(onto);
+      } catch (err) {
+        if (seq !== this.fetchSeq || this.disposed) return;
+        this.push({ type: 'error', message: errorMessage(err) });
+        return;
+      }
       if (seq !== this.fetchSeq || this.disposed) return;
-      this.push({ type: 'error', message: errorMessage(err) });
-      return;
+      if (plan.commits.length === 0) {
+        // The graph entry gates this ("nothing to rebase"), so reaching
+        // here means the range emptied between the click and the fetch.
+        this.push({ type: 'empty' });
+        return;
+      }
+      this.onto = plan.onto !== '' ? plan.onto : onto;
+      this.lastStopReason = undefined;
+      this.push({
+        type: 'plan',
+        onto: this.onto,
+        branch: plan.branch,
+        commits: plan.commits,
+      });
+    } finally {
+      // Only clear when still tracking this fetch (a re-target started a
+      // different one in the meantime — that fetch owns the slot now).
+      if (this.planFetchInFlightFor === onto) this.planFetchInFlightFor = undefined;
     }
-    if (seq !== this.fetchSeq || this.disposed) return;
-    if (plan.commits.length === 0) {
-      // The graph entry gates this ("nothing to rebase"), so reaching
-      // here means the range emptied between the click and the fetch.
-      this.push({ type: 'empty' });
-      return;
-    }
-    this.onto = plan.onto !== '' ? plan.onto : onto;
-    this.lastStopReason = undefined;
-    this.push({
-      type: 'plan',
-      onto: this.onto,
-      branch: plan.branch,
-      upstream: plan.upstream,
-      commits: plan.commits,
-    });
   }
 
   /** Executes the validated todo. Engine outcomes: stopped (normal —
@@ -373,23 +436,30 @@ class RebasePanel implements vscode.Disposable {
   private async execute(onto: string, todo: RebaseTodoEntry[]): Promise<void> {
     if (this.executing) return; // in-flight guard: no double starts
     this.executing = true;
-    this.push({ type: 'executing', active: true, op: 'execute' });
+    this.push({ type: 'executing', active: true });
     try {
-      const result = await this.client.startRebase(onto, todo);
-      await this.handleResult(result, 'execute');
-    } catch (err) {
-      if (rpcErrorCode(err) === RpcErrorCode.INVALID_ARGUMENT) {
-        if (/already in progress/i.test(errorMessage(err))) {
+      const outcome = await runRebaseStart(this.client, onto, todo);
+      if (outcome.kind === 'result') {
+        await this.handleResult(outcome.result, 'execute');
+      } else if (outcome.kind === 'refused') {
+        if (/already in progress/i.test(outcome.message)) {
           // A rebase is on disk (e.g. started externally): the docked view
           // is the honest state to show, not a stale-plan banner.
-          this.push({ type: 'blocked', message: errorMessage(err) });
+          this.push({ type: 'blocked', message: outcome.message });
           await this.pushStatus();
         } else {
           // Stale todo chain: report, keep the user's edits untouched.
           this.push({ type: 'stale' });
         }
+      } else if (outcome.kind === 'failed') {
+        vscode.window.showErrorMessage(`Git Bamboo: rebase failed — ${outcome.message}`);
       } else {
-        vscode.window.showErrorMessage(`Git Bamboo: rebase failed — ${errorMessage(err)}`);
+        // 'dropped': another mutating op is in flight for this repo (the
+        // shared net-op guard — the same slot pull/push and the graph
+        // banner's controls take).
+        vscode.window.showWarningMessage(
+          'Git Bamboo: another operation is in progress — try again once it finishes',
+        );
       }
     } finally {
       this.executing = false;
@@ -404,22 +474,19 @@ class RebasePanel implements vscode.Disposable {
   async step(kind: 'continue' | 'skip' | 'abort'): Promise<void> {
     if (this.executing) return;
     this.executing = true;
-    this.push({ type: 'executing', active: true, op: kind });
+    this.push({ type: 'executing', active: true });
     try {
-      const result =
-        kind === 'continue'
-          ? await this.client.rebaseContinue()
-          : kind === 'skip'
-            ? await this.client.rebaseSkip()
-            : await this.client.rebaseAbort();
-      await this.handleResult(result, kind);
-    } catch (err) {
-      if (rpcErrorCode(err) === RpcErrorCode.INVALID_ARGUMENT) {
-        this.push({ type: 'blocked', message: errorMessage(err) });
+      const outcome = await runRebaseStep(this.client, kind);
+      if (outcome.kind === 'result') {
+        await this.handleResult(outcome.result, kind);
+      } else if (outcome.kind === 'refused') {
+        this.push({ type: 'blocked', message: outcome.message });
         await this.pushStatus();
+      } else if (outcome.kind === 'failed') {
+        vscode.window.showErrorMessage(`Git Bamboo: rebase ${kind} failed — ${outcome.message}`);
       } else {
-        vscode.window.showErrorMessage(
-          `Git Bamboo: rebase ${kind} failed — ${errorMessage(err)}`,
+        vscode.window.showWarningMessage(
+          'Git Bamboo: another operation is in progress — try again once it finishes',
         );
       }
     } finally {
@@ -447,25 +514,37 @@ class RebasePanel implements vscode.Disposable {
    *  While stopped, the conflict count rides along (same engine status
    *  the Commit view's conflicts bucket renders — one source of truth),
    *  plus the last known stop reason. */
-  private async pushStatus(): Promise<void> {
+  private async pushStatus(forceDock?: boolean): Promise<void> {
     if (this.disposed) return;
+    // Sequence guard (the dataSeq learning): pushStatus is invoked from
+    // both the debounced notification refresh and the execute/step
+    // paths, so two getRebaseStatus RPCs can race — an older snapshot
+    // must never overwrite a newer one.
+    const seq = ++this.statusSeq;
     let status: GetRebaseStatusResult;
     try {
       status = await this.client.getRebaseStatus();
-    } catch {
-      return; // transient engine failure: keep the last pushed view
+    } catch (err) {
+      // Transient engine failure: keep the last pushed view — but leave
+      // a diagnostic trace (a persistently failing engine would otherwise
+      // leave the docked view silently stale).
+      console.warn('[git-bamboo] rebase panel status refresh failed:', err);
+      return;
     }
+    if (seq !== this.statusSeq || this.disposed) return;
     let conflictCount: number | undefined;
     if (status.state !== 'idle') {
       const conflicts = await this.conflictFlow.currentConflicts();
+      if (seq !== this.statusSeq || this.disposed) return;
       conflictCount = conflicts?.length ?? 0;
     }
-    if (this.disposed) return;
+    if (seq !== this.statusSeq || this.disposed) return;
     this.push({
       type: 'status',
       status,
       conflictCount,
       reason: status.state === 'idle' ? undefined : this.lastStopReason,
+      forceDock,
     });
   }
 

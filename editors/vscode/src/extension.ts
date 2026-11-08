@@ -146,6 +146,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         noSessionWarning();
         return;
       }
+      // Check if a rebase is already in progress — if so, open the panel
+      // directly (it will dock) instead of fetching a new plan (which
+      // fails when HEAD is detached).
+      try {
+        const status = await client.getRebaseStatus();
+        if (status.state !== 'idle') {
+          openRebasePlanPanel(context, client, activeConflictFlow, commit.id);
+          return;
+        }
+      } catch {
+        // Status unreadable: fall through — the plan fetch surfaces its
+        // own error banner if it fails.
+      }
       let plan;
       try {
         plan = await client.getRebasePlan(commit.id);

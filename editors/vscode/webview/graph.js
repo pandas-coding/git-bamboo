@@ -4,6 +4,8 @@
  * viewport paging driven by postMessage round-trips to the extension host.
  * Vanilla JS, no framework.
  */
+import { formatTime, shortSha } from './util.js';
+
 (() => {
   'use strict';
 
@@ -53,10 +55,6 @@
   /** True while the host runs a rebase control op (buttons disabled). */
   let rebaseControlActive = false;
 
-  function shortSha(id) {
-    return typeof id === 'string' && id.length >= 7 ? id.slice(0, 7) : String(id);
-  }
-
   /** Derives the banner from rebaseStatus: hidden unless a rebase is on
    *  disk. Controls enabled only while stopped AND no other mutating op
    *  is in flight (net op or rebase control). */
@@ -69,7 +67,11 @@
     rebaseBanner.hidden = false;
     let text = 'Rebase in progress';
     if (rebaseStatus.msgnum && rebaseStatus.end) {
-      text += ` ${rebaseStatus.msgnum}/${rebaseStatus.end}`;
+      // git's msgnum counts the entry being processed (1-based): it is
+      // bumped when the entry STARTS, so a conflict stop already counts
+      // the stopped entry. Progress = completed entries = msgnum - 1.
+      const completed = Math.max(rebaseStatus.msgnum - 1, 0);
+      text += ` ${completed}/${rebaseStatus.end}`;
     }
     if (state === 'stopped') {
       text += ` — stopped at ${shortSha(rebaseStatus.stopped_sha)}`;
@@ -106,7 +108,10 @@
 
   for (const [op, btn] of Object.entries(rebaseButtons)) {
     btn.addEventListener('click', () => {
-      if (!btn.disabled) vscode.postMessage({ type: 'rebaseControl', op });
+      // The host validates `rebaseOp` against its control set before any
+      // RPC runs (trust boundary) — the field name must match its
+      // GraphViewMessage exactly.
+      if (!btn.disabled) vscode.postMessage({ type: 'rebaseControl', rebaseOp: op });
     });
   }
 
@@ -423,20 +428,6 @@
     }
     selectedRow = row;
     rowEls.get(row)?.classList.add('selected');
-  }
-
-  function formatTime(unixSeconds) {
-    try {
-      return new Date(unixSeconds * 1000).toLocaleString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-    } catch {
-      return '';
-    }
   }
 
   /** Stable color per ref name (same palette as the lanes). */

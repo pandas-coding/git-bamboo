@@ -17,6 +17,7 @@
  * stroke SVGs), which is CSP-safe.
  */
 import { iconSvg } from './icons.js';
+import { formatTime } from './util.js';
 
 const vscode = acquireVsCodeApi();
 
@@ -38,22 +39,6 @@ const els = {
 
 /** Engine file status → icon name / CSS color class (same names). */
 const STATUS = { A: 'added', D: 'deleted', M: 'modified', R: 'renamed', C: 'copied', T: 'typechanged' };
-
-/** Mirrors graph.js's formatTime (webviews are separate bundles; a ~10-line
- *  JS duplication here is by design). */
-function formatTime(unixSeconds) {
-  try {
-    return new Date(unixSeconds * 1000).toLocaleString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  } catch {
-    return '';
-  }
-}
 
 /** First character of the author name for the avatar placeholder. */
 function initial(name) {

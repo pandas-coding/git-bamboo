@@ -5,11 +5,15 @@
  * index stages (base :1 / ours :2 / theirs :3) through the ENGINE_SCHEME
  * content provider.
  *
- * Completion is tracked on the save hook: when the merge editor's result
- * document (the worktree file) is saved without conflict markers, the
- * file is staged through the engine write queue — the index/worktree
- * change notifications then refresh the Commit view like any other
- * engine-side write.
+ * Completion is tracked on the merge editor's tab close: the Complete
+ * Merge button saves the result into the worktree file and closes the
+ * editor, and the close hook stages the worktree content through the
+ * engine write queue — the index/worktree notifications then refresh the
+ * Commit view like any other engine-side write. Plain saves inside the
+ * editor deliberately do NOT stage: an unresolved result document
+ * serializes as the base content without conflict markers, so a save
+ * hook would silently stage the base version and collapse the conflict
+ * with the wrong content.
  */
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -67,9 +71,10 @@ async function isRebaseActive(root: vscode.Uri): Promise<boolean> {
  *  stage :2 (ours) feeds input1 "Current" and :3 (theirs) input2
  *  "Incoming" — only the *titles* differ, because during a rebase "ours"
  *  is the upstream side and "theirs" is the user's own replayed change.
- *  Exported for the shared conflict flow (conflictFlow.ts), which
- *  forwards an explicit order from rebase-path callers; every other
- *  caller relies on openFor's automatic detection. */
+ *  The order is decided in ONE place — openFor's on-disk rebase detection
+ *  (isRebaseActive): engine- and externally-started rebases, pull/merge
+ *  conflicts, and every consumer get the right titles from the same
+ *  mechanism, with no per-caller parameter plumbing. */
 export type MergeInputOrder = 'merge' | 'rebase';
 
 function mergeInputs(root: vscode.Uri, relativePath: string, order: MergeInputOrder) {
@@ -87,7 +92,6 @@ export class MergeEditorManager implements vscode.Disposable {
   /** Result documents of currently open merge editors (worktree file URIs)
    *  mapped to the repo-relative path to stage when they resolve. */
   private readonly tracked = new Map<string, string>();
-  private readonly listener: vscode.Disposable;
   private readonly tabListener: vscode.Disposable;
   private disposed = false;
 
@@ -95,16 +99,20 @@ export class MergeEditorManager implements vscode.Disposable {
     private readonly client: EngineClient,
     private readonly root: vscode.Uri,
   ) {
-    this.listener = vscode.workspace.onDidSaveTextDocument((doc) => void this.onSaved(doc));
-    // Untrack when the merge editor tab closes unresolved, so a later
-    // re-conflict of the same file starts clean. The tab input type
-    // (TabInputTextMerge) is not in @types/vscode — duck-type on
-    // `resultUri` instead of `any`-casting.
+    // Completion = the merge editor tab closing (Complete Merge saves the
+    // result into the worktree file first); an unresolved close leaves the
+    // worktree conflicted or base-identical and the guards below refuse to
+    // stage. The tab input type (TabInputTextMerge) is not in
+    // @types/vscode — duck-type on `resultUri` instead of `any`-casting.
     this.tabListener = vscode.window.tabGroups.onDidChangeTabs((event) => {
       for (const closed of event.closed) {
         const input = closed.input as { resultUri?: unknown } | undefined;
         if (input && input.resultUri instanceof vscode.Uri) {
-          this.tracked.delete(input.resultUri.toString());
+          const key = input.resultUri.toString();
+          const relativePath = this.tracked.get(key);
+          if (!relativePath) continue;
+          this.tracked.delete(key);
+          void this.stageResolvedResult(input.resultUri, relativePath);
         }
       }
     });
@@ -112,7 +120,6 @@ export class MergeEditorManager implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
-    this.listener.dispose();
     this.tabListener.dispose();
     this.tracked.clear();
   }
@@ -127,17 +134,14 @@ export class MergeEditorManager implements vscode.Disposable {
    * silently empty sides that a save would then stage. An absent stage
    * (no :3 for a deleted side, no :1 base for both-added) resolves to
    * the empty string — that side's actual state — and errors propagate.
-   *
-   * `order` overrides the input-title order explicitly (the rebase flow
-   * passes 'rebase' from its own state knowledge); when omitted, the
-   * on-disk rebase state decides (merge-order outside a rebase, rebase
-   * order while one is in progress — engine- and externally-started
-   * alike).
+   * `kind` selects the binary-resolution offer for binary conflicts.
+   * The input-title order (merge vs. rebase) is decided here from the
+   *  on-disk rebase state (isRebaseActive) — the single mechanism, valid
+   *  for engine- and externally-started rebases alike.
    */
   async openFor(
     relativePath: string,
     kind: ConflictKind | undefined,
-    order?: MergeInputOrder,
   ): Promise<void> {
     const base = await this.client.getBlob(STAGE_BASE, relativePath);
     const ours = await this.client.getBlob(STAGE_OURS, relativePath);
@@ -150,7 +154,7 @@ export class MergeEditorManager implements vscode.Disposable {
     }
 
     const output = vscode.Uri.joinPath(this.root, ...relativePath.split('/'));
-    const resolvedOrder: MergeInputOrder = order ?? (await isRebaseActive(this.root) ? 'rebase' : 'merge');
+    const resolvedOrder: MergeInputOrder = (await isRebaseActive(this.root)) ? 'rebase' : 'merge';
     const { input1, input2 } = mergeInputs(this.root, relativePath, resolvedOrder);
     const args: Record<string, unknown> = {
       // input1 = current (ours :2), input2 = incoming (theirs :3); the
@@ -189,49 +193,71 @@ export class MergeEditorManager implements vscode.Disposable {
     }
   }
 
-  /** Save hook: a tracked result document without conflict markers is a
-   *  finished resolution — stage it through the engine write queue. The
-   *  engine's index/worktree notifications then refresh the view. */
-  private async onSaved(doc: vscode.TextDocument): Promise<void> {
+  /**
+   * Merge editor closed: stage the worktree result if it is a finished
+   * resolution. Guards, cheapest first:
+   *  - conflict markers (a forced close left unresolved regions behind);
+   *  - freshness: the conflict may already be resolved through another
+   *    path (Accept Yours button) while the editor stayed open;
+   *  - the untouched-result trap: an unresolved merge editor serializes
+   *    as the base content without markers, so a result identical to the
+   *    base while both sides differ from it means the conflict blocks
+   *    were never resolved — staging it would silently collapse the
+   *    conflict with the wrong content.
+   */
+  private async stageResolvedResult(
+    resultUri: vscode.Uri,
+    relativePath: string,
+  ): Promise<void> {
     if (this.disposed) return;
-    const relativePath = this.tracked.get(doc.uri.toString());
-    if (!relativePath) return;
-    if (hasConflictMarkers(doc.getText())) {
+    const name = path.posix.basename(relativePath);
+    let content: string | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        content = new TextDecoder().decode(await vscode.workspace.fs.readFile(resultUri));
+      } catch {
+        return; // worktree file gone (deleted side, repo moved) — nothing to stage
+      }
+      if (!hasConflictMarkers(content)) break;
+      // Complete Merge writes the result just before closing the tab;
+      // give a racing write one chance to land before refusing.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (content === undefined) return;
+    if (hasConflictMarkers(content)) {
       vscode.window.setStatusBarMessage(
-        `Git Bamboo: ${path.posix.basename(relativePath)} still has conflict markers — not staged`,
+        `Git Bamboo: ${name} still has conflict markers — not staged`,
         4000,
       );
       return;
     }
-    // Freshness: the user may have resolved this file through another
-    // path (e.g. the Accept Yours button) while the merge-editor tab
-    // stayed open — the session was never untracked then, and staging
-    // here would overwrite the accepted resolution with the merge
-    // editor's (stale) result. Re-check against a fresh status first.
     try {
       const items = await this.client.request<StatusItem[]>('getStatus', {});
       const stillConflicted =
         Array.isArray(items) &&
         items.some((item) => item.path === relativePath && item.status === 'conflict');
       if (!stillConflicted) {
-        this.tracked.delete(doc.uri.toString()); // someone else resolved it; stop watching
         vscode.window.setStatusBarMessage(
-          `Git Bamboo: ${path.posix.basename(relativePath)} was already resolved — not staged`,
+          `Git Bamboo: ${name} was already resolved — not staged`,
           4000,
         );
         return;
       }
-    } catch {
-      // Status unavailable (engine restarting): fall through and let the
-      // stage RPC itself arbitrate.
-    }
-    try {
+      const [base, ours, theirs] = await Promise.all([
+        this.client.getBlob(STAGE_BASE, relativePath),
+        this.client.getBlob(STAGE_OURS, relativePath),
+        this.client.getBlob(STAGE_THEIRS, relativePath),
+      ]);
+      if (content === base && ours !== base && theirs !== base) {
+        vscode.window.setStatusBarMessage(
+          `Git Bamboo: ${name} merge result is still the base version — ` +
+            'resolve the conflict blocks (Complete Merge) before staging',
+          6000,
+        );
+        return;
+      }
       await this.client.request('stage', { paths: [relativePath] });
-      this.tracked.delete(doc.uri.toString()); // resolved; stop watching
-      vscode.window.setStatusBarMessage(
-        `Git Bamboo: resolved and staged ${path.posix.basename(relativePath)}`,
-        4000,
-      );
+      vscode.window.setStatusBarMessage(`Git Bamboo: resolved and staged ${name}`, 4000);
     } catch (err) {
       vscode.window.showErrorMessage(
         `Git Bamboo: staging the resolved ${relativePath} failed — ${errorMessage(err)}`,

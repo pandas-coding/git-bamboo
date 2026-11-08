@@ -132,8 +132,6 @@
     .todo-row.drop-above { box-shadow: inset 0 2px 0 0 var(--vscode-focusBorder); }
     .todo-row.drop-below { box-shadow: inset 0 -2px 0 0 var(--vscode-focusBorder); }
     .todo-row.dropped { opacity: 0.45; }
-    .todo-row.dropped .commit-line,
-    .todo-row.dropped .row-actions { text-decoration: none; }
     .drag-handle {
       flex-shrink: 0;
       cursor: grab;
@@ -163,7 +161,6 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .commit-line .subject { display: inline; }
     .commit-line .meta {
       color: var(--vscode-descriptionForeground);
       font-size: 11px;
@@ -188,11 +185,6 @@
       color: var(--vscode-input-foreground);
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-inputValidation-infoBorder, #3566ac);
-    }
-    .row-message .hint {
-      color: var(--vscode-descriptionForeground);
-      font-size: 11px;
-      margin-top: 2px;
     }
     #plan-actions {
       display: flex;
@@ -363,7 +355,7 @@
   <!-- docked mode: an in-progress rebase (read-only view + controls) -->
   <section id="docked-view" class="hidden">
     <header id="docked-header">
-      <h1 id="docked-title">Rebase in progress</h1>
+      <h1>Rebase in progress</h1>
       <p id="docked-sub"></p>
     </header>
     <div id="progress-track"><div id="progress-fill"></div></div>

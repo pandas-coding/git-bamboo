@@ -7,11 +7,12 @@
  * both attach a vscode.Webview and get identical behavior.
  */
 import * as vscode from 'vscode';
-import { EngineClient, RpcError, RpcErrorCode, rpcErrorCode } from './engineClient';
+import { EngineClient, RpcError } from './engineClient';
 import { ConflictFlow } from './conflictFlow';
 import { openCommitDetailPanel } from './commitDetail';
 import { createContextTargetSlot } from './contextTargetSlot';
 import * as netOps from './netOps';
+import { runRebaseStep } from './rebaseControl';
 import type { GraphPage, RepoState } from './types';
 import {
   BRANCH_STATUS_DEBOUNCE_MS,
@@ -162,17 +163,15 @@ export class GraphSession implements vscode.Disposable {
       client.onNotification('refsChanged', () => {
         void this.sendRefs();
         this.scheduleBranchStatus();
+        // Rebase banner: any mutation that can change the on-disk rebase
+        // state schedules a disk-state re-read (debounced).
+        this.scheduleRebaseStatus();
       }),
       client.onNotification('headChanged', () => {
         void this.sendHead();
         this.scheduleBranchStatus();
+        this.scheduleRebaseStatus();
       }),
-      // Rebase banner: any mutation that can change the on-disk rebase
-      //  state (a step of ours, the rebase panel's, or an external CLI
-      //  rebase — the engine watches the worktree and notifies) schedules
-      //  a disk-state re-read, debounced.
-      client.onNotification('refsChanged', () => this.scheduleRebaseStatus()),
-      client.onNotification('headChanged', () => this.scheduleRebaseStatus()),
       client.onNotification('worktreeChanged', () => this.scheduleRebaseStatus()),
       client.onNotification('indexChanged', () => this.scheduleRebaseStatus()),
       { dispose: onDispose },
@@ -428,41 +427,40 @@ export class GraphSession implements vscode.Disposable {
     }
   }
 
-  /** Runs one rebase banner control (continue/skip/abort) via the engine
-   *  RPCs — the same ones the rebase panel's docked view uses, no copies.
-   *  Shares the net-op in-flight guard: one mutating operation per client
-   *  (a pull racing a rebase continue is exactly the kind of stale click
-   *  the guard exists for). A refused continue (unresolved conflicts) is
-   *  the engine's INVALID_ARGUMENT — surfaced as a warning pointing at
-   *  the Commit view's conflicts bucket. */
+  /** Runs one rebase banner control (continue/skip/abort) through the
+   *  shared rebase-step runner (rebaseControl.ts) — the same RPC,
+   *  in-flight guard, and failure classification the rebase panel's
+   *  docked view uses, no copies. A refused continue (unresolved
+   *  conflicts) is the engine's INVALID_ARGUMENT — surfaced as a warning
+   *  pointing at the Commit view's conflicts bucket. */
   private async runRebaseControl(op: 'continue' | 'skip' | 'abort'): Promise<void> {
-    if (this.disposed || !netOps.tryBeginNetOp(this.client)) return;
+    if (this.disposed) return;
+    await this.webview.postMessage({ type: 'rebaseControlState', active: true });
     try {
-      await this.webview.postMessage({ type: 'rebaseControlState', active: true });
-      await vscode.window.withProgress(
+      const outcome = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: `Git Bamboo: rebase ${op}`,
         },
-        () =>
-          op === 'continue'
-            ? this.client.rebaseContinue()
-            : op === 'skip'
-              ? this.client.rebaseSkip()
-              : this.client.rebaseAbort(),
+        () => runRebaseStep(this.client, op),
       );
-    } catch (err) {
-      if (rpcErrorCode(err) === RpcErrorCode.INVALID_ARGUMENT) {
+      if (outcome.kind === 'refused') {
         vscode.window.showWarningMessage(
-          `Git Bamboo: ${errorMessage(err)} — resolve conflicts in the Commit view first.`,
+          `Git Bamboo: ${outcome.message} — resolve conflicts in the Commit view first.`,
         );
-      } else {
+      } else if (outcome.kind === 'failed') {
         vscode.window.showErrorMessage(
-          `Git Bamboo: rebase ${op} failed — ${errorMessage(err)}`,
+          `Git Bamboo: rebase ${op} failed — ${outcome.message}`,
         );
       }
+      // 'result' and 'dropped' need no UI here: the shared runner already
+      // ran (or dropped) the op, and the settle call below refreshes the
+      // banner either way.
+    } catch (err) {
+      // runRebaseStep classifies instead of throwing; an escaping throw
+      // breaks that contract — log it instead of an unhandled rejection.
+      console.error('[git-bamboo] rebase control failed:', err);
     } finally {
-      netOps.endNetOp(this.client);
       if (!this.disposed) {
         await this.webview.postMessage({ type: 'rebaseControlState', active: false });
       }

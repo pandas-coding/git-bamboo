@@ -409,7 +409,7 @@ export class CommitViewProvider implements vscode.WebviewViewProvider, vscode.Di
    *  "Resolve in Merge Editor" button) through the shared conflict flow;
    * input titles follow the auto-detected merge/rebase order. */
   private async openMergeEditor(relativePath: string): Promise<void> {
-    const outcome = await this.conflictFlow.openMergeEditor(relativePath, undefined, this.lastItems);
+    const outcome = await this.conflictFlow.openMergeEditor(relativePath, this.lastItems);
     if (outcome.kind === 'opened' || outcome.kind === 'rejected') return;
     if (outcome.kind === 'stale') {
       vscode.window.showWarningMessage(

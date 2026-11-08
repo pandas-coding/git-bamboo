@@ -9,10 +9,12 @@
  *
  * What is shared and what is not: the engine queries (conflicted items,
  * resolveConflict), the freshness cross-check, and the merge-editor open
- * (with the input-order titles parameterized for the rebase path) live
- * here. Surface-specific concerns — how a consumer renders the conflicts
- * bucket (the Commit view), or how it points the user at it
- * (showConflictsView below) — stay with the consumer.
+ * live here. Surface-specific concerns — how a consumer renders the
+ * conflicts bucket (the Commit view), or how it points the user at it
+ * (showConflictsView below) — stay with the consumer. The merge editor's
+ * input-order titles (ours/theirs vs. rebase's) are decided inside
+ * mergeEditor.ts from the on-disk rebase state (isRebaseActive) — the
+ * single mechanism, no per-consumer parameter plumbing.
  *
  * Inbound data rule: paths, resolutions, and orders arriving from a
  * webview are untrusted. Callers validate webview payloads field-by-field
@@ -25,7 +27,7 @@
 import * as vscode from 'vscode';
 import { EngineClient, RpcErrorCode, rpcErrorCode } from './engineClient';
 import { isValidRepoPath } from './headContent';
-import { MergeEditorManager, type MergeInputOrder } from './mergeEditor';
+import { MergeEditorManager } from './mergeEditor';
 import type { ConflictResolution, StatusItem } from './types';
 import { errorMessage } from './util';
 
@@ -73,12 +75,13 @@ export class ConflictFlow implements vscode.Disposable {
   }
 
   /** The current conflicted entries (status === 'conflict'), straight
-   *  from the engine. Resolves undefined when the status RPC fails —
-   *  callers treat that as "unknown", never as "no conflicts". */
+   *  from the engine. Resolves undefined when the status RPC fails or
+   *  returns a malformed payload — callers treat that as "unknown",
+   *  never as "no conflicts". */
   async currentConflicts(): Promise<StatusItem[] | undefined> {
     try {
       const items = await this.client.request<StatusItem[]>('getStatus', {});
-      if (!Array.isArray(items)) return [];
+      if (!Array.isArray(items)) return undefined;
       return items.filter((item) => item && item.status === 'conflict');
     } catch {
       return undefined;
@@ -127,15 +130,13 @@ export class ConflictFlow implements vscode.Disposable {
   }
 
   /**
-   * Open the 3-way merge editor for one conflicted file. `order` is the
-   * structural parameter the rebase flow passes explicitly ('rebase'
-   * input titles); omitting it keeps the automatic on-disk detection
-   * (rebase order while a rebase is in progress). The freshness
-   * cross-check mirrors `resolve`.
+   * Open the 3-way merge editor for one conflicted file. The input-order
+   *  titles (ours/theirs vs. rebase's) are derived inside mergeEditor.ts
+   * from the on-disk rebase state — the one mechanism for every
+   *  consumer. The freshness cross-check mirrors `resolve`.
    */
   async openMergeEditor(
     relativePath: string,
-    order?: MergeInputOrder,
     snapshot?: StatusItem[],
   ): Promise<OpenMergeEditorOutcome> {
     if (!isValidRepoPath(relativePath)) return { kind: 'rejected' };
@@ -149,7 +150,7 @@ export class ConflictFlow implements vscode.Disposable {
     );
     if (items !== undefined && !current) return { kind: 'stale' };
     try {
-      await this.mergeEditors.openFor(relativePath, current?.conflict_kind, order);
+      await this.mergeEditors.openFor(relativePath, current?.conflict_kind);
       return { kind: 'opened' };
     } catch (err) {
       return { kind: 'failed', message: errorMessage(err) };
@@ -164,7 +165,6 @@ export class ConflictFlow implements vscode.Disposable {
  * Conflict Files" button, and the rebase panel's docked conflict notice).
  * One conflict surface, one entry — consumers never build their own.
  */
-export function showConflictsView(): Promise<void> {
-  return Promise.resolve(vscode.commands.executeCommand('gitBamboo.commit.showConflicts'))
-    .then(() => undefined);
+export async function showConflictsView(): Promise<void> {
+  await vscode.commands.executeCommand('gitBamboo.commit.showConflicts');
 }
