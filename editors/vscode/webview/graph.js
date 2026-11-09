@@ -229,6 +229,179 @@ import { formatTime, shortSha } from './util.js';
 
   updateToolbar();
 
+  // -------------------------------------------------------------- filter bar
+
+  const filterInput = document.getElementById('filter-input');
+  const filterType = document.getElementById('filter-type');
+  const filterClear = document.getElementById('filter-clear');
+  const filterCount = document.getElementById('filter-count');
+  const filterChips = document.getElementById('filter-chips');
+
+  /** Typing debounce: each keystroke would be a full engine query — wait
+   *  for the user to pause. */
+  const FILTER_DEBOUNCE_MS = 300;
+
+  /** Local mirror of the host's normalized filter (null = unfiltered).
+   *  The host is authoritative: every filterState echo — including ones
+   *  caused by this webview's own input — resyncs this (e.g. a filter
+   *  set from the command palette). */
+  let filter = null;
+
+  let filterTimer = 0;
+
+  function sendFilter(next) {
+    vscode.postMessage({ type: 'setFilter', filter: next });
+  }
+
+  /** Applies the input's current text to the selected condition type and
+   *  sends the whole filter (empty text clears that condition). */
+  function commitFilterInput() {
+    clearTimeout(filterTimer);
+    const base = filter ?? { author: null, message: null, path: null };
+    const text = filterInput.value.trim();
+    sendFilter({ ...base, [filterType.value]: text || null });
+  }
+
+  filterInput.addEventListener('input', () => {
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(commitFilterInput, FILTER_DEBOUNCE_MS);
+  });
+  // Enter commits immediately (bypasses the debounce).
+  filterInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') commitFilterInput();
+  });
+
+  filterType.addEventListener('change', () => {
+    // Swap the box to the newly selected condition's current text. A
+    // pending debounced edit targeted the OLD type — drop it.
+    clearTimeout(filterTimer);
+    filterInput.value = filter ? filter[filterType.value] || '' : '';
+    filterInput.focus();
+  });
+
+  filterClear.addEventListener('click', () => {
+    clearTimeout(filterTimer);
+    filterInput.value = '';
+    sendFilter(null);
+  });
+
+  /** Inline DOM SVG × for chip remove buttons (CSP allows inline SVG).
+   *  Invariant, so built once and cloned per chip. */
+  const CHIP_REMOVE_ICON = (() => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('width', '10');
+    svg.setAttribute('height', '10');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', 'currentColor');
+    path.setAttribute('stroke-width', '1.4');
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('d', 'M4 4l8 8 M12 4l-8 8');
+    svg.appendChild(path);
+    return svg;
+  })();
+
+  /** Rebuilds the condition chips from `filter` (textContent only:
+   *  filter text is untrusted). Each chip removes its own condition. */
+  function renderFilterChips() {
+    filterChips.textContent = '';
+    const active = filter
+      ? ['author', 'message', 'path'].filter((type) => filter[type])
+      : [];
+    filterClear.hidden = active.length === 0;
+    for (const type of active) {
+      const chip = document.createElement('span');
+      chip.className = 'filter-chip';
+      const label = document.createElement('span');
+      label.className = 'chip-label';
+      label.textContent = `${type} ${filter[type]}`;
+      label.title = `${type}: ${filter[type]}`;
+      chip.appendChild(label);
+      const remove = document.createElement('button');
+      remove.className = 'chip-remove';
+      remove.type = 'button';
+      remove.title = `Remove the ${type} condition`;
+      remove.setAttribute('aria-label', `Remove the ${type} condition`);
+      remove.appendChild(CHIP_REMOVE_ICON.cloneNode(true));
+      remove.addEventListener('click', () => {
+        clearTimeout(filterTimer);
+        if (type === filterType.value) filterInput.value = '';
+        sendFilter({ ...filter, [type]: null });
+      });
+      chip.appendChild(remove);
+      filterChips.appendChild(chip);
+    }
+  }
+
+  /** Validates a host filterState payload: a filter object with
+   *  string-or-null fields, or null. Returns undefined for malformed
+   *  shapes (ignored — keeps the last known state). */
+  function parseFilterState(payload) {
+    if (payload === null || payload === undefined) return null;
+    if (typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+    const field = (value) =>
+      typeof value === 'string' ? value : value === null || value === undefined ? null : undefined;
+    const author = field(payload.author);
+    const message = field(payload.message);
+    const path = field(payload.path);
+    if (author === undefined || message === undefined || path === undefined) return undefined;
+    return author || message || path ? { author, message, path } : null;
+  }
+
+  /** A new filter is a new query: the hit list occupies a different row
+   *  space, so drop every cached row and refetch from the top — a fresh
+   *  document, exactly. */
+  function resetListForFilter() {
+    commits.clear();
+    idToRow = new Map();
+    total = 0;
+    anchorCommit = null;
+    selectedRow = -1;
+    spacer.style.height = `${ROW_HEIGHT}px`;
+    scroller.scrollTop = 0;
+    refillRows(); // skeleton-reset via fillRow (clears stale row state)
+    applyWidth();
+    renderRows();
+    requestViewport();
+  }
+
+  /** filterState from the host (every change, including ones this webview
+   *  initiated): resync the UI, and reset the list when the filter
+   *  actually changed — the host dedups no-op changes, so an unchanged
+   *  echo (the 'ready' handshake with no filter) costs nothing. */
+  function applyFilterState(payload) {
+    const parsed = parseFilterState(payload);
+    if (parsed === undefined) return;
+    const same =
+      (parsed ? parsed.author : null) === (filter ? filter.author : null) &&
+      (parsed ? parsed.message : null) === (filter ? filter.message : null) &&
+      (parsed ? parsed.path : null) === (filter ? filter.path : null);
+    filter = parsed;
+    clearTimeout(filterTimer);
+    filterInput.value = filter ? filter[filterType.value] || '' : '';
+    renderFilterChips();
+    filterCount.hidden = true; // re-shown by the next graphPage
+    if (!same) resetListForFilter();
+  }
+
+  /** Hit count for the toolbar: exact while a filter is active (the
+   *  engine's filtered total is exact), "\u2265 N" when the walk hit a
+   *  safety cap. Hidden for unfiltered views (total_approx is an
+   *  estimate there — a precise-looking count would lie). */
+  function updateFilterCount(page) {
+    if (!filter) {
+      filterCount.hidden = true;
+      return;
+    }
+    filterCount.hidden = false;
+    filterCount.textContent = `${page.truncated ? '\u2265 ' : ''}${total} commit${total === 1 ? '' : 's'}`;
+    filterCount.title = page.truncated
+      ? 'At least this many commits match — the walk hit a safety cap'
+      : 'Commits matching the filter';
+  }
+
   /** Refs by commit id (branch/tag/remote tips, from getRefs). */
   let branchTips = new Map();
   /** HEAD commit id, for marking the HEAD row (null while unknown). */
@@ -702,6 +875,7 @@ import { formatTime, shortSha } from './util.js';
     rebuildIdIndex();
     applyWidth(); // new data may change the visible lane count
     renderRows();
+    updateFilterCount(page);
   }
 
   /** Keep roughly the last two viewports (± current window) client-side. */
@@ -752,6 +926,8 @@ import { formatTime, shortSha } from './util.js';
     if (!message || typeof message.type !== 'string') return;
     if (message.type === 'graphPage' && message.page) {
       applyPage(message.offset | 0, message.page);
+    } else if (message.type === 'filterState') {
+      applyFilterState(message.filter);
     } else if (message.type === 'graphInvalidated') {
       invalidate();
     } else if (message.type === 'refs' && Array.isArray(message.refs)) {

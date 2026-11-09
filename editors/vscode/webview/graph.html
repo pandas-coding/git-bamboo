@@ -115,6 +115,126 @@
     #ahead-behind:disabled {
       opacity: 0.7;
     }
+    /* Filter row (below the net-ops toolbar): one text input plus a
+     * condition-type select; every active condition renders as a
+     * removable chip and the hit count sits at the row's right end. */
+    #filter-bar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap; /* chips wrap to extra rows when they overflow */
+      gap: 4px;
+      min-height: 30px;
+      padding: 3px 6px;
+      box-sizing: border-box;
+      border-bottom: 1px solid var(--vscode-panelSection-border, transparent);
+    }
+    #filter-bar svg {
+      display: block;
+      flex: 0 0 auto;
+      color: var(--vscode-icon-foreground, var(--vscode-foreground));
+    }
+    #filter-input {
+      flex: 1 1 90px;
+      min-width: 60px;
+      height: 24px;
+      padding: 0 5px;
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 4px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      font: inherit;
+      box-sizing: border-box;
+    }
+    #filter-input:focus {
+      outline: 1px solid var(--vscode-focusBorder, #007fd4);
+      outline-offset: -1px;
+    }
+    #filter-type {
+      flex: 0 0 auto;
+      height: 24px;
+      padding: 0 2px;
+      border: 1px solid var(--vscode-dropdown-border, transparent);
+      border-radius: 4px;
+      background: var(--vscode-dropdown-background);
+      color: var(--vscode-dropdown-foreground);
+      font: inherit;
+      box-sizing: border-box;
+      cursor: pointer;
+    }
+    /* Clear button: same genes as .net-btn, only shown when a condition
+     * is active. */
+    #filter-clear {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--vscode-icon-foreground, var(--vscode-foreground));
+      cursor: pointer;
+      box-sizing: border-box;
+    }
+    #filter-clear:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    #filter-clear[hidden] {
+      display: none;
+    }
+    /* Active conditions, one removable chip each. */
+    .filter-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 1px;
+      height: 17px;
+      max-width: 45%;
+      padding: 0 1px 0 6px;
+      border: 1px solid var(--vscode-descriptionForeground);
+      border-radius: 4px;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      box-sizing: border-box;
+    }
+    /* Type prefix ("author") and text ("alice") separated by a space;
+     * the text ellipsizes when it outgrows the chip. */
+    .filter-chip .chip-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .filter-chip .chip-remove {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 15px;
+      padding: 0;
+      border: none;
+      border-radius: 3px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      box-sizing: border-box;
+      flex: 0 0 auto;
+    }
+    .filter-chip .chip-remove:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    /* Hit count (right end): exact for filtered views, "\u2265 N" when
+     * the engine's walk hit a safety cap. */
+    #filter-count {
+      margin-left: auto;
+      flex: 0 0 auto;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
+    }
+    #filter-count[hidden] {
+      display: none;
+    }
     /* Rebase-in-progress banner (below the toolbar): one line of state
      * plus Continue/Skip/Abort — shown only while a rebase is on disk
      * (engine- or CLI-started alike: the host re-reads disk state on
@@ -341,6 +461,20 @@
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.25 12.75V6.75"/><path d="M2.75 6.75 5.25 4.25 7.75 6.75"/><path d="M10.75 3.25v6"/><path d="M8.25 9.25 10.75 11.75 13.25 9.25"/></svg>
       </button>
       <button id="ahead-behind" class="pill" type="button" title="" aria-label="Ahead and behind counts"></button>
+    </div>
+    <div id="filter-bar" role="search" aria-label="Filter commits">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.75" cy="6.75" r="4.25"/><path d="M10 10l3.5 3.5"/></svg>
+      <input id="filter-input" type="text" maxlength="256" placeholder="Filter" aria-label="Filter text" spellcheck="false" autocomplete="off">
+      <select id="filter-type" aria-label="Filter condition type" title="Which condition the text box edits">
+        <option value="message" selected>Message</option>
+        <option value="author">Author</option>
+        <option value="path">Path</option>
+      </select>
+      <button id="filter-clear" type="button" title="Clear the filter" aria-label="Clear the filter" hidden>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l8 8"/><path d="M12 4l-8 8"/></svg>
+      </button>
+      <span id="filter-count" aria-live="polite" hidden></span>
+      <span id="filter-chips"></span>
     </div>
     <div id="rebase-banner" role="status" aria-label="Rebase in progress" hidden>
       <span class="rb-text" id="rebase-text"></span>
