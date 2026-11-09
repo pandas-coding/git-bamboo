@@ -1440,15 +1440,25 @@ async fn resolve_index_mode(
             return Ok(String::from_utf8_lossy(mode).into_owned());
         }
     }
-    let executable = repo_path
-        .join(path)
-        .metadata()
-        .map(|m| {
-            use std::os::unix::fs::PermissionsExt;
-            m.permissions().mode() & 0o111 != 0
-        })
-        .unwrap_or(false);
+    let executable = worktree_file_is_executable(&repo_path.join(path));
     Ok(if executable { "100755" } else { "100644" }.to_string())
+}
+
+/// The filesystem's executable bit — `resolve_index_mode`'s last resort, for a
+/// path in neither the index nor HEAD's tree. Windows has no such bit (git for
+/// Windows records every new file as 100644), so the probe only exists on unix
+/// and the answer is `false` everywhere else.
+#[cfg(unix)]
+fn worktree_file_is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn worktree_file_is_executable(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// `git hash-object -w --stdin --path <path>`: write the constructed
