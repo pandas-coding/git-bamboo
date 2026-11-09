@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 4：graph 搜索过滤（作者/消息/路径，过滤即查询条件）
 date: 2026-10-30
-status: ready
+status: in-progress
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights
@@ -47,14 +47,14 @@ graph 工具栏出现过滤框：输入作者 / 消息文本 / 路径条件（�
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p bamboo-engine` 全绿（存量 graph 测试零改动通过 + 新增过滤测试）；`cargo clippy` 无新告警。
-- [ ] 协议：`GraphRequest.filter` 缺省 None 时行为与现状逐字节一致（兼容性测试）。
+- [x] `cargo test -p bamboo-engine` 全绿（存量 graph 测试零改动通过 + 新增过滤测试）；`cargo clippy` 无新告警。
+- [x] 协议：`GraphRequest.filter` 缺省 None 时行为与现状逐字节一致（兼容性测试）。
 - [ ] **手测**：工具栏过滤作者/消息/路径 → graph 即时收窄，滚动条与实际内容一致（total 精确）。
 - [ ] **手测**：过滤态下虚拟滚动流畅（无整列表重渲染卡顿）；滚动中右键任意行，菜单动作作用于该行显示的 commit（无 stale 目标）。
 - [ ] **手测**：过滤态下分支切换/engine 通知 → 过滤条件保留、结果正确刷新。
 - [ ] **手测**：清除过滤 → 恢复全量视图，行为与过滤前一致。
 - [ ] 路径过滤在大仓库（含 rename 历史）不超时；超限场景显示"≥N"截断提示而非假死。
-- [ ] webview 入站 filter 文本经 host 校验（超长/控制字符被拒）。
+- [x] webview 入站 filter 文本经 host 校验（超长/控制字符被拒）。
 
 ## Dependencies
 
