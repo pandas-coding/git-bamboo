@@ -77,12 +77,27 @@ export interface GraphViewport {
   epoch: number;
 }
 
+/** Graph filter conditions, engine-side ("filter as a query"); an
+ *  all-null filter means unfiltered. Semantics mirror the engine:
+ *  author matches name OR email, case-insensitive substring; message
+ *  matches the summary line, case-insensitive substring; path is a
+ *  case-sensitive substring of any first-parent-changed path. */
+export interface GraphFilter {
+  author: string | null;
+  message: string | null;
+  path: string | null;
+}
+
 export interface GraphPage {
   commits: Commit[];
+  /** Unfiltered: lower bound. Filtered: EXACT hit count. */
   total_approx: number;
   has_more: boolean;
   epoch: number;
   anchor_commit: string | null;
+  /** The filtered walk hit a safety cap; `total_approx` is then a lower
+   *  bound and the UI shows "≥ N". Absent on the wire when false. */
+  truncated?: boolean;
 }
 
 /** Wire format of one file entry in the engine's `getCommitDetail` result. */

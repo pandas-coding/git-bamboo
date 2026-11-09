@@ -13,7 +13,7 @@ import { openCommitDetailPanel } from './commitDetail';
 import { createContextTargetSlot } from './contextTargetSlot';
 import * as netOps from './netOps';
 import { runRebaseStep } from './rebaseControl';
-import type { GraphPage, RepoState } from './types';
+import type { GraphFilter, GraphPage, RepoState } from './types';
 import {
   BRANCH_STATUS_DEBOUNCE_MS,
   COMMIT_ID_RE,
@@ -70,6 +70,10 @@ interface GraphViewMessage {
   offset?: number;
   limit?: number;
   anchorCommit?: string | null;
+  /** setFilter payload: the full filter conditions (webview → host).
+   *  Parsed by `parseWebviewFilter` before use — the webview is a trust
+   *  boundary. */
+  filter?: unknown;
   /** graphWidthChanged payload: the new manual width, or null to clear the
    *  override and return to auto width. */
   width?: number | null;
@@ -110,6 +114,67 @@ interface GraphContextTarget {
 /** The pending webview context-menu target (weak single-slot registry). */
 const graphContextSlot = createContextTargetSlot<GraphContextTarget>();
 
+/** Live graph sessions (both hosts). The command palette's filter entry
+ *  (`gitBamboo.graph.filter`) applies a filter to every open graph
+ *  surface of one engine client through this registry; sessions remove
+ *  themselves on dispose. */
+const liveSessions = new Set<GraphSession>();
+
+/** Apply a graph filter to every live graph session served by `client`
+ * (the command-palette entry point — the same session API the webview's
+ * filter box uses). */
+export function applyGraphFilter(client: EngineClient, filter: GraphFilter): void {
+  for (const session of liveSessions) {
+    if (session.serves(client)) session.setFilter(filter);
+  }
+}
+
+/** Trim a filter's string fields and drop empty ones; an all-empty
+ *  filter normalizes to null (no filter — the unfiltered path). */
+export function normalizeGraphFilter(filter: GraphFilter): GraphFilter | null {
+  const trim = (value: string | null): string | null => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : null;
+  };
+  const normalized: GraphFilter = {
+    author: trim(filter.author),
+    message: trim(filter.message),
+    path: trim(filter.path),
+  };
+  return normalized.author || normalized.message || normalized.path ? normalized : null;
+}
+
+/** Whether two normalized filters are the same (null = unfiltered). */
+function sameFilter(a: GraphFilter | null, b: GraphFilter | null): boolean {
+  return a?.author === b?.author && a?.message === b?.message && a?.path === b?.path;
+}
+
+/** Parse a webview-supplied filter payload (trust boundary). Every field
+ *  must be null/absent or a plain string within the engine's validation
+ *  rules (≤ 256 chars, no control characters). Returns a normalized
+ *  filter (null = no conditions), or undefined when the payload is
+ *  malformed — the caller ignores those. */
+function parseWebviewFilter(payload: unknown): GraphFilter | null | undefined {
+  const field = (value: unknown): string | null | undefined => {
+    if (value === null || value === undefined) return null;
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    if (trimmed === '') return null;
+    if (trimmed.length > 256 || /[\x00-\x1f\x7f]/.test(trimmed)) return undefined;
+    return trimmed;
+  };
+  if (payload === null || payload === undefined) return null;
+  if (typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const record = payload as Record<string, unknown>;
+  const author = field(record.author);
+  const message = field(record.message);
+  const path = field(record.path);
+  if (author === undefined || message === undefined || path === undefined) {
+    return undefined;
+  }
+  return normalizeGraphFilter({ author, message, path });
+}
+
 /** Returns (and clears) the commit targeted by the graph context menu, if
  *  any. Called by the context-menu command handlers in extension.ts. */
 export function takeGraphContextTarget():
@@ -137,6 +202,10 @@ export class GraphSession implements vscode.Disposable {
   private rebaseStatusSeq = 0;
   /** Sequence number so stale getGraph responses are dropped. */
   private requestSeq = 0;
+  /** Current graph filter (normalized; null = unfiltered). Carried on
+   *  every getGraph request, the epoch probe, and the EPOCH_MISMATCH
+   *  retry so the filtered view survives invalidations. */
+  private filter: GraphFilter | null = null;
   private disposed = false;
   private readonly disposables: vscode.Disposable[] = [];
 
@@ -178,11 +247,13 @@ export class GraphSession implements vscode.Disposable {
     );
     // Initial refs/HEAD are pushed from the 'ready' handler: messages posted
     // here (before the webview document loads its listener) are dropped.
+    liveSessions.add(this);
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    liveSessions.delete(this);
     graphContextSlot.clearIf((target) => target.owner === this);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.invalidateTimer) clearTimeout(this.invalidateTimer);
@@ -214,6 +285,10 @@ export class GraphSession implements vscode.Disposable {
     try {
       const probe = await this.client.request<GraphPage>('getGraph', {
         viewport: { offset: 0, limit: 1, anchor_commit: null, epoch: 0 },
+        // The probe re-adopts the current epoch; it carries the filter so
+        // a probe during an active filter reads under the same conditions
+        // (and the engine's memoized view survives the epoch bump).
+        ...(this.filter && { filter: this.filter }),
       });
       this.state.epoch = probe.epoch;
     } catch (err) {
@@ -251,6 +326,19 @@ export class GraphSession implements vscode.Disposable {
       // And the initial rebase banner state (a rebase already on disk —
       // engine- or externally-started — shows immediately).
       void this.sendRebaseStatus();
+      // And the active filter, so a reloaded webview restores it (the
+      // webview resets its local list on filterState and re-requests).
+      void this.webview.postMessage({ type: 'filterState', filter: this.filter });
+    } else if (message?.type === 'setFilter') {
+      // Filter box change (debounced 300ms in the webview). Parsed and
+      // sanitized before use; malformed payloads are dropped, the engine
+      // double-validates everything again anyway.
+      const filter = parseWebviewFilter(message.filter);
+      if (filter !== undefined) {
+        this.setFilter(filter);
+      } else {
+        console.warn('[git-bamboo] ignored malformed graph filter payload:', message.filter);
+      }
     } else if (message?.type === 'graphWidthChanged') {
       // null clears the override (back to auto width); update() with
       // undefined removes the key from globalState. The webview is a trust
@@ -316,12 +404,36 @@ export class GraphSession implements vscode.Disposable {
     }
   }
 
+  /** Set (or clear) the graph filter — the session API shared by the
+   *  webview's filter box and the command palette. The webview resets
+   *  its local list and re-requests from offset 0 on the pushed
+   *  filterState, so both entry points get identical behavior; a filter
+   *  equal to the current one is a no-op (no reset, no re-request). */
+  setFilter(raw: GraphFilter | null): void {
+    const filter = raw === null ? null : normalizeGraphFilter(raw);
+    if (sameFilter(filter, this.filter)) return;
+    this.filter = filter;
+    void this.webview.postMessage({ type: 'filterState', filter });
+  }
+
+  /** The active filter (normalized; null = unfiltered). */
+  get activeFilter(): GraphFilter | null {
+    return this.filter;
+  }
+
+  /** Whether this session serves the given engine client — used by the
+   *  palette filter entry to find the graph surfaces of one repo. */
+  serves(client: EngineClient): boolean {
+    return this.client === client;
+  }
+
   private async requestGraph(offset: number, limit: number, anchor: string | null, retried = false): Promise<void> {
     if (this.disposed) return;
     const seq = ++this.requestSeq;
     try {
       const page = await this.client.request<GraphPage>('getGraph', {
         viewport: { offset, limit, anchor_commit: anchor, epoch: this.state.epoch },
+        ...(this.filter && { filter: this.filter }),
       });
       if (seq !== this.requestSeq || this.disposed) return; // superseded by a newer scroll position
       this.state.epoch = page.epoch;
