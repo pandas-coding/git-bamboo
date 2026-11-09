@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 3：JetBrains 式 blame（引擎 getBlame + 标注/悬停/导航）
 date: 2026-10-30
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights
@@ -67,20 +67,22 @@ tags: [git, rust, vscode-extension, ui]
   —— `gix_read.rs` 的 `repo.commit_graph_if_enabled()` 显式传入 `blame::file`（带注释说明
   "不传则静默不用"）；回退（gix 报错或 entry 未铺满 blob）报 `via = "git-porcelain"`，
   正常路径报 `"gix"`；等价性测试断言两条路径的归属与元数据完全一致。
-- [ ] **手测**：toggle blame → gutter 出现作者/时间标注；颜色弱化不干扰代码阅读。
-- [ ] **手测**：悬停行 → 该行 commit 详情 + 跳 commit 面板/diff 入口可用。
-- [ ] **手测**：CodeLens 当前行"跳转引入 commit" → commitDetail 打开正确 commit。
-- [ ] **手测**：annotate previous 连续回溯 3 层 → 每层打开父版本只读文档并自动标注，行号合理保持。
-- [ ] **手测**：脏缓冲（未保存修改）blame 不报错（contents 路径）；保存后重渲染。
-- [ ] **手测**：大文件（>1000 行、多变更）滚动流畅（viewport 切片生效，无明显卡顿；50ms 级交互）。
-- [ ] engine 通知（切换分支/外部 commit）后 blame 缓存失效重渲染（TTL + 通知双通道）。
+- [x] **手测**：toggle blame → gutter 出现作者/时间标注；颜色弱化不干扰代码阅读。
+- [x] **手测**：悬停行 → 该行 commit 详情 + 跳 commit 面板/diff 入口可用。
+- [x] **手测**：CodeLens 当前行"跳转引入 commit" → commitDetail 打开正确 commit。
+- [x] **手测**：annotate previous 连续回溯 3 层 → 每层打开父版本只读文档并自动标注，行号合理保持。
+- [x] **手测**：脏缓冲（未保存修改）blame 不报错（contents 路径）；保存后重渲染。
+- [x] **手测**：大文件（>1000 行、多变更）滚动流畅（viewport 切片生效，无明显卡顿；50ms 级交互）。
+- [x] engine 通知（切换分支/外部 commit）后 blame 缓存失效重渲染（TTL + 通知双通道）。
 
-> **手测项状态（2026-11-09）**：实现完成、自动项全绿，但上述 7 条需要真实 VS Code 会话，
-> 本轮未执行（按 plan-status-hygiene 显式记录，故 status 停在 `in-progress` 而非 `done`）。
-> 跑法：`scripts/make-blame-test-repo.sh`（默认 `/tmp/git-bamboo-blame-manual`，`--force` 重建）
-> 生成确定性仓库并在其中写入 `MANUAL-TESTS.md`——每条验收项都有对应场景与期望值
-> （三层 annotate-previous 链、被相似度检测识别的 rename、单文件三种归属、1500 行大文件、
-> 脏工作区 + 未跟踪文件、切换分支触发失效）。
+> **手测项收口（2026-11-10）**：上述 7 条已由用户在真实 VS Code 会话中执行并确认通过，故逐条
+> 勾选、`status` 转 `done`。本轮未走 `scripts/make-blame-test-repo.sh` 的夹具（`/tmp/git-bamboo-blame-manual`
+> 无留存产物），所以这里按"整批通过"记录，不逐条补写未经本人执行的观察值——按
+> `plan-status-hygiene` 的要求，勾选的依据是执行者的确认，不是"测试过了"的类推。夹具脚本及其
+> `MANUAL-TESTS.md`（三层 annotate-previous 链、被相似度检测识别的 rename、单文件三种归属、
+> 1500 行大文件、脏工作区 + 未跟踪文件、切换分支触发失效）保留，供日后回归复跑。
+> 自动项在 `8a3ae88` 时三平台 CI 全绿：Rust Tests `ubuntu-latest` / `macos-latest` /
+> `windows-latest` + Cargo Audit + Security audit 均 success。
 
 ## Implementation Notes（2026-11-09，实现期偏离与补充）
 
@@ -131,6 +133,21 @@ tags: [git, rust, vscode-extension, ui]
     改为命令白名单，并对 entry 的 commit id 做形状校验（不合格则整份响应丢弃 + 记录日志）；
     保存时主动失效对应缓存键（原来只能等 watcher 通知）；两个 "Open Changes" 入口合并为
     `openCommitFileDiff`，`toRelativePath` 单一实现。
+
+- **合并后的跨平台 CI 修复（2026-11-09/10）**：本期是 2026-10-22 之后第一次跑齐三平台矩阵，
+  连带暴露 4 个平台相关缺陷，其中 1 个属本期代码：
+  - `getBlame` 的路径收敛原先用 `Path::is_absolute` 判定。Windows 上 `/etc/passwd` **不算**绝对
+    路径（无盘符前缀），而 `PathBuf::push` 的文档明写"有 root 无 prefix 时替换掉除 prefix 外的
+    全部内容"，于是 `join` 落到 `C:\etc\passwd`——逃出工作区。blame 是唯一会用客户端路径直接打开
+    工作区文件的读，故这里是唯一能读到仓库外文件的地方。改为按 component 只允许 `Normal`
+    （连带拒绝 `RootDir`/`Prefix`/`ParentDir`），三平台一致（`d805250`）。
+  - 既有代码：`write_queue.rs` 的 exec-bit 探测未做平台 gating，Windows 直接编译失败（`a03370f`）；
+    watcher 只按客户端给的路径形式匹配事件，而 macOS FSEvents 报的是解析后路径（`/var` →
+    `/private/var`），导致工作区事件被静默丢弃（`75791af`）；Windows 上删除被监听目录时 notify
+    收到 `ERROR_ACCESS_DENIED` 后静默撤监听且不发任何事件，re-arm 因此永不触发，改为比对根目录
+    创建时间（`RootStamp`）而非试图撞上"目录不存在"的时间窗（`8a3ae88`）。
+  - 另修 stash 日期断言假设了非零时区偏移（git `%cI` 在零偏移打印 `Z`），改用 RFC-3339 解析，
+    并在协议文档写明 `Z` 与 `±HH:MM` 两种形态都合法（`d1fd1e6`）。
 
 ## Dependencies
 
