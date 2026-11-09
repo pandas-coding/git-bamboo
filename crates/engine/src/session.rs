@@ -12,8 +12,8 @@ use bamboo_protocol::BambooError;
 use crate::cache::Cache;
 use crate::gitdir;
 use crate::undo::UndoEngine;
-use crate::write_queue::{run_write_queue, WriteCommand, WriteResult};
 use crate::undo::{UndoErrorKind, UndoSummary};
+use crate::write_queue::{run_write_queue, WriteCommand, WriteResult};
 
 /// The result of one write command, crossing the session boundary with
 /// its structure intact: plain commands return an output string,
@@ -95,6 +95,9 @@ pub struct Session {
     pub epoch: AtomicU64,
     pub gix_repo: Mutex<gix::Repository>,
     pub cache: Mutex<Cache>,
+    /// Memoized filtered graph views (see `graph_filter`), keyed by
+    /// filter and invalidated wholesale when the epoch or tip set moves.
+    pub filtered_views: Mutex<Option<crate::graph_filter::FilteredViews>>,
     pub undo: UndoEngine,
     pub write_tx: mpsc::Sender<(WriteCommand, tokio::sync::oneshot::Sender<WriteResult>)>,
     /// The undo transaction id of the in-flight interactive rebase, if
@@ -137,10 +140,8 @@ impl Session {
         let (cache, epoch) = Cache::open(&git_dir, &fingerprint)?;
         let undo = UndoEngine::new(&repo_path, &git_dir)?;
 
-        let (write_tx, write_rx) = mpsc::channel::<(
-            WriteCommand,
-            tokio::sync::oneshot::Sender<WriteResult>,
-        )>(32);
+        let (write_tx, write_rx) =
+            mpsc::channel::<(WriteCommand, tokio::sync::oneshot::Sender<WriteResult>)>(32);
 
         let session = Arc::new(Self {
             repo_path: repo_path.clone(),
@@ -148,6 +149,7 @@ impl Session {
             epoch: AtomicU64::new(epoch),
             gix_repo: Mutex::new(gix_repo),
             cache: Mutex::new(cache),
+            filtered_views: Mutex::new(None),
             undo,
             write_tx,
             rebase_tx: std::sync::Mutex::new(None),
@@ -189,7 +191,10 @@ impl Session {
 
     /// Release the binding (the rebase finished/was aborted/failed).
     pub fn take_rebase_tx(&self) -> Option<u64> {
-        self.rebase_tx.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.rebase_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// The bound rebase transaction, if the rebase is still in flight.
@@ -230,7 +235,9 @@ impl Session {
             .send((WriteCommand::Undo { transaction_id }, tx))
             .await
             .map_err(|_| anyhow::anyhow!("write queue closed"))?;
-        let result = rx.await.map_err(|_| anyhow::anyhow!("write result dropped"))?;
+        let result = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("write result dropped"))?;
         match result {
             WriteResult::Undo(r) => Ok(r),
             WriteResult::Ok(_) => Err(anyhow::anyhow!(
@@ -278,7 +285,9 @@ impl Session {
             // ref/HEAD files explicitly.
             match watcher.watch(&self.repo_path, notify::RecursiveMode::Recursive) {
                 Ok(()) => watched_any = true,
-                Err(e) => warn!(error = %e, "failed to watch worktree recursively; skipping worktree watching"),
+                Err(e) => {
+                    warn!(error = %e, "failed to watch worktree recursively; skipping worktree watching")
+                }
             }
         }
         // Always watch the ref/HEAD gitdir entries explicitly (this also
@@ -397,9 +406,7 @@ impl Session {
                         matches!(
                             ev.kind,
                             notify::EventKind::Remove(_)
-                                | notify::EventKind::Modify(
-                                    notify::event::ModifyKind::Name(_)
-                                )
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
                         ) && ev
                             .paths
                             .iter()
@@ -415,10 +422,7 @@ impl Session {
             })
             .ok();
 
-        *self
-            .watcher
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(watcher);
+        *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
     }
 
     /// Re-arm the fs watcher after the repo root (or gitdir) was deleted.
@@ -440,30 +444,30 @@ impl Session {
         let git_dir = self.git_dir.clone();
         std::thread::Builder::new()
             .name("bamboo-watcher-rearm".into())
-            .spawn(move || {
-                loop {
-                    let Some(session) = weak.upgrade() else { return };
-                    if repo_path.is_dir() && git_dir.exists() {
-                        session.start_fs_watcher();
-                        session.rearm_pending.store(false, Ordering::SeqCst);
-                        let epoch = session.bump_epoch();
-                        let new_head = std::fs::read_to_string(git_dir.join("HEAD"))
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
-                        session.emit(EngineEvent::HeadChanged { new_head, epoch });
-                        session.emit(EngineEvent::RefsChanged {
-                            changed_refs: Vec::new(),
-                            epoch,
-                        });
-                        session.emit(EngineEvent::IndexChanged { epoch });
-                        session.emit(EngineEvent::GraphInvalidated { epoch });
-                        session.emit(EngineEvent::WorktreeChanged { paths: Vec::new() });
-                        debug!(path = %repo_path.display(), "fs watcher re-armed after repo recreate");
-                        return;
-                    }
-                    std::thread::sleep(REARM_POLL);
+            .spawn(move || loop {
+                let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                if repo_path.is_dir() && git_dir.exists() {
+                    session.start_fs_watcher();
+                    session.rearm_pending.store(false, Ordering::SeqCst);
+                    let epoch = session.bump_epoch();
+                    let new_head = std::fs::read_to_string(git_dir.join("HEAD"))
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    session.emit(EngineEvent::HeadChanged { new_head, epoch });
+                    session.emit(EngineEvent::RefsChanged {
+                        changed_refs: Vec::new(),
+                        epoch,
+                    });
+                    session.emit(EngineEvent::IndexChanged { epoch });
+                    session.emit(EngineEvent::GraphInvalidated { epoch });
+                    session.emit(EngineEvent::WorktreeChanged { paths: Vec::new() });
+                    debug!(path = %repo_path.display(), "fs watcher re-armed after repo recreate");
+                    return;
                 }
+                std::thread::sleep(REARM_POLL);
             })
             .ok();
     }
@@ -703,7 +707,10 @@ mod tests {
         );
         assert_eq!(root.relative(Path::new("/private/home/u/repo/x")), None);
         // The root itself relative to itself is empty, as strip_prefix gives.
-        assert_eq!(root.relative(Path::new("/home/u/repo")), Some(Path::new("")));
+        assert_eq!(
+            root.relative(Path::new("/home/u/repo")),
+            Some(Path::new(""))
+        );
     }
 
     /// `new` against a real directory: whatever the platform does with

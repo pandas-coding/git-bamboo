@@ -125,7 +125,11 @@ async fn graph_page_survives_annotated_tag() -> anyhow::Result<()> {
         .args(["tag", "-a", "v1.0", "-m", "release 1.0"])
         .current_dir(dir.path())
         .output()?;
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let session = open_session(&dir).await?;
     let viewport = bamboo_protocol::GraphViewport {
@@ -609,6 +613,444 @@ async fn graph_page_anchor_repins_viewport() -> anyhow::Result<()> {
     let fallback = bamboo_engine::gix_read::read_graph_page(&session, &vp)?;
     assert_eq!(fallback.commits.len(), 1);
     assert_eq!(fallback.commits[0].message, "third");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Graph filtering (filter as a query condition)
+// ---------------------------------------------------------------------------
+
+/// Build the filter-test repo. History (dates increase so newest-first
+/// order is deterministic):
+///
+/// ```text
+/// 1 root  "init project"        Alice <alice@corp.example>  README.md docs/guide.md src/main.rs
+/// 2       "fix typo in guide"   Alice                        docs/guide.md
+/// 3 feat  "feat: add engine"    Bob   <bob@corp.example>    src/engine.rs
+/// 4 feat  "fix: engine crash"   Bob                          src/engine.rs
+/// 5 merge "merge feature"       Alice                        (merges 4 into main)
+/// ```
+///
+/// The branch and merge matter for two semantics: the merge's diff is
+/// taken against its FIRST parent (so it shows src/engine.rs as added),
+/// and lanes are assigned over the full topology, not the hit list.
+fn filter_repo() -> anyhow::Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    let git = |args: &[&str]| -> anyhow::Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&["config", "core.autocrlf", "false"])?;
+
+    let commit = |msg: &str,
+                  author: (&str, &str),
+                  date: &str,
+                  files: &[(&str, &str)]|
+     -> anyhow::Result<()> {
+        for (path, content) in files {
+            let full = dir.path().join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(full, content)?;
+        }
+        git(&["add", "."])?;
+        let out = Command::new("git")
+            .arg("commit")
+            .arg("-q")
+            .arg("-m")
+            .arg(msg)
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", author.0)
+            .env("GIT_AUTHOR_EMAIL", author.1)
+            .env("GIT_COMMITTER_NAME", author.0)
+            .env("GIT_COMMITTER_EMAIL", author.1)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    };
+
+    let alice = ("Alice", "alice@corp.example");
+    let bob = ("Bob", "bob@corp.example");
+    commit(
+        "init project",
+        alice,
+        "2026-01-01T00:00:00Z",
+        &[
+            ("README.md", "readme\n"),
+            ("docs/guide.md", "guide\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ],
+    )?;
+    commit(
+        "fix typo in guide",
+        alice,
+        "2026-01-02T00:00:00Z",
+        &[("docs/guide.md", "guide, fixed\n")],
+    )?;
+    git(&["checkout", "-q", "-b", "feature"])?;
+    commit(
+        "feat: add engine",
+        bob,
+        "2026-01-03T00:00:00Z",
+        &[("src/engine.rs", "engine v1\n")],
+    )?;
+    commit(
+        "fix: engine crash",
+        bob,
+        "2026-01-04T00:00:00Z",
+        &[("src/engine.rs", "engine v2\n")],
+    )?;
+    git(&["checkout", "-q", "main"])?;
+    // Non-fast-forward merge (feature is two commits ahead of main).
+    let out = Command::new("git")
+        .args(["merge", "--no-ff", "-q", "-m", "merge feature", "feature"])
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Alice")
+        .env("GIT_AUTHOR_EMAIL", "alice@corp.example")
+        .env("GIT_COMMITTER_NAME", "Alice")
+        .env("GIT_COMMITTER_EMAIL", "alice@corp.example")
+        .env("GIT_AUTHOR_DATE", "2026-01-05T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-01-05T00:00:00Z")
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(dir)
+}
+
+/// Read one filtered page over `filter_repo`.
+async fn filtered_page(
+    session: &std::sync::Arc<bamboo_engine::session::Session>,
+    filter: &bamboo_protocol::GraphFilter,
+) -> anyhow::Result<bamboo_protocol::GraphPage> {
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 100,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+    bamboo_engine::gix_read::read_graph_page_with_filter(session, &viewport, Some(filter))
+}
+
+fn graph_filter(
+    author: Option<&str>,
+    message: Option<&str>,
+    path: Option<&str>,
+) -> bamboo_protocol::GraphFilter {
+    bamboo_protocol::GraphFilter {
+        author: author.map(str::to_string),
+        message: message.map(str::to_string),
+        path: path.map(str::to_string),
+    }
+}
+
+/// Assert the page's commit messages, in row order, exactly.
+fn assert_messages(page: &bamboo_protocol::GraphPage, expected: &[&str]) {
+    let actual: Vec<&str> = page.commits.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(actual, expected, "unexpected filtered rows");
+}
+
+#[tokio::test]
+async fn graph_filter_message_substring_is_exact_and_ordered() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    let page = filtered_page(&session, &graph_filter(None, Some("fix"), None)).await?;
+    assert_messages(&page, &["fix: engine crash", "fix typo in guide"]);
+    // Filtered reads report the EXACT hit count, not a lower bound.
+    assert_eq!(page.total_approx, 2);
+    assert!(!page.has_more);
+    assert!(!page.truncated);
+    // Substring, not prefix: "typo" matches mid-message.
+    let page = filtered_page(&session, &graph_filter(None, Some("typo"), None)).await?;
+    assert_messages(&page, &["fix typo in guide"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_author_matches_name_or_email_case_insensitively() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Name, case-insensitive (merge + the two Alice commits, newest first).
+    let page = filtered_page(&session, &graph_filter(Some("ALICE"), None, None)).await?;
+    assert_messages(
+        &page,
+        &["merge feature", "fix typo in guide", "init project"],
+    );
+
+    // Email substring: the local part alone matches both hosters' addresses.
+    let page = filtered_page(&session, &graph_filter(Some("bob@"), None, None)).await?;
+    assert_messages(&page, &["fix: engine crash", "feat: add engine"]);
+
+    // No match: exact miss yields an empty page, not an error.
+    let page = filtered_page(&session, &graph_filter(Some("nobody"), None, None)).await?;
+    assert_messages(&page, &[]);
+    assert_eq!(page.total_approx, 0);
+    assert!(!page.has_more);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_path_substring_matches_changed_paths() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    // File-name substring: the two engine commits plus the merge (its diff
+    // vs. the FIRST parent adds src/engine.rs).
+    let page = filtered_page(&session, &graph_filter(None, None, Some("engine.rs"))).await?;
+    assert_messages(
+        &page,
+        &["merge feature", "fix: engine crash", "feat: add engine"],
+    );
+
+    // Directory substring: includes the ROOT commit (its diff vs. the
+    // empty tree adds docs/guide.md).
+    let page = filtered_page(&session, &graph_filter(None, None, Some("docs/"))).await?;
+    assert_messages(&page, &["fix typo in guide", "init project"]);
+
+    // Paths are case-sensitive, unlike author/message.
+    let page = filtered_page(&session, &graph_filter(None, None, Some("Docs"))).await?;
+    assert_messages(&page, &[]);
+
+    // A file only ever touched on the feature branch is reachable through
+    // the merge tip.
+    let page = filtered_page(&session, &graph_filter(None, None, Some("src/engine"))).await?;
+    assert_eq!(page.total_approx, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_conditions_and_together() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Alice + "fix": the guide fix, not Bob's engine fixes.
+    let page = filtered_page(&session, &graph_filter(Some("alice"), Some("fix"), None)).await?;
+    assert_messages(&page, &["fix typo in guide"]);
+
+    // All three conditions.
+    let page = filtered_page(
+        &session,
+        &graph_filter(Some("bob"), Some("crash"), Some("engine")),
+    )
+    .await?;
+    assert_messages(&page, &["fix: engine crash"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_paginates_over_the_materialized_list() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    let filter = graph_filter(None, None, Some("src"));
+    // Hits: merge, engine crash, add engine, init project (root adds
+    // src/main.rs) — newest first.
+    let viewport = |offset: u64, limit: u32| bamboo_protocol::GraphViewport {
+        offset,
+        limit,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+        &session,
+        &viewport(0, 2),
+        Some(&filter),
+    )?;
+    assert_messages(&page, &["merge feature", "fix: engine crash"]);
+    assert_eq!(page.total_approx, 4);
+    assert!(page.has_more);
+
+    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+        &session,
+        &viewport(3, 2),
+        Some(&filter),
+    )?;
+    assert_messages(&page, &["init project"]);
+    assert_eq!(page.total_approx, 4);
+    assert!(!page.has_more);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_anchor_repins_in_the_filtered_list() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    let all = filtered_page(&session, &graph_filter(Some("alice"), None, None)).await?;
+    assert_eq!(all.commits.len(), 3);
+    // Anchor to the OLDEST Alice commit: the page starts there even though
+    // the offset would start at 0.
+    let anchor = &all.commits[2].id;
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 2,
+        anchor_commit: Some(anchor.clone()),
+        epoch: session.current_epoch(),
+    };
+    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+        &session,
+        &viewport,
+        Some(&graph_filter(Some("alice"), None, None)),
+    )?;
+    assert_messages(&page, &["init project"]);
+    assert_eq!(page.total_approx, 3);
+    assert!(!page.has_more);
+
+    // Unknown anchors keep the requested offset.
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 1,
+        limit: 1,
+        anchor_commit: Some("0000000000000000000000000000000000000000".to_string()),
+        epoch: session.current_epoch(),
+    };
+    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+        &session,
+        &viewport,
+        Some(&graph_filter(Some("alice"), None, None)),
+    )?;
+    assert_messages(&page, &["fix typo in guide"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_empty_filter_equals_unfiltered() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 100,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+    let unfiltered = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
+
+    // An all-None filter is a no-op, and so is a whitespace-only one after
+    // normalization (the server normalizes; the engine double-guards).
+    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+        &session,
+        &viewport,
+        Some(&bamboo_protocol::GraphFilter::default()),
+    )?;
+    assert_eq!(page, unfiltered);
+
+    // A filtered read first (populating lanes at this epoch) must not
+    // disturb the unfiltered read.
+    let filtered = filtered_page(&session, &graph_filter(None, Some("merge"), None)).await?;
+    assert_eq!(filtered.commits.len(), 1);
+    let again = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
+    assert_eq!(again.commits.len(), 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_epoch_mismatch_still_rejects() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 10,
+        anchor_commit: None,
+        epoch: session.current_epoch() + 99,
+    };
+    let err = bamboo_engine::gix_read::read_graph_page_with_filter(
+        &session,
+        &viewport,
+        Some(&graph_filter(None, Some("fix"), None)),
+    )
+    .expect_err("stale epoch must be rejected");
+    assert!(err.to_string().contains("epoch"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_truncation_reports_lower_bound() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 100,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+
+    // Walk cap: stop after 3 commits (merge, crash, engine) — the walk
+    // never reaches the older "fix typo in guide".
+    let limits = bamboo_engine::graph_filter::FilterLimits {
+        max_commits: 3,
+        ..Default::default()
+    };
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &viewport,
+        Some(&graph_filter(None, Some("fix"), None)),
+        &limits,
+    )?;
+    assert!(page.truncated);
+    assert_eq!(page.total_approx, 1); // only "fix: engine crash" was reached
+    assert_messages(&page, &["fix: engine crash"]);
+
+    // Time budget: a zero budget with a path condition truncates before
+    // any hit is examined.
+    let limits = bamboo_engine::graph_filter::FilterLimits {
+        tree_diff_time_budget: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &viewport,
+        Some(&graph_filter(None, None, Some("src"))),
+        &limits,
+    )?;
+    assert!(page.truncated);
+    assert_eq!(page.total_approx, 0);
+    assert_messages(&page, &[]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_switching_filters_serves_each_view() -> anyhow::Result<()> {
+    // The memoized view is keyed by filter: alternating between filters
+    // (the user editing the box) must serve each list correctly, and the
+    // same filter twice must agree with itself.
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    let by_message = graph_filter(None, Some("fix"), None);
+    let by_author = graph_filter(Some("bob"), None, None);
+
+    for round in 0..2 {
+        let a = filtered_page(&session, &by_message).await?;
+        assert_eq!(a.total_approx, 2, "message view, round {round}");
+        let b = filtered_page(&session, &by_author).await?;
+        assert_eq!(b.total_approx, 2, "author view, round {round}");
+        let a2 = filtered_page(&session, &by_message).await?;
+        assert_eq!(a2.total_approx, 2);
+        assert_messages(&a2, &["fix: engine crash", "fix typo in guide"]);
+    }
     Ok(())
 }
 
@@ -1356,8 +1798,8 @@ async fn commit_detail_rejects_invalid_and_unknown_sha() -> anyhow::Result<()> {
 // Network ops: push/pull/fetch, remotes, branch status, stash RPCs
 // ---------------------------------------------------------------------------
 
-use bamboo_protocol::{BambooError, ForceMode, PullStrategy};
 use bamboo_engine::write_queue::WriteCommand;
+use bamboo_protocol::{BambooError, ForceMode, PullStrategy};
 
 /// Run git in `dir`, failing the test with stderr on a non-zero exit.
 /// Author/committer envs are pinned so helper commits never depend on the
@@ -1399,11 +1841,7 @@ fn test_repo_with_origin() -> anyhow::Result<(tempfile::TempDir, tempfile::TempD
 /// Advance origin/main by one commit made in a throwaway clone — WITHOUT
 /// touching the work repo, so its remote-tracking refs go stale (the
 /// precondition for push-rejection and force-with-lease tests).
-fn advance_origin(
-    origin: &tempfile::TempDir,
-    msg: &str,
-    filename: &str,
-) -> anyhow::Result<String> {
+fn advance_origin(origin: &tempfile::TempDir, msg: &str, filename: &str) -> anyhow::Result<String> {
     let clone = tempfile::tempdir()?;
     gitq(
         clone.path(),
@@ -1412,8 +1850,13 @@ fn advance_origin(
     std::fs::write(clone.path().join(filename), format!("{msg}\n"))?;
     gitq(clone.path(), &["add", "."])?;
     gitq(clone.path(), &["commit", "-q", "-m", msg])?;
-    gitq(clone.path(), &["push", "-q", "origin", "HEAD:refs/heads/main"])?;
-    Ok(gitq(clone.path(), &["rev-parse", "HEAD"])?.trim().to_string())
+    gitq(
+        clone.path(),
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    )?;
+    Ok(gitq(clone.path(), &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string())
 }
 
 fn push_cmd(remote: &str, branch: &str, force: ForceMode, set_upstream: bool) -> WriteCommand {
@@ -1450,7 +1893,9 @@ async fn push_force_none_rejected_then_force_succeeds() -> anyhow::Result<()> {
     );
 
     // force: force (--force) → overwrite; push updates tracking refs.
-    let local_sha = gitq(work.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+    let local_sha = gitq(work.path(), &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
     session
         .enqueue_write(push_cmd("origin", "main", ForceMode::Force, false))
         .await?;
@@ -1489,7 +1934,9 @@ async fn push_force_with_lease_semantics() -> anyhow::Result<()> {
             remote: Some("origin".to_string()),
         })
         .await?;
-    let local_sha = gitq(work.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+    let local_sha = gitq(work.path(), &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
     session
         .enqueue_write(push_cmd("origin", "main", ForceMode::Lease, false))
         .await?;
@@ -1536,8 +1983,7 @@ async fn push_injection_rejected() -> anyhow::Result<()> {
         .expect_err("option-like remote must be rejected");
     assert_eq!(err.code, BambooError::GIT_ERROR);
     assert!(
-        format!("{err}").contains("invalid ref name")
-            || format!("{err}").contains("remote"),
+        format!("{err}").contains("invalid ref name") || format!("{err}").contains("remote"),
         "unexpected error: {err}"
     );
     let err = session
@@ -1629,7 +2075,10 @@ async fn pull_rebase_strategy_keeps_history_linear() -> anyhow::Result<()> {
         gitq(work.path(), &["rev-parse", "HEAD^"])?.trim(),
         remote_sha
     );
-    assert_ne!(gitq(work.path(), &["rev-parse", "HEAD"])?.trim(), remote_sha);
+    assert_ne!(
+        gitq(work.path(), &["rev-parse", "HEAD"])?.trim(),
+        remote_sha
+    );
     assert!(gitq(work.path(), &["log", "--merges", "--oneline"])?
         .trim()
         .is_empty());
@@ -1732,7 +2181,11 @@ async fn fetch_none_fetches_all_remotes_and_bypasses_undo_journal() -> anyhow::R
     );
     // The second remote was fetched too (a single-remote fetch would
     // never create refs/remotes/other/*).
-    assert!(gitq(work.path(), &["rev-parse", "--verify", "refs/remotes/other/main"]).is_ok());
+    assert!(gitq(
+        work.path(),
+        &["rev-parse", "--verify", "refs/remotes/other/main"]
+    )
+    .is_ok());
 
     // Fetch deliberately creates NO undo transaction (bypass, see
     // run_write_queue): the journal is still empty after the fetch.
@@ -1803,7 +2256,10 @@ async fn branch_status_upstream_ahead_behind() -> anyhow::Result<()> {
     assert_eq!((st.ahead, st.behind), (0, 0));
 
     // A local commit → ahead 1.
-    gitq(work.path(), &["commit", "-q", "--allow-empty", "-m", "local ahead"])?;
+    gitq(
+        work.path(),
+        &["commit", "-q", "--allow-empty", "-m", "local ahead"],
+    )?;
     let st = bamboo_engine::gix_read::read_branch_status(&session, None)?;
     assert_eq!((st.ahead, st.behind), (1, 0));
 
@@ -1825,7 +2281,9 @@ async fn branch_status_upstream_ahead_behind() -> anyhow::Result<()> {
 
     // Detached HEAD on the default (current) branch is INVALID_ARGUMENT
     // so clients can disable the affected buttons.
-    let sha = gitq(work.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+    let sha = gitq(work.path(), &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
     gitq(work.path(), &["checkout", "-q", &sha])?;
     let err = bamboo_engine::gix_read::read_branch_status(&session, None)
         .expect_err("detached HEAD must be an error");
@@ -1920,7 +2378,8 @@ async fn stash_apply_reinstates_index_split() -> anyhow::Result<()> {
     settle().await;
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
     assert!(
-        items.iter().any(|i| i.path == "a.txt" && i.staged
+        items.iter().any(|i| i.path == "a.txt"
+            && i.staged
             && i.status == bamboo_protocol::StatusCode::Modified),
         "expected staged a.txt (index = v2), got {:?}",
         items
@@ -2160,7 +2619,9 @@ async fn pull_ff_only_rejection_restores_auto_stash() -> anyhow::Result<()> {
     std::fs::write(work.path().join("local.txt"), "local\n")?;
     gitq(work.path(), &["add", "."])?;
     gitq(work.path(), &["commit", "-q", "-m", "local work"])?;
-    let pre_pull_head = gitq(work.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+    let pre_pull_head = gitq(work.path(), &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
 
     // Dirty worktree gets auto-stashed before the pull.
     std::fs::write(work.path().join("a.txt"), "dirty\n")?;
@@ -2183,7 +2644,10 @@ async fn pull_ff_only_rejection_restores_auto_stash() -> anyhow::Result<()> {
 
     // The auto-stash was popped back: the dirty change is restored and
     // nothing is stranded on the stash stack.
-    assert_eq!(std::fs::read_to_string(work.path().join("a.txt"))?, "dirty\n");
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("a.txt"))?,
+        "dirty\n"
+    );
     assert!(gitq(work.path(), &["stash", "list"])?.trim().is_empty());
     // The failed pull did not move HEAD.
     assert_eq!(
@@ -2250,7 +2714,12 @@ async fn get_remotes_redacts_embedded_url_credentials() -> anyhow::Result<()> {
 
     gitq(
         work.path(),
-        &["remote", "set-url", "origin", "https://user:token@example.com/repo.git"],
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://user:token@example.com/repo.git",
+        ],
     )?;
     let remotes = bamboo_engine::gix_read::read_remotes(&session)?;
     let url = remotes
@@ -2301,7 +2770,10 @@ async fn stash_pop_explicit_ref_targets_the_named_entry() -> anyhow::Result<()> 
             reinstate_index: false,
         })
         .await?;
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "first\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt"))?,
+        "first\n"
+    );
     assert_eq!(std::fs::read_to_string(dir.path().join("b.txt"))?, "b\n");
 
     // Only the "second" entry remains, now at stash@{0}.
@@ -2409,7 +2881,10 @@ async fn status_reports_conflict_kind() -> anyhow::Result<()> {
         .find(|i| i.path == "a.txt")
         .expect("conflicted a.txt should be listed");
     assert_eq!(item.status, bamboo_protocol::StatusCode::Conflict);
-    assert_eq!(item.conflict_kind, Some(bamboo_protocol::ConflictKind::BothModified));
+    assert_eq!(
+        item.conflict_kind,
+        Some(bamboo_protocol::ConflictKind::BothModified)
+    );
 
     // Delete/modify conflicts classify too.
     let dir = deleted_by_them_repo()?;
@@ -2420,7 +2895,10 @@ async fn status_reports_conflict_kind() -> anyhow::Result<()> {
         .find(|i| i.path == "b.txt")
         .expect("conflicted b.txt should be listed");
     assert_eq!(item.status, bamboo_protocol::StatusCode::Conflict);
-    assert_eq!(item.conflict_kind, Some(bamboo_protocol::ConflictKind::DeletedByThem));
+    assert_eq!(
+        item.conflict_kind,
+        Some(bamboo_protocol::ConflictKind::DeletedByThem)
+    );
     Ok(())
 }
 
@@ -2443,14 +2921,15 @@ async fn resolve_conflict_theirs_and_commit() -> anyhow::Result<()> {
     assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "side\n");
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
     assert!(
-        items
-            .iter()
-            .any(|i| i.path == "a.txt" && i.staged
-                && i.status == bamboo_protocol::StatusCode::Modified),
+        items.iter().any(|i| i.path == "a.txt"
+            && i.staged
+            && i.status == bamboo_protocol::StatusCode::Modified),
         "resolved file should be staged as modified, got {:?}",
         items
     );
-    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert!(!items
+        .iter()
+        .any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
 
     // With no unmerged entries left, the commit goes through.
     session
@@ -2478,7 +2957,9 @@ async fn resolve_conflict_ours_yields_our_content() -> anyhow::Result<()> {
     assert_eq!(std::fs::read_to_string(dir.path().join("a.txt"))?, "main\n");
 
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
-    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert!(!items
+        .iter()
+        .any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
     // Our blob equals HEAD's, so after staging nothing shows as a change.
     assert!(
         !items.iter().any(|i| i.path == "a.txt"),
@@ -2505,7 +2986,10 @@ async fn resolve_conflict_rejects_mismatches_and_stale_paths() -> anyhow::Result
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
     let msg = format!("{err}");
     assert!(msg.contains("both-modified"), "should name the kind: {msg}");
-    assert!(msg.contains("ours/theirs"), "should suggest ours/theirs: {msg}");
+    assert!(
+        msg.contains("ours/theirs"),
+        "should suggest ours/theirs: {msg}"
+    );
 
     // A non-conflicted path (unmodified since HEAD) is rejected: the
     // classification is fresh, not taken from the client snapshot.
@@ -2580,8 +3064,13 @@ async fn resolve_conflict_rejects_directory_shaped_paths() -> anyhow::Result<()>
         .await?;
     settle().await;
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
-    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
-    assert_eq!(std::fs::read_to_string(dir.path().join("sub/f.txt"))?, "side\n");
+    assert!(!items
+        .iter()
+        .any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sub/f.txt"))?,
+        "side\n"
+    );
     Ok(())
 }
 
@@ -2610,7 +3099,9 @@ async fn resolve_deleted_by_them_conflict() -> anyhow::Result<()> {
     settle().await;
     assert_eq!(std::fs::read_to_string(dir.path().join("b.txt"))?, "ours\n");
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
-    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert!(!items
+        .iter()
+        .any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
     // Then commit goes through.
     session
         .enqueue_write(bamboo_engine::write_queue::WriteCommand::Commit {
@@ -2635,13 +3126,15 @@ async fn resolve_deleted_by_them_keep_theirs_confirms_deletion() -> anyhow::Resu
     settle().await;
     assert!(!dir.path().join("b.txt").exists(), "file should be gone");
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
-    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert!(!items
+        .iter()
+        .any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
     // The confirmed deletion is staged (HEAD still has b.txt until the
     // merge commit lands).
     assert!(
-        items
-            .iter()
-            .any(|i| i.path == "b.txt" && i.staged && i.status == bamboo_protocol::StatusCode::Deleted),
+        items.iter().any(|i| i.path == "b.txt"
+            && i.staged
+            && i.status == bamboo_protocol::StatusCode::Deleted),
         "deletion confirmed: b.txt should be a staged deletion, got {:?}",
         items
     );
@@ -2661,9 +3154,14 @@ async fn resolve_deleted_by_us_conflict() -> anyhow::Result<()> {
         })
         .await?;
     settle().await;
-    assert!(!dir.path().join("c.txt").exists(), "our deletion should win");
+    assert!(
+        !dir.path().join("c.txt").exists(),
+        "our deletion should win"
+    );
     let items = bamboo_engine::gix_read::read_status(&session, None)?;
-    assert!(!items.iter().any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
+    assert!(!items
+        .iter()
+        .any(|i| i.status == bamboo_protocol::StatusCode::Conflict));
     assert!(!items.iter().any(|i| i.path == "c.txt"));
 
     // keepTheirs (on a fresh conflict) restores their version from the
@@ -2677,7 +3175,10 @@ async fn resolve_deleted_by_us_conflict() -> anyhow::Result<()> {
         })
         .await?;
     settle().await;
-    assert_eq!(std::fs::read_to_string(dir.path().join("c.txt"))?, "theirs\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("c.txt"))?,
+        "theirs\n"
+    );
     Ok(())
 }
 
@@ -2864,9 +3365,7 @@ async fn stage_ranges_stages_one_hunk_of_two() -> anyhow::Result<()> {
 
     // Hunk 1 occupies new-side lines [1,5] (edit + context); a range
     // anywhere inside selects it.
-    session
-        .enqueue_write(stage_cmd("d.txt", &[(2, 2)]))
-        .await?;
+    session.enqueue_write(stage_cmd("d.txt", &[(2, 2)])).await?;
 
     // Worktree untouched; index holds line2 but NOT line12.
     let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
@@ -2889,9 +3388,7 @@ async fn stage_ranges_incremental_does_not_lose_earlier_hunks() -> anyhow::Resul
     // Stage hunk 1, then hunk 2 — the second call must EXTEND the index
     // content, not clobber it (this is why the base is the index blob,
     // not HEAD).
-    session
-        .enqueue_write(stage_cmd("d.txt", &[(2, 2)]))
-        .await?;
+    session.enqueue_write(stage_cmd("d.txt", &[(2, 2)])).await?;
     session
         .enqueue_write(stage_cmd("d.txt", &[(12, 12)]))
         .await?;
@@ -2964,7 +3461,10 @@ async fn stage_ranges_rejects_conflicted_path() -> anyhow::Result<()> {
     // Manufacture a conflict (both sides touch a.txt differently).
     // Clone BEFORE the local commit so the histories diverge.
     let clone = tempfile::tempdir()?;
-    gitq(clone.path(), &["clone", "-q", origin.path().to_str().unwrap(), "."])?;
+    gitq(
+        clone.path(),
+        &["clone", "-q", origin.path().to_str().unwrap(), "."],
+    )?;
     std::fs::write(work.path().join("a.txt"), "ours\n")?;
     gitq(work.path(), &["add", "--", "a.txt"])?;
     gitq(work.path(), &["commit", "-q", "-m", "ours"])?;
@@ -2995,9 +3495,7 @@ async fn stage_ranges_stages_whole_file_deletion() -> anyhow::Result<()> {
     std::fs::remove_file(dir.path().join("d.txt"))?;
 
     // The deletion hunk's new-side interval is [1,1] (empty new side).
-    session
-        .enqueue_write(stage_cmd("d.txt", &[(1, 1)]))
-        .await?;
+    session.enqueue_write(stage_cmd("d.txt", &[(1, 1)])).await?;
 
     // Index entry removed (not an empty blob!), worktree still absent.
     let status = gitq(dir.path(), &["status", "--porcelain"])?;
@@ -3012,7 +3510,10 @@ async fn stage_ranges_preserves_missing_trailing_newline() -> anyhow::Result<()>
     let session = open_session(&dir).await?;
 
     // Rewrite d.txt so it ends WITHOUT a newline, changing the last line.
-    let body: String = (1..=11).map(|n| format!("line{n}\n")).collect::<Vec<_>>().join("")
+    let body: String = (1..=11)
+        .map(|n| format!("line{n}\n"))
+        .collect::<Vec<_>>()
+        .join("")
         + "l12-dirty";
     std::fs::write(dir.path().join("d.txt"), body)?;
 
@@ -3022,7 +3523,10 @@ async fn stage_ranges_preserves_missing_trailing_newline() -> anyhow::Result<()>
 
     // The index blob must end without a trailing newline, byte-exactly.
     let index = gitq(dir.path(), &["show", ":0:d.txt"])?;
-    let expected: String = (1..=11).map(|n| format!("line{n}\n")).collect::<Vec<_>>().join("")
+    let expected: String = (1..=11)
+        .map(|n| format!("line{n}\n"))
+        .collect::<Vec<_>>()
+        .join("")
         + "l12-dirty";
     assert_eq!(index, expected);
     // And the worktree diff is now empty (fully staged).
@@ -3039,9 +3543,7 @@ async fn stage_ranges_preserves_executable_bit() -> anyhow::Result<()> {
     gitq(dir.path(), &["commit", "-q", "-m", "chmod d.txt"])?;
     dirty_two_hunks(dir.path())?;
 
-    session
-        .enqueue_write(stage_cmd("d.txt", &[(2, 2)]))
-        .await?;
+    session.enqueue_write(stage_cmd("d.txt", &[(2, 2)])).await?;
 
     // The reconstructed index entry keeps mode 100755 (via ls-files).
     let ls = gitq(dir.path(), &["ls-files", "-s", "--", "d.txt"])?;
@@ -3088,10 +3590,7 @@ async fn unstage_ranges_new_file_back_to_untracked() -> anyhow::Result<()> {
     // Removed from the index entirely (untracked again, file preserved).
     let status = gitq(dir.path(), &["status", "--porcelain"])?;
     assert!(status.contains("?? n.txt"), "status: {status}");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("n.txt"))?,
-        "new\n"
-    );
+    assert_eq!(std::fs::read_to_string(dir.path().join("n.txt"))?, "new\n");
     Ok(())
 }
 
@@ -3316,7 +3815,10 @@ async fn start_rebase(
 fn feature_todo(dir: &tempfile::TempDir) -> anyhow::Result<Vec<bamboo_protocol::RebaseTodoEntry>> {
     let mut todo = Vec::new();
     for s in ["f1", "f2", "f3"] {
-        todo.push(todo_entry(&sha_of(dir, s)?, bamboo_protocol::RebaseAction::Pick));
+        todo.push(todo_entry(
+            &sha_of(dir, s)?,
+            bamboo_protocol::RebaseAction::Pick,
+        ));
     }
     Ok(todo)
 }
@@ -3343,7 +3845,8 @@ async fn rebase_plan_lists_chain_in_replay_order() -> anyhow::Result<()> {
     assert_eq!(plan.commits.len(), 3);
 
     // Unknown branch / detached-HEAD-style input errors are structured.
-    let err = bamboo_engine::gix_read::read_rebase_plan(&session, "main", Some("nope")).unwrap_err();
+    let err =
+        bamboo_engine::gix_read::read_rebase_plan(&session, "main", Some("nope")).unwrap_err();
     let err = err.downcast::<bamboo_protocol::BambooError>().unwrap();
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
     Ok(())
@@ -3423,7 +3926,10 @@ async fn start_rebase_conflict_stop_and_continue() -> anyhow::Result<()> {
     let result = start_rebase(&session, "main", feature_todo(&dir)?).await?;
     // The conflict at f1 (shared.txt) is a NORMAL outcome, not an error.
     assert!(result.stopped);
-    assert_eq!(result.reason, Some(bamboo_protocol::RebaseStopReason::Conflict));
+    assert_eq!(
+        result.reason,
+        Some(bamboo_protocol::RebaseStopReason::Conflict)
+    );
     assert_eq!(result.stopped_sha.as_deref(), Some(f1_sha.as_str()));
     assert_eq!(result.msgnum, Some(1));
     assert_eq!(result.end, Some(3));
@@ -3463,7 +3969,10 @@ async fn start_rebase_conflict_stop_and_continue() -> anyhow::Result<()> {
     // Full replay on top of m1 with the resolved content.
     let subjects = subjects(&dir, "feature")?;
     assert_eq!(subjects, vec!["f3", "f2", "f1", "m1", "c2", "c1"]);
-    assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt"))?, "resolved\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("shared.txt"))?,
+        "resolved\n"
+    );
     // The status is idle again.
     assert_eq!(
         bamboo_engine::gix_read::read_rebase_status(&session)?.state,
@@ -3521,7 +4030,10 @@ async fn rebase_abort_restores_the_pre_rebase_state() -> anyhow::Result<()> {
         .current_dir(dir.path())
         .output()?;
     assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), before_tip);
-    assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt"))?, "feature-side\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("shared.txt"))?,
+        "feature-side\n"
+    );
     assert_eq!(
         bamboo_engine::gix_read::read_rebase_status(&session)?.state,
         bamboo_protocol::RebaseRunState::Idle
@@ -3590,10 +4102,10 @@ async fn start_rebase_rejected_while_rebase_in_progress() -> anyhow::Result<()> 
     // misclassified "success with stopped: true" of a rebase that never
     // ran — and must not disturb the in-flight rebase.
     let epoch_before = session.current_epoch();
-    let err = start_rebase(&session, "main", feature_todo(&dir)?).await.unwrap_err();
-    let err = err
-        .downcast::<bamboo_protocol::BambooError>()
-        .unwrap();
+    let err = start_rebase(&session, "main", feature_todo(&dir)?)
+        .await
+        .unwrap_err();
+    let err = err.downcast::<bamboo_protocol::BambooError>().unwrap();
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
     assert!(err.message.contains("already in progress"));
     // Error paths still invalidate: the rebase command bumped the epoch.
@@ -3643,16 +4155,21 @@ async fn start_rebase_rejected_for_externally_started_rebase() -> anyhow::Result
     std::fs::write(merge_dir.join("head-name"), "refs/heads/feature")?;
     std::fs::write(merge_dir.join("onto"), sha_of(&dir, "c2")?)?;
 
-    let err = start_rebase(&session, "main", feature_todo(&dir)?).await.unwrap_err();
-    let err = err
-        .downcast::<bamboo_protocol::BambooError>()
-        .unwrap();
+    let err = start_rebase(&session, "main", feature_todo(&dir)?)
+        .await
+        .unwrap_err();
+    let err = err.downcast::<bamboo_protocol::BambooError>().unwrap();
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
     assert!(err.message.contains("already in progress"));
 
     // No sidecars were written for the refused start (a stale todo/marker
     // would otherwise leak into the external rebase run).
-    assert!(!dir.path().join(".git").join("bamboo").join("rebase").exists());
+    assert!(!dir
+        .path()
+        .join(".git")
+        .join("bamboo")
+        .join("rebase")
+        .exists());
     Ok(())
 }
 
@@ -3723,7 +4240,12 @@ async fn start_rebase_with_nothing_to_do_is_structured_success() -> anyhow::Resu
     assert_eq!(sha_of(&dir, "f3")?, before_tip);
     // Nothing on disk: no rebase dir, no sidecars, no journal noise.
     assert!(!dir.path().join(".git").join("rebase-merge").exists());
-    assert!(!dir.path().join(".git").join("bamboo").join("rebase").exists());
+    assert!(!dir
+        .path()
+        .join(".git")
+        .join("bamboo")
+        .join("rebase")
+        .exists());
     Ok(())
 }
 
@@ -3856,7 +4378,10 @@ async fn undo_of_stopped_rebase_aborts_and_restores() -> anyhow::Result<()> {
         .current_dir(dir.path())
         .output()?;
     assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), before_tip);
-    assert_eq!(std::fs::read_to_string(dir.path().join("shared.txt"))?, "feature-side\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("shared.txt"))?,
+        "feature-side\n"
+    );
     Ok(())
 }
 
@@ -3882,7 +4407,10 @@ async fn get_rebase_status_detects_external_rebase() -> anyhow::Result<()> {
         .args(["rebase", "main", "feature"])
         .current_dir(dir.path())
         .output()?;
-    assert!(!out.status.success(), "expected the rebase to stop at the conflict");
+    assert!(
+        !out.status.success(),
+        "expected the rebase to stop at the conflict"
+    );
 
     let status = bamboo_engine::gix_read::read_rebase_status(&session)?;
     assert_eq!(status.state, bamboo_protocol::RebaseRunState::Stopped);
@@ -3951,9 +4479,7 @@ async fn start_rebase_validation_rejects_stale_todo() -> anyhow::Result<()> {
     let onto = sha_of(&dir, "c2")?;
     let before_tip = sha_of(&dir, "f3")?;
     let err = start_rebase(&session, &onto, todo).await.unwrap_err();
-    let err = err
-        .downcast::<bamboo_protocol::BambooError>()
-        .unwrap();
+    let err = err.downcast::<bamboo_protocol::BambooError>().unwrap();
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
     assert!(err.message.contains("stale plan"));
 
@@ -3966,9 +4492,7 @@ async fn start_rebase_validation_rejects_stale_todo() -> anyhow::Result<()> {
     )
     .await
     .unwrap_err();
-    let err = err
-        .downcast::<bamboo_protocol::BambooError>()
-        .unwrap();
+    let err = err.downcast::<bamboo_protocol::BambooError>().unwrap();
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
 
     // Nothing was mutated (no rebase dir, branch tip untouched).
@@ -4054,9 +4578,7 @@ async fn start_rebase_rejects_too_many_entries() -> anyhow::Result<()> {
     let err = start_rebase(&session, &sha_of(&dir, "c2")?, todo)
         .await
         .unwrap_err();
-    let err = err
-        .downcast::<bamboo_protocol::BambooError>()
-        .unwrap();
+    let err = err.downcast::<bamboo_protocol::BambooError>().unwrap();
     assert_eq!(err.code, bamboo_protocol::BambooError::INVALID_ARGUMENT);
     assert!(err.message.contains("exceeds"));
     Ok(())
@@ -4226,11 +4748,18 @@ async fn undo_self_heals_after_bamboo_dir_removed() -> anyhow::Result<()> {
     // The journal and audit log were recreated in the healed tree.
     let entries = session.undo.list_transactions(10)?;
     assert!(
-        entries.iter().any(|e| e.description.contains("healed") || e.description.contains("Stage")),
+        entries
+            .iter()
+            .any(|e| e.description.contains("healed") || e.description.contains("Stage")),
         "expected journaled transactions after self-heal, got {:?}",
         entries.iter().map(|e| &e.description).collect::<Vec<_>>()
     );
-    assert!(dir.path().join(".git").join("bamboo").join("audit.log").exists());
+    assert!(dir
+        .path()
+        .join(".git")
+        .join("bamboo")
+        .join("audit.log")
+        .exists());
     Ok(())
 }
 
@@ -5016,7 +5545,10 @@ async fn blame_of_absent_path_and_unborn_head_is_empty_not_an_error() -> anyhow:
 fn crlf_repo() -> anyhow::Result<(tempfile::TempDir, String)> {
     let dir = tempfile::tempdir()?;
     let git = |args: &[&str]| -> anyhow::Result<()> {
-        let out = Command::new("git").args(args).current_dir(dir.path()).output()?;
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()?;
         if !out.status.success() {
             anyhow::bail!(
                 "git {:?} failed: {}",

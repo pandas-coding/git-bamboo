@@ -109,7 +109,8 @@ pub enum StatusCode {
 ///   (the message the graph rows display);
 /// - `path`: case-SENSITIVE substring of any path changed vs. the first
 ///   parent (full tree diff for root commits).
-/// Multiple set conditions AND together. Each field is validated at the
+///
+/// Multiple set conditions AND together; each field is validated at the
 /// server parse layer: non-empty, ≤ 256 chars, no control characters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct GraphFilter {
@@ -132,9 +133,7 @@ impl GraphFilter {
     /// The server parse layer calls this before validation so an `""` field
     /// behaves exactly like an absent field on the wire.
     pub fn normalized(self) -> Self {
-        let trim = |v: Option<String>| {
-            v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-        };
+        let trim = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Self {
             author: trim(self.author),
             message: trim(self.message),
@@ -775,9 +774,7 @@ pub enum RebaseStatusEntry {
         subject: String,
     },
     /// A passthrough line, verbatim.
-    Raw {
-        line: String,
-    },
+    Raw { line: String },
 }
 
 /// `getRebaseStatus` result: the direct mapping of the on-disk rebase

@@ -76,10 +76,9 @@ fn resolve_conflict_roundtrip() {
     assert_eq!(back.resolution, ConflictResolution::KeepTheirs);
     // Unknown resolutions are rejected at the parse boundary, not deep
     // in the engine.
-    assert!(serde_json::from_str::<ResolveConflict>(
-        r#"{"path":"a","resolution":"bogus"}"#
-    )
-    .is_err());
+    assert!(
+        serde_json::from_str::<ResolveConflict>(r#"{"path":"a","resolution":"bogus"}"#).is_err()
+    );
 }
 
 #[test]
@@ -116,9 +115,10 @@ fn graph_page_serialization() {
     })
     .unwrap();
     assert!(truncated.contains("\"truncated\":true"));
-    assert_eq!(
-        serde_json::from_str::<GraphPage>(&truncated).unwrap().truncated,
-        true
+    assert!(
+        serde_json::from_str::<GraphPage>(&truncated)
+            .unwrap()
+            .truncated
     );
 }
 
@@ -155,10 +155,15 @@ fn get_graph_filter_roundtrip_and_default() {
     };
     let json = serde_json::to_string(&no_filter).unwrap();
     assert!(!json.contains("filter"));
-    let legacy =
-        r#"{"viewport":{"offset":0,"limit":50,"anchor_commit":null,"epoch":1}}"#;
-    assert_eq!(serde_json::from_str::<GetGraph>(legacy).unwrap().filter, None);
-    assert_eq!(serde_json::from_str::<GetGraph>(&json).unwrap().filter, None);
+    let legacy = r#"{"viewport":{"offset":0,"limit":50,"anchor_commit":null,"epoch":1}}"#;
+    assert_eq!(
+        serde_json::from_str::<GetGraph>(legacy).unwrap().filter,
+        None
+    );
+    assert_eq!(
+        serde_json::from_str::<GetGraph>(&json).unwrap().filter,
+        None
+    );
 }
 
 #[test]
@@ -442,9 +447,18 @@ fn diff_types_wire_shapes() {
             new_start: 1,
             new_lines: 5,
             lines: vec![
-                DiffLine { kind: DiffLineKind::Context, text: "line1".into() },
-                DiffLine { kind: DiffLineKind::Removed, text: "line2".into() },
-                DiffLine { kind: DiffLineKind::Added, text: "l2-dirty".into() },
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    text: "line1".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Removed,
+                    text: "line2".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    text: "l2-dirty".into(),
+                },
             ],
         }],
     };
@@ -458,15 +472,11 @@ fn diff_types_wire_shapes() {
     assert_eq!(back, result);
 
     // stageRanges / unstageRanges roundtrip.
-    let stage: StageRanges = serde_json::from_str(
-        r#"{"path":"src/main.rs","ranges":[{"start":1,"end":5}]}"#,
-    )
-    .unwrap();
+    let stage: StageRanges =
+        serde_json::from_str(r#"{"path":"src/main.rs","ranges":[{"start":1,"end":5}]}"#).unwrap();
     assert_eq!(stage.path, "src/main.rs");
-    let unstage: UnstageRanges = serde_json::from_str(
-        r#"{"path":"src/main.rs","ranges":[{"start":1,"end":5}]}"#,
-    )
-    .unwrap();
+    let unstage: UnstageRanges =
+        serde_json::from_str(r#"{"path":"src/main.rs","ranges":[{"start":1,"end":5}]}"#).unwrap();
     assert_eq!(unstage.ranges.len(), 1);
 }
 
@@ -490,8 +500,7 @@ fn rebase_result_roundtrip() {
 
     // The idle/default shape round-trips too.
     let r = RebaseResult::default();
-    let back: RebaseResult =
-        serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+    let back: RebaseResult = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
     assert_eq!(r, back);
 }
 
@@ -521,8 +530,7 @@ fn rebase_todo_entry_roundtrip() {
     assert_eq!(e, back);
 
     // message is optional on the wire.
-    let back: RebaseTodoEntry =
-        serde_json::from_str("{\"id\":\"x\",\"action\":\"pick\"}").unwrap();
+    let back: RebaseTodoEntry = serde_json::from_str("{\"id\":\"x\",\"action\":\"pick\"}").unwrap();
     assert_eq!(back.message, None);
 }
 

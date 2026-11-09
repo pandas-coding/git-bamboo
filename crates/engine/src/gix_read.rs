@@ -5,11 +5,12 @@ use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
     BambooError, BlameCommit, BlameEntry, BlameVia, BranchStatus, Commit, DiffHunk, DiffLine,
-    DiffLineKind, GetBlame, GetBlameResult, GetDiffResult, GraphPage, GraphViewport, Ref, RefKind,
-    RemoteInfo, StashEntry, StatusCode, StatusItem,
+    DiffLineKind, GetBlame, GetBlameResult, GetDiffResult, GraphFilter, GraphPage, GraphViewport,
+    Ref, RefKind, RemoteInfo, StashEntry, StatusCode, StatusItem,
 };
 
-use crate::cache::CachedCommit;
+use crate::cache::{Cache, CachedCommit};
+use crate::graph_filter::{self, FilterLimits};
 use crate::rebase::{current_branch_name, read_rebase_state, rebase_chain, resolve_rev_commit};
 use crate::session::Session;
 use crate::write_queue::{redact_credentials, validate_path_arg, validate_ref_arg};
@@ -17,6 +18,30 @@ use crate::write_queue::{redact_credentials, validate_path_arg, validate_ref_arg
 const PRELOAD_MARGIN: u32 = 500;
 
 pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::Result<GraphPage> {
+    read_graph_page_with_limits(session, viewport, None, &FilterLimits::default())
+}
+
+/// `read_graph_page` with a filter: `Some(filter)` routes to the
+/// engine-side filtered traversal (see `graph_filter`); `None` — or an
+/// all-empty filter, which is a no-op — keeps the exact unfiltered
+/// behavior.
+pub fn read_graph_page_with_filter(
+    session: &Session,
+    viewport: &GraphViewport,
+    filter: Option<&GraphFilter>,
+) -> anyhow::Result<GraphPage> {
+    read_graph_page_with_limits(session, viewport, filter, &FilterLimits::default())
+}
+
+/// Graph read entry point with injectable safety caps for the filtered
+/// walk. Production uses `FilterLimits::default()`; tests inject small
+/// caps to exercise truncation deterministically.
+pub fn read_graph_page_with_limits(
+    session: &Session,
+    viewport: &GraphViewport,
+    filter: Option<&GraphFilter>,
+    limits: &FilterLimits,
+) -> anyhow::Result<GraphPage> {
     let current_epoch = session.current_epoch();
     if viewport.epoch != 0 && viewport.epoch != current_epoch {
         return Err(BambooError::epoch_mismatch(current_epoch, viewport.epoch).into());
@@ -30,12 +55,135 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
     // Invalidate lane cache if epoch changed.
     let _ = cache.invalidate_on_epoch_change(current_epoch)?;
 
-    // Collect all ref targets plus HEAD as tips. Refs that point at
-    // annotated tags (refs/tags/*) hold a *tag object* id, and the rev walk
-    // does not peel tips itself — feeding it a tag id fails with "Expected
-    // object of kind commit but got tag". Peel every ref to the commit it
-    // ultimately references instead; refs that don't resolve to a commit
-    // (e.g. refs/notes trees) are skipped rather than failing the page.
+    let tips = collect_tips(&repo)?;
+    if tips.is_empty() {
+        return Ok(GraphPage {
+            commits: Vec::new(),
+            total_approx: 0,
+            has_more: false,
+            epoch: current_epoch,
+            anchor_commit: viewport.anchor_commit.clone(),
+            truncated: false,
+        });
+    }
+
+    match filter.filter(|f| !f.is_empty()) {
+        Some(f) => graph_filter::filtered_page(
+            session,
+            &repo,
+            &cache,
+            &tips,
+            viewport,
+            f,
+            current_epoch,
+            limits,
+        ),
+        None => read_unfiltered_page(session, &repo, &cache, &tips, viewport, current_epoch),
+    }
+}
+
+/// The unfiltered page read: windowed rev walk, cache-first metadata,
+/// sweep-line lanes, anchor re-pinning. This is the pre-filter behavior,
+/// untouched by the `graph_filter` module.
+fn read_unfiltered_page(
+    session: &Session,
+    repo: &gix::Repository,
+    cache: &Cache,
+    tips: &[gix::ObjectId],
+    viewport: &GraphViewport,
+    current_epoch: u64,
+) -> anyhow::Result<GraphPage> {
+    // Walk commits newest-first with commit graph acceleration. This pass
+    // only enumerates object ids (cheap via the commit-graph); commit
+    // metadata is resolved afterwards, cache-first.
+    let walk = rev_walk_newest_first(repo, tips)?;
+
+    let end = viewport
+        .offset
+        .saturating_add(viewport.limit as u64)
+        .saturating_add(PRELOAD_MARGIN as u64);
+
+    let mut ids: Vec<gix::ObjectId> = Vec::with_capacity(end.min(10_000) as usize);
+    for (idx, info) in walk.enumerate() {
+        let info = info?;
+        if idx >= end as usize {
+            break;
+        }
+        ids.push(info.id);
+    }
+
+    // Epoch TOCTOU guard: re-check AFTER the walk. If the watcher bumped
+    // the epoch mid-read (refs moved), stale data must neither be returned
+    // nor cached under the new epoch.
+    if session.current_epoch() != current_epoch {
+        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
+    }
+
+    // Resolve commit metadata cache-first (see `resolve_commit_metas`).
+    let mut all_commits = resolve_commit_metas(repo, cache, &ids)?;
+
+    let total_approx = all_commits.len() as u64;
+    // NOTE: `all_commits` is walked from row 0 (the rev walk enumerates
+    // newest-first from the top), so its length is already a lower bound of
+    // the true total — never add `viewport.offset` here.
+
+    // Assign lanes over the walk window and persist them + the epoch they
+    // are valid for in ONE redb transaction.
+    let lane_entries = assign_lanes(&mut all_commits);
+    if let Err(e) = cache.put_lanes_with_epoch(&lane_entries, current_epoch) {
+        warn!(error = %e, "failed to cache lanes");
+    }
+
+    // Anchor re-pinning: when the client pins a viewport to a commit, use
+    // that commit's index as the effective offset so the view stays stable
+    // across invalidations (new commits landing on top shift the page down
+    // instead of scrolling the anchor out). Unknown anchors keep the
+    // requested offset.
+    let start = match &viewport.anchor_commit {
+        Some(anchor) => all_commits
+            .iter()
+            .position(|c| &c.id == anchor)
+            .map(|idx| idx.min(all_commits.len().saturating_sub(1)))
+            .unwrap_or(viewport.offset as usize),
+        None => viewport.offset as usize,
+    };
+    let has_more = start + (viewport.limit as usize) < all_commits.len();
+    let commits: Vec<Commit> = all_commits
+        .into_iter()
+        .skip(start)
+        .take(viewport.limit as usize)
+        .collect();
+
+    // Final epoch guard: never serve (nor acknowledge) a page whose epoch
+    // is no longer current by the time we finish.
+    if session.current_epoch() != current_epoch {
+        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
+    }
+
+    info!(
+        offset = viewport.offset,
+        limit = viewport.limit,
+        returned = commits.len(),
+        "graph page returned"
+    );
+
+    Ok(GraphPage {
+        commits,
+        total_approx,
+        has_more,
+        epoch: current_epoch,
+        anchor_commit: viewport.anchor_commit.clone(),
+        truncated: false,
+    })
+}
+
+/// Collect all ref targets plus HEAD as tips. Refs that point at
+/// annotated tags (refs/tags/*) hold a *tag object* id, and the rev walk
+/// does not peel tips itself — feeding it a tag id fails with "Expected
+/// object of kind commit but got tag". Peel every ref to the commit it
+/// ultimately references instead; refs that don't resolve to a commit
+/// (e.g. refs/notes trees) are skipped rather than failing the page.
+fn collect_tips(repo: &gix::Repository) -> anyhow::Result<Vec<gix::ObjectId>> {
     let mut tips = Vec::new();
     for reference in repo.references()?.all()? {
         let mut reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -59,52 +207,34 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
             tips.push(head_commit.id);
         }
     }
+    Ok(tips)
+}
 
-    if tips.is_empty() {
-        return Ok(GraphPage {
-            commits: Vec::new(),
-            total_approx: 0,
-            has_more: false,
-            epoch: current_epoch,
-            anchor_commit: viewport.anchor_commit.clone(),
-        });
-    }
-
-    // Walk commits newest-first with commit graph acceleration. This pass
-    // only enumerates object ids (cheap via the commit-graph); commit
-    // metadata is resolved afterwards, cache-first.
-    let walk = repo
-        .rev_walk(tips)
+/// The shared graph walk: newest-first by commit time, commit-graph
+/// accelerated. Both the unfiltered windowed read and the filtered full
+/// walk enumerate from this.
+pub(crate) fn rev_walk_newest_first<'repo>(
+    repo: &'repo gix::Repository,
+    tips: &[gix::ObjectId],
+) -> anyhow::Result<gix::revision::Walk<'repo>> {
+    Ok(repo
+        .rev_walk(tips.iter().copied())
         .sorting(gix::revision::walk::Sorting::ByCommitTime(
             gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
         ))
         .use_commit_graph(true)
-        .all()?;
+        .all()?)
+}
 
-    let end = viewport
-        .offset
-        .saturating_add(viewport.limit as u64)
-        .saturating_add(PRELOAD_MARGIN as u64);
-
-    let mut ids: Vec<gix::ObjectId> = Vec::with_capacity(end.min(10_000) as usize);
-    for (idx, info) in walk.enumerate() {
-        let info = info?;
-        if idx >= end as usize {
-            break;
-        }
-        ids.push(info.id);
-    }
-
-    // Epoch TOCTOU guard: re-check AFTER the walk. If the watcher bumped
-    // the epoch mid-read (refs moved), stale data must neither be returned
-    // nor cached under the new epoch.
-    if session.current_epoch() != current_epoch {
-        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
-    }
-
-    // Resolve commit metadata: serve hits from the COMMIT_META cache
-    // (keyed by immutable object id, so entries never go stale) and decode
-    // only the misses, writing them back in one batch.
+/// Resolve commit metadata for `ids`, cache-first: hits are served from
+/// the COMMIT_META cache (keyed by immutable object id, so entries never
+/// go stale) and misses are decoded and written back in one batch.
+/// `lane` is left at 0 — callers assign lanes afterwards.
+pub(crate) fn resolve_commit_metas(
+    repo: &gix::Repository,
+    cache: &Cache,
+    ids: &[gix::ObjectId],
+) -> anyhow::Result<Vec<Commit>> {
     let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
     let cached = cache.get_commit_metas(&id_strs)?;
     let mut all_commits: Vec<Commit> = Vec::with_capacity(ids.len());
@@ -124,7 +254,7 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
             continue;
         }
 
-        let commit_obj = repo.find_object(oid)?;
+        let commit_obj = repo.find_object(*oid)?;
         let commit = commit_obj.try_into_commit()?;
         let commit_ref = commit.decode()?;
 
@@ -168,15 +298,18 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
     if let Err(e) = cache.put_commit_metas(&misses) {
         warn!(error = %e, "failed to cache commit metadata");
     }
+    Ok(all_commits)
+}
 
-    let total_approx = all_commits.len() as u64;
-    // NOTE: `all_commits` is walked from row 0 (the rev walk enumerates
-    // newest-first from the top), so its length is already a lower bound of
-    // the true total — never add `viewport.offset` here.
-
+/// Assign lanes using a sweep-line algorithm, walking newest → oldest.
+/// lanes[i] = Some(commit_id) means lane i is occupied by commit_id's
+/// line. Lanes are u16: with pathological graphs (> 65 535 concurrent
+/// lanes) the assignment collapses instead of panicking — extra commits
+/// fall back to lane 0. Returns the (id, lane) pairs for persistence.
+pub(crate) fn assign_lanes(all_commits: &mut [Commit]) -> Vec<(String, u16)> {
     // Build children map for lane assignment.
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for commit in &all_commits {
+    for commit in all_commits.iter() {
         for parent_id in &commit.parent_ids {
             children
                 .entry(parent_id.clone())
@@ -185,15 +318,10 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
         }
     }
 
-    // Assign lanes using a sweep-line algorithm, walking newest → oldest.
-    // lanes[i] = Some(commit_id) means lane i is occupied by commit_id's line.
-    // Lanes are u16: with pathological graphs (> 65 535 concurrent lanes)
-    // the assignment collapses instead of panicking — extra commits fall
-    // back to lane 0 (see below).
     let mut lanes: Vec<Option<String>> = Vec::new();
     let mut commit_lanes: HashMap<String, u16> = HashMap::new();
 
-    for commit in &mut all_commits {
+    for commit in all_commits.iter_mut() {
         let commit_children = children.get(&commit.id).cloned().unwrap_or_default();
 
         let lane = match commit_children.len() {
@@ -265,53 +393,7 @@ pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::R
         commit_lanes.insert(commit.id.clone(), lane);
     }
 
-    // Persist lanes + the epoch they are valid for in ONE redb transaction.
-    let lane_entries: Vec<(String, u16)> =
-        all_commits.iter().map(|c| (c.id.clone(), c.lane)).collect();
-    if let Err(e) = cache.put_lanes_with_epoch(&lane_entries, current_epoch) {
-        warn!(error = %e, "failed to cache lanes");
-    }
-
-    // Anchor re-pinning: when the client pins a viewport to a commit, use
-    // that commit's index as the effective offset so the view stays stable
-    // across invalidations (new commits landing on top shift the page down
-    // instead of scrolling the anchor out). Unknown anchors keep the
-    // requested offset.
-    let start = match &viewport.anchor_commit {
-        Some(anchor) => all_commits
-            .iter()
-            .position(|c| &c.id == anchor)
-            .map(|idx| idx.min(all_commits.len().saturating_sub(1)))
-            .unwrap_or(viewport.offset as usize),
-        None => viewport.offset as usize,
-    };
-    let has_more = start + (viewport.limit as usize) < all_commits.len();
-    let commits: Vec<Commit> = all_commits
-        .into_iter()
-        .skip(start)
-        .take(viewport.limit as usize)
-        .collect();
-
-    // Final epoch guard: never serve (nor acknowledge) a page whose epoch
-    // is no longer current by the time we finish.
-    if session.current_epoch() != current_epoch {
-        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
-    }
-
-    info!(
-        offset = viewport.offset,
-        limit = viewport.limit,
-        returned = commits.len(),
-        "graph page returned"
-    );
-
-    Ok(GraphPage {
-        commits,
-        total_approx,
-        has_more,
-        epoch: current_epoch,
-        anchor_commit: viewport.anchor_commit.clone(),
-    })
+    all_commits.iter().map(|c| (c.id.clone(), c.lane)).collect()
 }
 
 pub fn read_status(session: &Session, paths: Option<&[String]>) -> anyhow::Result<Vec<StatusItem>> {
@@ -631,13 +713,9 @@ fn read_conflict_stage_blob(
     stage: gix::index::entry::Stage,
 ) -> anyhow::Result<String> {
     let index = repo.index()?;
-    let Some(entry) = index
-        .entries()
-        .iter()
-        .find(|entry| {
-            entry.stage() == stage && entry.path_in(index.path_backing()) == path.as_bytes()
-        })
-    else {
+    let Some(entry) = index.entries().iter().find(|entry| {
+        entry.stage() == stage && entry.path_in(index.path_backing()) == path.as_bytes()
+    }) else {
         return Ok(String::new());
     };
     let blob = repo.find_blob(entry.id)?;
@@ -654,14 +732,10 @@ pub(crate) const INDEX_REVISION: &str = ":0";
 /// read_blob variant). An absent entry resolves to an empty string.
 fn read_index_blob(repo: &gix::Repository, path: &str) -> anyhow::Result<String> {
     let index = repo.index()?;
-    let Some(entry) = index
-        .entries()
-        .iter()
-        .find(|entry| {
-            entry.stage() == gix::index::entry::Stage::Unconflicted
-                && entry.path_in(index.path_backing()) == path.as_bytes()
-        })
-    else {
+    let Some(entry) = index.entries().iter().find(|entry| {
+        entry.stage() == gix::index::entry::Stage::Unconflicted
+            && entry.path_in(index.path_backing()) == path.as_bytes()
+    }) else {
         return Ok(String::new());
     };
     let blob = repo.find_blob(entry.id)?;
@@ -935,7 +1009,10 @@ fn read_config(repo_path: &std::path::Path, key: &str) -> Option<String> {
 /// (success, stdout, stderr). The single subprocess shape for the
 /// git-shelling read side — non-interactive auth and a closed stdin so
 /// a read can never hang waiting for terminal input.
-fn git_output(repo_path: &std::path::Path, args: &[&str]) -> anyhow::Result<(bool, String, String)> {
+fn git_output(
+    repo_path: &std::path::Path,
+    args: &[&str],
+) -> anyhow::Result<(bool, String, String)> {
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(repo_path)
@@ -1022,8 +1099,10 @@ pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Re
             }
             // An unknown branch must be an explicit INVALID_ARGUMENT, not
             // an indistinguishable "no upstream, 0/0" result.
-            let (ok, _, _) =
-                git_output(repo_path, &["show-ref", "--verify", &format!("refs/heads/{b}")])?;
+            let (ok, _, _) = git_output(
+                repo_path,
+                &["show-ref", "--verify", &format!("refs/heads/{b}")],
+            )?;
             if !ok {
                 return Err(BambooError::invalid_argument(format!(
                     "getBranchStatus: branch {b:?} not found"
@@ -1051,7 +1130,11 @@ pub fn read_branch_status(session: &Session, branch: Option<&str>) -> anyhow::Re
     // this rev spec cannot be confused with a user-supplied @{...}.)
     let (ok, stdout, _) = git_output(
         repo_path,
-        &["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")],
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            &format!("{branch}@{{upstream}}"),
+        ],
     )?;
     let upstream = if ok {
         let name = stdout.trim().to_string();
@@ -1605,12 +1688,7 @@ pub fn read_blame_with(
         // `normalize_blame_eol`); `None` means the revision's own blob is the
         // blamed content and there is nothing to convert.
         let normalized = match contents_bytes {
-            Some(bytes) => Some(normalize_blame_eol(
-                &repo,
-                blamed_commit,
-                &req.path,
-                bytes,
-            )?),
+            Some(bytes) => Some(normalize_blame_eol(&repo, blamed_commit, &req.path, bytes)?),
             None => None,
         };
         let blame_bytes: Option<&[u8]> = normalized.as_deref();
@@ -2059,11 +2137,7 @@ fn autocrlf_converts(repo: &gix::Repository) -> bool {
 /// `normalize_blame_eol`). A missing or non-blob entry counts as "no CR":
 /// there is then nothing to compare against and the caller keeps the bytes
 /// verbatim.
-fn blob_has_cr(
-    repo: &gix::Repository,
-    commit: gix::ObjectId,
-    path: &str,
-) -> anyhow::Result<bool> {
+fn blob_has_cr(repo: &gix::Repository, commit: gix::ObjectId, path: &str) -> anyhow::Result<bool> {
     Ok(match blob_at_path(repo, commit, path)? {
         Some(blob) => blob.data.contains(&b'\r'),
         None => false,
@@ -2451,9 +2525,7 @@ pub fn read_rebase_plan(
         "getRebasePlan: branch",
     )
     .map_err(|_| {
-        BambooError::invalid_argument(format!(
-            "getRebasePlan: branch {branch_name:?} not found"
-        ))
+        BambooError::invalid_argument(format!("getRebasePlan: branch {branch_name:?} not found"))
     })?;
 
     let Some((base, chain)) = rebase_chain(&repo, onto_id, branch_id)? else {
@@ -2479,8 +2551,6 @@ pub fn read_rebase_plan(
         commits,
     })
 }
-
-
 
 /// `getRebaseStatus`: direct mapping of the on-disk rebase state. Read-only
 /// and session-gated like every other read; detects externally-started

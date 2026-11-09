@@ -8,13 +8,13 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
-    BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg, CreateBranch, DeleteBranch,
-    Discard, Fetch, GetBlame, GetBlob, GetBranchStatus, GetCommitDetail, GetDiff, GetGraph,
-    GetHeadResult, GetRebasePlan, GetRebaseStatus, GetRemotes, GetStatus, GraphPage, HeadChanged,
-    IndexChanged, Initialize, InitializeResult, ListUndoStack, OutputResult, Pull, Push,
-    RefsChanged, RemoteInfo, RebaseAbort, RebaseContinue, RebaseSkip, ResolveConflict, StashDrop,
-    StashEntry, StashPop, StashPush, Stage, StageRanges, StartRebase, StatusItem, SwitchBranch,
-    Undo, UndoResponse, Unstage, UnstageRanges, WorktreeChanged,
+    validate_graph_filter, BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg,
+    CreateBranch, DeleteBranch, Discard, Fetch, GetBlame, GetBlob, GetBranchStatus,
+    GetCommitDetail, GetDiff, GetGraph, GetHeadResult, GetRebasePlan, GetRebaseStatus, GetRemotes,
+    GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
+    OutputResult, Pull, Push, RebaseAbort, RebaseContinue, RebaseSkip, RefsChanged, RemoteInfo,
+    ResolveConflict, Stage, StageRanges, StartRebase, StashDrop, StashEntry, StashPop, StashPush,
+    StatusItem, SwitchBranch, Undo, UndoResponse, Unstage, UnstageRanges, WorktreeChanged,
 };
 
 use crate::session::{EngineEvent, Session, WriteOutcome};
@@ -474,8 +474,21 @@ impl BambooServer {
                 let req: GetGraph = parse_params("getGraph", params)?;
                 let mut viewport = req.viewport;
                 viewport.limit = viewport.limit.min(1000);
+                // Trust boundary: the filter arrives from a webview.
+                // Normalize (trim, drop empty fields — an all-empty
+                // filter is a plain unfiltered request) and validate
+                // (length, control characters) before it reaches the
+                // walk.
+                let filter = match req.filter.map(|f| f.normalized()) {
+                    None => None,
+                    Some(f) if f.is_empty() => None,
+                    Some(f) => {
+                        validate_graph_filter(&f)?;
+                        Some(f)
+                    }
+                };
                 let page: GraphPage = spawn_blocking_read(session, move |s| {
-                    crate::gix_read::read_graph_page(s, &viewport)
+                    crate::gix_read::read_graph_page_with_filter(s, &viewport, filter.as_ref())
                 })
                 .await
                 .map_err(|e| {
@@ -496,12 +509,16 @@ impl BambooServer {
             }
             "stage" => {
                 let req: Stage = parse_params("stage", params)?;
-                session.enqueue_write(WriteCommand::Stage(req.paths)).await?;
+                session
+                    .enqueue_write(WriteCommand::Stage(req.paths))
+                    .await?;
                 Ok(Value::Null)
             }
             "unstage" => {
                 let req: Unstage = parse_params("unstage", params)?;
-                session.enqueue_write(WriteCommand::Unstage(req.paths)).await?;
+                session
+                    .enqueue_write(WriteCommand::Unstage(req.paths))
+                    .await?;
                 Ok(Value::Null)
             }
             "discard" => {
@@ -670,9 +687,7 @@ impl BambooServer {
             }
             "rebaseContinue" => {
                 let _: RebaseContinue = parse_params("rebaseContinue", params)?;
-                write_outcome_json(
-                    session.enqueue_write(WriteCommand::RebaseContinue).await?,
-                )
+                write_outcome_json(session.enqueue_write(WriteCommand::RebaseContinue).await?)
             }
             "rebaseSkip" => {
                 let _: RebaseSkip = parse_params("rebaseSkip", params)?;
