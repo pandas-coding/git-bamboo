@@ -2312,12 +2312,17 @@ async fn stash_pop_explicit_ref_targets_the_named_entry() -> anyhow::Result<()> 
         "unexpected subject: {:?}",
         entries[0].message
     );
-    // The date is strict ISO-8601 (%cI), as the protocol doc promises.
-    assert!(
-        entries[0].date.contains('T') && entries[0].date.contains('+'),
-        "date should be ISO-8601 with offset: {:?}",
-        entries[0].date
-    );
+    // The date is strict ISO-8601 (%cI), as the protocol doc promises. Parsed
+    // rather than substring-matched, because git prints the zero offset as `Z`
+    // and not `+00:00` — so which zone form appears depends on the machine's
+    // timezone, and a UTC host (every CI runner) yields `...Z`. Both are
+    // ISO-8601; asserting a literal '+' made this test pass only off-UTC.
+    chrono::DateTime::parse_from_rfc3339(&entries[0].date).unwrap_or_else(|e| {
+        panic!(
+            "date should be strict ISO-8601: {:?} ({e})",
+            entries[0].date
+        )
+    });
     Ok(())
 }
 

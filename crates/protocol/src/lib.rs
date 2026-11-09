@@ -563,8 +563,11 @@ pub struct StashEntry {
     /// Subject line of the stash commit (message given at push time or
     /// the generated "WIP on ..." line).
     pub message: String,
-    /// Strict ISO-8601 commit date of the stash entry, e.g.
-    /// `2026-10-26T12:00:00+08:00` (`git log %cI`).
+    /// Strict ISO-8601 commit date of the stash entry (`git log %cI`), e.g.
+    /// `2026-10-26T12:00:00+08:00`. A zero offset is printed as `Z`
+    /// (`2026-10-26T04:00:00Z`), not `+00:00`, so clients must accept both
+    /// zone forms — which one arrives depends on the timezone of the machine
+    /// the engine runs on.
     pub date: String,
 }
 
