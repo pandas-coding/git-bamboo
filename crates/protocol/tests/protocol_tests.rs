@@ -98,12 +98,107 @@ fn graph_page_serialization() {
         has_more: true,
         epoch: 7,
         anchor_commit: Some("abc".into()),
+        truncated: false,
     };
     let json = serde_json::to_string(&page).unwrap();
     assert!(json.contains("\"total_approx\":1000"));
+    // `truncated: false` is omitted on the wire (backwards compatible:
+    // old payloads without the field deserialize to false).
+    assert!(!json.contains("truncated"));
     let back: GraphPage = serde_json::from_str(&json).unwrap();
     assert_eq!(back.epoch, 7);
     assert!(back.has_more);
+    assert!(!back.truncated);
+
+    let truncated = serde_json::to_string(&GraphPage {
+        truncated: true,
+        ..page
+    })
+    .unwrap();
+    assert!(truncated.contains("\"truncated\":true"));
+    assert_eq!(
+        serde_json::from_str::<GraphPage>(&truncated).unwrap().truncated,
+        true
+    );
+}
+
+#[test]
+fn get_graph_filter_roundtrip_and_default() {
+    let viewport = GraphViewport {
+        offset: 4,
+        limit: 50,
+        anchor_commit: None,
+        epoch: 3,
+    };
+    // With a filter: only set fields appear on the wire; a full roundtrip
+    // preserves the conditions exactly.
+    let with_filter = GetGraph {
+        viewport: viewport.clone(),
+        filter: Some(GraphFilter {
+            author: Some("Alice".into()),
+            message: None,
+            path: Some("src/main.rs".into()),
+        }),
+    };
+    let json = serde_json::to_string(&with_filter).unwrap();
+    assert!(json.contains("\"author\":\"Alice\""));
+    assert!(!json.contains("message"));
+    let back: GetGraph = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.filter, with_filter.filter);
+    assert_eq!(back.viewport, viewport);
+
+    // Without a filter: the field is absent on the wire (old clients never
+    // send it) and deserializes to None.
+    let no_filter = GetGraph {
+        viewport,
+        filter: None,
+    };
+    let json = serde_json::to_string(&no_filter).unwrap();
+    assert!(!json.contains("filter"));
+    let legacy =
+        r#"{"viewport":{"offset":0,"limit":50,"anchor_commit":null,"epoch":1}}"#;
+    assert_eq!(serde_json::from_str::<GetGraph>(legacy).unwrap().filter, None);
+    assert_eq!(serde_json::from_str::<GetGraph>(&json).unwrap().filter, None);
+}
+
+#[test]
+fn graph_filter_normalized_and_validated() {
+    // Whitespace-only and empty fields collapse to None.
+    let f = GraphFilter {
+        author: Some("  ".into()),
+        message: Some("".into()),
+        path: Some(" src ".into()),
+    }
+    .normalized();
+    assert!(f.author.is_none());
+    assert!(f.message.is_none());
+    assert_eq!(f.path.as_deref(), Some("src"));
+    assert!(!f.is_empty());
+    assert!(GraphFilter::default().normalized().is_empty());
+
+    // Validation: control characters and oversized fields are rejected.
+    let bad_ctrl = GraphFilter {
+        message: Some("a\nb".into()),
+        ..Default::default()
+    };
+    assert!(validate_graph_filter(&bad_ctrl).is_err());
+    let bad_len = GraphFilter {
+        path: Some("x".repeat(257)),
+        ..Default::default()
+    };
+    assert!(validate_graph_filter(&bad_len).is_err());
+    // 256 chars is the inclusive bound; empty fields are rejected (the
+    // parse layer normalizes them away, this guards a non-normalized path).
+    assert!(validate_graph_filter(&GraphFilter {
+        path: Some("x".repeat(256)),
+        ..Default::default()
+    })
+    .is_ok());
+    assert!(validate_graph_filter(&GraphFilter {
+        path: Some(String::new()),
+        ..Default::default()
+    })
+    .is_err());
 }
 
 #[test]

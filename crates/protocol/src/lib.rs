@@ -96,6 +96,53 @@ pub enum StatusCode {
 // Graph pagination
 // ---------------------------------------------------------------------------
 
+/// Graph filter conditions ("filter as a query condition"): the engine
+/// applies these while walking the commit graph, so filtering is a
+/// first-class query parameter instead of a client-side post-filter of
+/// materialized pages — virtual scrolling and lane rendering keep working
+/// unchanged at 100k+ commits.
+///
+/// Semantics (an intentional deviation from git-log's regex flags, which
+/// are hostile in a GUI input box and a regex-injection surface):
+/// - `author`: case-insensitive substring of the author name OR email;
+/// - `message`: case-insensitive substring of the commit summary line
+///   (the message the graph rows display);
+/// - `path`: case-SENSITIVE substring of any path changed vs. the first
+///   parent (full tree diff for root commits).
+/// Multiple set conditions AND together. Each field is validated at the
+/// server parse layer: non-empty, ≤ 256 chars, no control characters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct GraphFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl GraphFilter {
+    /// True when no condition is set — a filter with no fields is a no-op
+    /// and callers treat it as `None` (the unfiltered fast path).
+    pub fn is_empty(&self) -> bool {
+        self.author.is_none() && self.message.is_none() && self.path.is_none()
+    }
+
+    /// Normalize after deserialization: trim whitespace, drop empty strings.
+    /// The server parse layer calls this before validation so an `""` field
+    /// behaves exactly like an absent field on the wire.
+    pub fn normalized(self) -> Self {
+        let trim = |v: Option<String>| {
+            v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        };
+        Self {
+            author: trim(self.author),
+            message: trim(self.message),
+            path: trim(self.path),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphViewport {
     pub offset: u64,
@@ -108,10 +155,19 @@ pub struct GraphViewport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphPage {
     pub commits: Vec<Commit>,
+    /// Unfiltered: a lower bound ("walk so far" count). Filtered: the
+    /// EXACT hit count — the engine materializes the full filtered list
+    /// once, so the scrollbar always matches the content.
     pub total_approx: u64,
     pub has_more: bool,
     pub epoch: u64,
     pub anchor_commit: Option<String>,
+    /// True when a filtered walk hit its safety cap (commit-count or
+    /// tree-diff time budget) and was cut short: `total_approx` is then a
+    /// lower bound and the UI shows "≥ N commits". Omitted (false) on
+    /// the wire for unfiltered pages, so old payloads stay compatible.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +222,41 @@ pub struct UndoResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetGraph {
     pub viewport: GraphViewport,
+    /// Filter conditions; absent = unfiltered (backwards compatible: old
+    /// clients that never send the field get the exact prior behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<GraphFilter>,
+}
+
+/// Validate a client-supplied graph filter: each set field must be
+/// non-empty, at most 256 chars, and free of control characters. Runs in
+/// the server parse layer so no oversized or control-character payload
+/// ever reaches the walk (the webview is a trust boundary).
+pub fn validate_graph_filter(filter: &GraphFilter) -> Result<(), BambooError> {
+    for (field, value) in [
+        ("author", &filter.author),
+        ("message", &filter.message),
+        ("path", &filter.path),
+    ] {
+        if let Some(text) = value {
+            if text.is_empty() {
+                return Err(BambooError::invalid_argument(format!(
+                    "getGraph: filter field {field} must not be empty"
+                )));
+            }
+            if text.chars().count() > 256 {
+                return Err(BambooError::invalid_argument(format!(
+                    "getGraph: filter field {field} exceeds 256 characters"
+                )));
+            }
+            if text.chars().any(|c| c.is_ascii_control()) {
+                return Err(BambooError::invalid_argument(format!(
+                    "getGraph: filter field {field} contains control characters"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
