@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use notify::Watcher;
 use tokio::sync::mpsc;
@@ -74,10 +74,14 @@ const EVENT_DEBOUNCE: Duration = Duration::from_millis(50);
 /// the recreate, so the session waits for the paths to reappear.
 const REARM_POLL: Duration = Duration::from_millis(250);
 
-/// How often the watcher thread confirms the watched roots still exist when no
-/// events arrive. Event-driven detection is not enough on its own: Windows
-/// delivers nothing at all once the watched directory is gone, because the
-/// `ReadDirectoryChangesW` handle dies with it.
+/// How often the watcher thread checks up on the watched roots when no events
+/// arrive. Event-driven detection is not enough on its own: Windows delivers
+/// nothing at all once the watched directory is gone — notify's backend takes
+/// `ERROR_ACCESS_DENIED`, unwatches the directory and reports no event — so the
+/// thread has to go and look. It checks both whether the roots still exist and
+/// whether they are still the SAME directories (RootStamp), because a scripted
+/// delete-and-recreate finishes inside one interval and existence alone misses
+/// it.
 const ROOT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Session {
@@ -316,16 +320,36 @@ impl Session {
         std::thread::Builder::new()
             .name("bamboo-watcher".into())
             .spawn(move || {
+                // The roots' identity as of arming, so a replacement can be
+                // recognised later even though the paths look unchanged.
+                let armed = RootStamp::of(&repo_root.given, &git_root.given);
+                let mut pending_stamp: Option<RootStamp> = None;
                 loop {
                     // A heartbeat rather than a blocking recv: see
-                    // ROOT_CHECK_INTERVAL. A deleted repo must be noticed even
-                    // when the backend has stopped reporting.
+                    // ROOT_CHECK_INTERVAL. A deleted or replaced repo must be
+                    // noticed even when the backend has stopped reporting.
                     let event = match rx.recv_timeout(ROOT_CHECK_INTERVAL) {
                         Ok(event) => event,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             let Some(session) = weak.upgrade() else { break };
                             if roots_gone(&repo_root, &git_root) {
+                                pending_stamp = None;
                                 session.schedule_watcher_rearm();
+                            } else {
+                                // Gone-and-back: the paths exist but are not
+                                // the directories we armed on. Require the new
+                                // stamp to survive one more beat before acting,
+                                // so a filesystem that reports an unstable
+                                // creation time cannot start a re-arm loop.
+                                let now = RootStamp::of(&repo_root.given, &git_root.given);
+                                if now == armed {
+                                    pending_stamp = None;
+                                } else if pending_stamp == Some(now) {
+                                    pending_stamp = None;
+                                    session.schedule_watcher_rearm();
+                                } else {
+                                    pending_stamp = Some(now);
+                                }
                             }
                             continue;
                         }
@@ -500,6 +524,38 @@ fn roots_gone(repo_root: &WatchRoot, git_root: &WatchRoot) -> bool {
     !repo_root.given.is_dir() || !git_root.given.exists()
 }
 
+/// The filesystem identity of the watched roots: their creation times.
+///
+/// Existence is not enough to notice a replacement, because a scripted
+/// `rm -rf repo && mkdir repo && git init` finishes inside one poll interval —
+/// and on Windows there is no event to react to either, since notify unwatches
+/// a directory whose handle starts returning `ERROR_ACCESS_DENIED` without
+/// reporting anything. A creation time changes PERMANENTLY when the directory
+/// is replaced, so the next heartbeat sees it no matter how brief the gap was.
+///
+/// `None` where the filesystem exposes no creation time (statx without btime,
+/// for instance). Both sides are then `None`, the stamps compare equal, and
+/// this check stays inert — the event- and existence-based detection still
+/// carry those platforms, as they always did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootStamp {
+    repo: Option<SystemTime>,
+    git: Option<SystemTime>,
+}
+
+impl RootStamp {
+    fn of(repo_root: &Path, git_root: &Path) -> Self {
+        Self {
+            repo: created_at(repo_root),
+            git: created_at(git_root),
+        }
+    }
+}
+
+fn created_at(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.created()).ok()
+}
+
 /// Classify and emit notifications for a coalesced batch of fs events.
 /// A single epoch bump covers the whole batch so clients refresh once.
 fn process_event_batch(
@@ -606,7 +662,7 @@ fn process_event_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::WatchRoot;
+    use super::{Duration, RootStamp, WatchRoot};
     use std::path::{Path, PathBuf};
 
     /// The macOS shape: watched as `/var/...`, events reported as
@@ -669,5 +725,38 @@ mod tests {
             root.relative(&dir.path().join("a.txt")),
             Some(Path::new("a.txt"))
         );
+    }
+
+    /// A recreated root must not look like the one we armed on. That is the
+    /// whole job of the stamp: it is what lets the re-arm notice a
+    /// delete-and-recreate that finished inside a single poll interval, which
+    /// is how it actually happens (`rm -rf repo && mkdir repo && git init`).
+    /// Where the filesystem reports no creation time both sides are None and
+    /// there is nothing to distinguish — the check is inert there by design.
+    #[test]
+    fn root_stamp_changes_when_a_directory_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let before = RootStamp::of(&root, &git);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        // Longer than any plausible creation-time granularity on the
+        // filesystems this runs on, so the test does not hinge on the
+        // replacement landing in a different clock tick by luck.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::create_dir_all(&git).unwrap();
+        let after = RootStamp::of(&root, &git);
+
+        if before.repo.is_some() || before.git.is_some() {
+            assert_ne!(
+                before, after,
+                "a replaced root must have a new stamp, or the watcher stays \
+                 armed on a directory that no longer exists"
+            );
+        } else {
+            assert_eq!(after, before, "no creation time means no stamp churn");
+        }
     }
 }
