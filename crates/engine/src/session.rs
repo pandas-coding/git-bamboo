@@ -303,7 +303,10 @@ impl Session {
         // replaced (re-initialize) it exits instead of keeping the session
         // alive forever.
         let weak = Arc::downgrade(self);
-        let repo_path = self.repo_path.clone();
+        // Event paths are matched against both the form we watched and its
+        // symlink-resolved form — macOS reports only the latter (WatchRoot).
+        let repo_root = WatchRoot::new(&self.repo_path);
+        let git_root = WatchRoot::new(&git_dir);
         std::thread::Builder::new()
             .name("bamboo-watcher".into())
             .spawn(move || {
@@ -335,15 +338,32 @@ impl Session {
                         }
                     }
                     let Some(session) = weak.upgrade() else { break };
-                    // Deletion of a watched root itself (rm -rf of the repo
-                    // or its gitdir) kills the inode-based watches; schedule
-                    // a re-arm so a recreate resumes notifications.
-                    let root_removed = batch.iter().any(|ev| {
-                        matches!(ev.kind, notify::EventKind::Remove(_))
-                            && ev.paths.iter().any(|p| p == &repo_path || p == &git_dir)
+                    // Deletion of a watched root itself (rm -rf of the repo or
+                    // its gitdir) kills inode-based watches, so a recreate has
+                    // to re-arm. Two signals, because neither alone holds on
+                    // every backend: inotify reports Remove on the root, but
+                    // macOS' FSEvents reports the root's deletion as
+                    // ROOT_CHANGED, which notify surfaces as Modify(Name(From))
+                    // — and a recreate inside the 50ms debounce window can have
+                    // the path back again before the batch is classified. Both
+                    // are cheap (two stats at most per batch), and a false
+                    // positive only costs one conservative refresh burst: the
+                    // re-arm thread waits for the paths to reappear.
+                    let root_event = batch.iter().any(|ev| {
+                        matches!(
+                            ev.kind,
+                            notify::EventKind::Remove(_)
+                                | notify::EventKind::Modify(
+                                    notify::event::ModifyKind::Name(_)
+                                )
+                        ) && ev
+                            .paths
+                            .iter()
+                            .any(|p| repo_root.is_self(p) || git_root.is_self(p))
                     });
-                    process_event_batch(&session, &repo_path, &git_dir, batch);
-                    if root_removed {
+                    let root_gone = !repo_root.given.is_dir() || !git_root.given.exists();
+                    process_event_batch(&session, &repo_root, &git_root, batch);
+                    if root_event || root_gone {
                         session.schedule_watcher_rearm();
                     }
                 }
@@ -405,12 +425,61 @@ impl Session {
     }
 }
 
+/// A watched root, in the form we were handed and in its symlink-resolved
+/// form.
+///
+/// The two differ more often than it looks. macOS' FSEvents backend hands
+/// notify the REAL path — a repo opened as `/var/tmp/repo` reports events
+/// under `/private/var/tmp/repo`, because `/var` is a symlink — and
+/// `git rev-parse --absolute-git-dir` answers with the physical path too,
+/// while inotify and ReadDirectoryChangesW echo back the watched string.
+/// Comparing an event path against only the form the client gave us therefore
+/// drops every worktree event on macOS whenever the path traverses a symlink,
+/// silently: the UI just stops refreshing. Both forms are matched instead.
+///
+/// `real` is None when canonicalization fails or resolves to the same path,
+/// so the common case costs one failed comparison and nothing else.
+#[derive(Debug)]
+struct WatchRoot {
+    given: PathBuf,
+    real: Option<PathBuf>,
+}
+
+impl WatchRoot {
+    fn new(path: &Path) -> Self {
+        let real = std::fs::canonicalize(path).ok().filter(|real| real != path);
+        Self {
+            given: path.to_path_buf(),
+            real,
+        }
+    }
+
+    /// `path` relative to this root, or None when it is not inside it — in
+    /// either form. The relative result is the same for both, so what the
+    /// client sees does not depend on which one matched.
+    fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        if let Ok(rel) = path.strip_prefix(&self.given) {
+            return Some(rel);
+        }
+        match &self.real {
+            Some(real) => path.strip_prefix(real).ok(),
+            None => None,
+        }
+    }
+
+    /// `path` IS this root, in either form — the case that matters when the
+    /// root itself is deleted and the watches die with it.
+    fn is_self(&self, path: &Path) -> bool {
+        path == self.given || self.real.as_deref() == Some(path)
+    }
+}
+
 /// Classify and emit notifications for a coalesced batch of fs events.
 /// A single epoch bump covers the whole batch so clients refresh once.
 fn process_event_batch(
     session: &Session,
-    repo_path: &Path,
-    git_dir: &Path,
+    repo_root: &WatchRoot,
+    git_root: &WatchRoot,
     events: Vec<notify::Event>,
 ) {
     let mut head_changed = false;
@@ -437,8 +506,7 @@ fn process_event_batch(
                 continue;
             }
 
-            if path.starts_with(git_dir) {
-                let rel = path.strip_prefix(git_dir).unwrap_or(&path);
+            if let Some(rel) = git_root.relative(&path) {
                 let rel_str = rel.to_string_lossy();
 
                 // Skip lock files and other transient gitdir noise
@@ -460,9 +528,8 @@ fn process_event_batch(
                     graph_invalidated = true;
                 }
                 // Other gitdir internals (objects, packs, ...) are ignored.
-            } else if path.starts_with(repo_path) {
+            } else if let Some(rel) = repo_root.relative(&path) {
                 // Worktree change: refresh status.
-                let rel = path.strip_prefix(repo_path).unwrap_or(&path);
                 worktree_paths.push(rel.to_string_lossy().to_string());
             } else {
                 // Neither worktree nor gitdir (can happen with odd watcher
@@ -486,7 +553,7 @@ fn process_event_batch(
 
     let epoch = session.bump_epoch();
     if head_changed {
-        let new_head = std::fs::read_to_string(git_dir.join("HEAD"))
+        let new_head = std::fs::read_to_string(git_root.given.join("HEAD"))
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -508,5 +575,73 @@ fn process_event_batch(
         session.emit(EngineEvent::WorktreeChanged {
             paths: worktree_paths,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WatchRoot;
+    use std::path::{Path, PathBuf};
+
+    /// The macOS shape: watched as `/var/...`, events reported as
+    /// `/private/var/...`. Both must classify, and both must yield the same
+    /// relative path — that string is what the client receives.
+    #[test]
+    fn watch_root_matches_the_symlink_resolved_form() {
+        let root = WatchRoot {
+            given: PathBuf::from("/var/tmp/repo"),
+            real: Some(PathBuf::from("/private/var/tmp/repo")),
+        };
+        for reported in ["/var/tmp/repo/a.txt", "/private/var/tmp/repo/a.txt"] {
+            assert_eq!(
+                root.relative(Path::new(reported)),
+                Some(Path::new("a.txt")),
+                "{reported}"
+            );
+        }
+        assert!(root.is_self(Path::new("/var/tmp/repo")));
+        assert!(root.is_self(Path::new("/private/var/tmp/repo")));
+        // Sharing a prefix is not being inside: `/var/tmp/repo2` is a sibling.
+        assert_eq!(root.relative(Path::new("/var/tmp/repo2/a.txt")), None);
+        assert!(!root.is_self(Path::new("/var/tmp/repo2")));
+        assert!(!root.is_self(Path::new("/private/var/tmp/repo/.git")));
+    }
+
+    /// Without an alias only the given form matches — the alias must widen
+    /// matching, not replace it.
+    #[test]
+    fn watch_root_without_an_alias_matches_only_what_it_was_given() {
+        let root = WatchRoot {
+            given: PathBuf::from("/home/u/repo"),
+            real: None,
+        };
+        assert_eq!(
+            root.relative(Path::new("/home/u/repo/.git/HEAD")),
+            Some(Path::new(".git/HEAD"))
+        );
+        assert_eq!(root.relative(Path::new("/private/home/u/repo/x")), None);
+        // The root itself relative to itself is empty, as strip_prefix gives.
+        assert_eq!(root.relative(Path::new("/home/u/repo")), Some(Path::new("")));
+    }
+
+    /// `new` against a real directory: whatever the platform does with
+    /// symlinks, the canonical form of the root must match. On macOS
+    /// `tempdir()` is under `/var` and this exercises the alias; on Linux the
+    /// two forms coincide and it exercises the dedupe.
+    #[test]
+    fn watch_root_new_resolves_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WatchRoot::new(dir.path());
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(root.is_self(dir.path()));
+        assert!(root.is_self(&canonical));
+        assert_eq!(
+            root.relative(&canonical.join("a.txt")),
+            Some(Path::new("a.txt"))
+        );
+        assert_eq!(
+            root.relative(&dir.path().join("a.txt")),
+            Some(Path::new("a.txt"))
+        );
     }
 }

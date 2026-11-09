@@ -4122,12 +4122,29 @@ async fn watcher_rearms_after_repo_recreate() -> anyhow::Result<()> {
     let _session = bamboo_engine::session::Session::open(&repo, tx).await?;
 
     // Sanity: the watcher is alive — a worktree write produces a
-    // notification.
-    std::fs::write(repo.join("probe.txt"), "1\n")?;
-    let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("no notification before recreate"))?;
-    assert!(ev.is_some());
+    // notification. Retried rather than written once, because a backend is
+    // not necessarily armed the instant `open` returns (macOS starts its
+    // FSEvents stream on its own thread) and a write landing in that window
+    // is simply lost. A watcher that is dead — or one dropping events because
+    // it cannot match their path form — never delivers however often we write,
+    // so the retry cannot mask the failure this check exists to catch.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut alive = false;
+    loop {
+        std::fs::write(repo.join("probe.txt"), "1\n")?;
+        match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(_)) => {
+                alive = true;
+                break;
+            }
+            Ok(None) => anyhow::bail!("notification channel closed"),
+            Err(_) => {}
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    assert!(alive, "no notification before recreate");
 
     // rm -rf + recreate: new inodes; the old watches are dead.
     std::fs::remove_dir_all(&repo)?;
