@@ -25,11 +25,11 @@ import { GraphWebviewProvider } from './graphWebview';
 import { openGraphPanel, registerGraphPanelSerializer } from './graphPanel';
 import { openCommitDetailPanel } from './commitDetail';
 import { openRebasePlanPanel, registerRebasePanelSerializer, runRebasePanelCommand } from './rebasePanel';
-import { takeGraphContextTarget, type GraphContextCommit } from './graphSession';
+import { applyGraphFilter, currentGraphFilter, takeGraphContextTarget, type GraphContextCommit } from './graphSession';
 import { HeadContentProvider } from './headContent';
 import { HunkStagingController, STAGE_HUNK_COMMAND, UNSTAGE_HUNK_COMMAND } from './hunkStaging';
 import { trustedSetting, withNetOpGuard } from './netOps';
-import type { InitializeResult, RepoState } from './types';
+import type { GraphFilter, InitializeResult, RepoState } from './types';
 import { BRANCH_STATUS_DEBOUNCE_MS, debounce, errorMessage } from './util';
 
 let activeClient: EngineClient | undefined;
@@ -249,6 +249,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
     }));
+  // Palette "Filter Commit Graph…": one condition per invocation (multi-
+  //  condition filters are built in the graph toolbar's chips), composed
+  //  onto the current filter so picking a different type stacks rather
+  //  than replaces. Same session API the toolbar input uses, so every
+  //  open graph surface of the repo updates together.
+  registerCommand(context, 'gitBamboo.graph.filter', async () => {
+    if (!activeClient) {
+      noSessionWarning();
+      return;
+    }
+    const current = currentGraphFilter(activeClient);
+    if (current === undefined) {
+      vscode.window.showInformationMessage(
+        'Git Bamboo: open the Commit Graph view first — its filter toolbar lives there.',
+      );
+      return;
+    }
+    type FilterField = 'message' | 'author' | 'path';
+    const items: { label: string; description: string; field: FilterField | null }[] = [
+      { label: 'Message', description: 'Case-insensitive substring of the summary line', field: 'message' },
+      { label: 'Author', description: 'Case-insensitive substring of name or email', field: 'author' },
+      { label: 'Path', description: 'Case-sensitive substring of a changed path', field: 'path' },
+    ];
+    if (current) {
+      items.unshift({ label: 'Clear Filter', description: 'Remove all conditions', field: null });
+    }
+    const pick = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Filter the commit graph by…',
+    });
+    if (!pick) return;
+    const base: GraphFilter = current ?? { author: null, message: null, path: null };
+    if (pick.field === null) {
+      applyGraphFilter(activeClient, { author: null, message: null, path: null });
+      return;
+    }
+    const text = await vscode.window.showInputBox({
+      title: `Filter commits by ${pick.label.toLowerCase()}`,
+      prompt: 'Empty input clears this condition; other conditions are kept.',
+      value: base[pick.field] ?? '',
+      validateInput: (value) =>
+        value.length > 256
+          ? 'Filter text is limited to 256 characters'
+          : /[\x00-\x1f\x7f]/.test(value)
+            ? 'Filter text must not contain control characters'
+            : '',
+    });
+    if (text === undefined) return; // cancelled — keep the current filter
+    const next: GraphFilter = { author: base.author, message: base.message, path: base.path };
+    next[pick.field] = text.trim() || null;
+    applyGraphFilter(activeClient, next);
+  });
   // Context-menu "Open Commit Details": reuses the parked right-click
   // target (the panel host re-targets an existing panel, so consecutive
   // opens never stack). The commit id was already validated against the

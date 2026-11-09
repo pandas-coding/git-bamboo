@@ -119,6 +119,11 @@
         "category": "Git Bamboo"
       },
       {
+        "command": "gitBamboo.graph.filter",
+        "title": "Filter Commit Graph...",
+        "category": "Git Bamboo"
+      },
+      {
         "command": "gitBamboo.rebasePanel.execute",
         "title": "Rebase Panel: Execute",
         "category": "Git Bamboo"

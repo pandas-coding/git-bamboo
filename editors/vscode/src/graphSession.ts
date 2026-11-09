@@ -129,6 +129,16 @@ export function applyGraphFilter(client: EngineClient, filter: GraphFilter): voi
   }
 }
 
+/** The current filter of the first live session served by `client`: a
+ *  filter object, null (no filter), or undefined when no graph surface
+ *  is open (the command palette uses that to explain itself). */
+export function currentGraphFilter(client: EngineClient): GraphFilter | null | undefined {
+  for (const session of liveSessions) {
+    if (session.serves(client)) return session.activeFilter;
+  }
+  return undefined;
+}
+
 /** Trim a filter's string fields and drop empty ones; an all-empty
  *  filter normalizes to null (no filter — the unfiltered path). */
 export function normalizeGraphFilter(filter: GraphFilter): GraphFilter | null {
