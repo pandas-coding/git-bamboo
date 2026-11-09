@@ -1,7 +1,7 @@
 ---
 title: Rebase 与历史洞察 Phase 4：graph 搜索过滤（作者/消息/路径，过滤即查询条件）
 date: 2026-10-30
-status: in-progress
+status: done
 ideas:
   - .ai-workflow/ideas/20261025-rebase-and-history-insights.md
 group: rebase-and-history-insights
