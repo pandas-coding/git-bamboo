@@ -4845,10 +4845,12 @@ async fn blame_rejects_invalid_arguments_as_structured_errors() -> anyhow::Resul
 
     // Path traversal: blame is the read that opens a worktree FILE from this
     // argument (every other one hands it to git, which refuses to leave the
-    // repository), so absolute paths and `..` are rejected before anything is
-    // joined onto the worktree root. (A Windows-style `C:\...` is caught by
-    // the same `is_absolute` check on Windows; on Unix it is an odd but
-    // harmless relative filename that stays inside the repository.)
+    // repository), so rooted paths and `..` are rejected before anything is
+    // joined onto the worktree root. `/etc/passwd` is the interesting case:
+    // absolute on Unix, but on Windows it carries no drive prefix and so is
+    // NOT `is_absolute` — while `join` still discards everything after the
+    // prefix and escapes to `C:\etc\passwd`. Rejecting by component covers
+    // both, which is why the check is not `is_absolute`.
     for escaping in ["/etc/passwd", "../outside.txt", "sub/../../outside.txt"] {
         invalid_arg(bamboo_engine::gix_read::read_blame(
             &session,
@@ -4859,6 +4861,18 @@ async fn blame_rejects_invalid_arguments_as_structured_errors() -> anyhow::Resul
             },
         ));
     }
+    // The same escape spelled the Windows way: rooted, no prefix. On Unix a
+    // backslash is an ordinary filename character, so this only means what it
+    // says where it can hurt.
+    #[cfg(windows)]
+    invalid_arg(bamboo_engine::gix_read::read_blame(
+        &session,
+        &bamboo_protocol::GetBlame {
+            path: "\\etc\\passwd".to_string(),
+            rev: None,
+            contents: None,
+        },
+    ));
     invalid_arg(bamboo_engine::gix_read::read_blame(
         &session,
         &bamboo_protocol::GetBlame {

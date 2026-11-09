@@ -1470,17 +1470,21 @@ pub fn read_blame_with(
     // refuses to leave it. `validate_path_arg` rejects option-like and
     // control-character paths but neither absolute ones nor `..`, and
     // joining either onto the worktree root would read outside it.
+    //
+    // Decided by COMPONENT, not by `is_absolute`, because the two disagree
+    // exactly where it matters: on Windows `/etc/passwd` is NOT absolute (no
+    // drive prefix), yet `root.join("/etc/passwd")` discards everything after
+    // the prefix and lands at `C:\etc\passwd` — outside the worktree. Requiring
+    // plain relative components is the only form that joins inside the root on
+    // every platform.
     let blame_path = std::path::Path::new(&req.path);
-    if blame_path.is_absolute()
-        || blame_path.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)
-            )
-        })
+    if !blame_path
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
     {
         return Err(BambooError::invalid_argument(format!(
-            "getBlame: path must be repository-relative without '..': {:?}",
+            "getBlame: path must be a plain repository-relative path \
+             (no leading '/', no drive, no '..'): {:?}",
             req.path
         ))
         .into());

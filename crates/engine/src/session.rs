@@ -74,6 +74,12 @@ const EVENT_DEBOUNCE: Duration = Duration::from_millis(50);
 /// the recreate, so the session waits for the paths to reappear.
 const REARM_POLL: Duration = Duration::from_millis(250);
 
+/// How often the watcher thread confirms the watched roots still exist when no
+/// events arrive. Event-driven detection is not enough on its own: Windows
+/// delivers nothing at all once the watched directory is gone, because the
+/// `ReadDirectoryChangesW` handle dies with it.
+const ROOT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
 pub struct Session {
     pub repo_path: PathBuf,
     /// The resolved git directory (differs from `repo_path/.git` for linked
@@ -310,7 +316,21 @@ impl Session {
         std::thread::Builder::new()
             .name("bamboo-watcher".into())
             .spawn(move || {
-                while let Ok(event) = rx.recv() {
+                loop {
+                    // A heartbeat rather than a blocking recv: see
+                    // ROOT_CHECK_INTERVAL. A deleted repo must be noticed even
+                    // when the backend has stopped reporting.
+                    let event = match rx.recv_timeout(ROOT_CHECK_INTERVAL) {
+                        Ok(event) => event,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let Some(session) = weak.upgrade() else { break };
+                            if roots_gone(&repo_root, &git_root) {
+                                session.schedule_watcher_rearm();
+                            }
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let Ok(event) = event else { continue };
                     let mut batch = vec![event];
                     // Coalesce events arriving within the debounce window
@@ -340,14 +360,14 @@ impl Session {
                     let Some(session) = weak.upgrade() else { break };
                     // Deletion of a watched root itself (rm -rf of the repo or
                     // its gitdir) kills inode-based watches, so a recreate has
-                    // to re-arm. Two signals, because neither alone holds on
-                    // every backend: inotify reports Remove on the root, but
-                    // macOS' FSEvents reports the root's deletion as
-                    // ROOT_CHANGED, which notify surfaces as Modify(Name(From))
-                    // — and a recreate inside the 50ms debounce window can have
-                    // the path back again before the batch is classified. Both
-                    // are cheap (two stats at most per batch), and a false
-                    // positive only costs one conservative refresh burst: the
+                    // to re-arm. Event kinds alone are not enough: inotify
+                    // reports Remove on the root, macOS' FSEvents reports the
+                    // same deletion as ROOT_CHANGED — which notify surfaces as
+                    // Modify(Name(From)) — and Windows may report nothing at
+                    // all (the heartbeat above covers that). A recreate inside
+                    // the 50ms debounce window can also put the path back
+                    // before the batch is classified, hence both signals. A
+                    // false positive costs one conservative refresh burst: the
                     // re-arm thread waits for the paths to reappear.
                     let root_event = batch.iter().any(|ev| {
                         matches!(
@@ -361,7 +381,7 @@ impl Session {
                             .iter()
                             .any(|p| repo_root.is_self(p) || git_root.is_self(p))
                     });
-                    let root_gone = !repo_root.given.is_dir() || !git_root.given.exists();
+                    let root_gone = roots_gone(&repo_root, &git_root);
                     process_event_batch(&session, &repo_root, &git_root, batch);
                     if root_event || root_gone {
                         session.schedule_watcher_rearm();
@@ -472,6 +492,12 @@ impl WatchRoot {
     fn is_self(&self, path: &Path) -> bool {
         path == self.given || self.real.as_deref() == Some(path)
     }
+}
+
+/// Whether either watched root has vanished from the filesystem — the
+/// backend-independent half of re-arm detection.
+fn roots_gone(repo_root: &WatchRoot, git_root: &WatchRoot) -> bool {
+    !repo_root.given.is_dir() || !git_root.given.exists()
 }
 
 /// Classify and emit notifications for a coalesced batch of fs events.
