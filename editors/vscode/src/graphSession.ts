@@ -159,19 +159,20 @@ function sameFilter(a: GraphFilter | null, b: GraphFilter | null): boolean {
   return a?.author === b?.author && a?.message === b?.message && a?.path === b?.path;
 }
 
-/** Parse a webview-supplied filter payload (trust boundary). Every field
- *  must be null/absent or a plain string within the engine's validation
- *  rules (≤ 256 chars, no control characters). Returns a normalized
- *  filter (null = no conditions), or undefined when the payload is
- *  malformed — the caller ignores those. */
+/** Parse a webview-supplied filter payload (trust boundary). Every
+ *  field must be null/absent or a plain string; the payload is then
+ *  normalized (trim, drop empty fields). The LENGTH and
+ *  control-character rules live ONLY in the engine
+ *  (`validate_graph_filter` — the single enforcement point); a
+ *  rules-violating payload surfaces as a typed RPC error instead of
+ *  being silently dropped here. Returns a normalized filter (null = no
+ *  conditions), or undefined when the payload is malformed — the caller
+ *  ignores those. */
 function parseWebviewFilter(payload: unknown): GraphFilter | null | undefined {
   const field = (value: unknown): string | null | undefined => {
     if (value === null || value === undefined) return null;
     if (typeof value !== 'string') return undefined;
-    const trimmed = value.trim();
-    if (trimmed === '') return null;
-    if (trimmed.length > 256 || /[\x00-\x1f\x7f]/.test(trimmed)) return undefined;
-    return trimmed;
+    return value;
   };
   if (payload === null || payload === undefined) return null;
   if (typeof payload !== 'object' || Array.isArray(payload)) return undefined;
@@ -213,8 +214,9 @@ export class GraphSession implements vscode.Disposable {
   /** Sequence number so stale getGraph responses are dropped. */
   private requestSeq = 0;
   /** Current graph filter (normalized; null = unfiltered). Carried on
-   *  every getGraph request, the epoch probe, and the EPOCH_MISMATCH
-   *  retry so the filtered view survives invalidations. */
+   *  every getGraph request and the EPOCH_MISMATCH retry so the filtered
+   *  view survives invalidations (the epoch probe stays unfiltered — it
+   *  must stay cheap; see `refreshAfterInvalidation`). */
   private filter: GraphFilter | null = null;
   private disposed = false;
   private readonly disposables: vscode.Disposable[] = [];
@@ -295,10 +297,12 @@ export class GraphSession implements vscode.Disposable {
     try {
       const probe = await this.client.request<GraphPage>('getGraph', {
         viewport: { offset: 0, limit: 1, anchor_commit: null, epoch: 0 },
-        // The probe re-adopts the current epoch; it carries the filter so
-        // a probe during an active filter reads under the same conditions
-        // (and the engine's memoized view survives the epoch bump).
-        ...(this.filter && { filter: this.filter }),
+        // The probe deliberately carries NO filter: it is a cheap epoch
+        // probe, and any epoch bump invalidates the engine's memoized
+        // filtered views — carrying the filter would rebuild the whole
+        // (potentially expensive) view just to answer "what epoch is
+        // it?". The webview's re-request does that work exactly once,
+        // under the new epoch.
       });
       this.state.epoch = probe.epoch;
     } catch (err) {
@@ -423,6 +427,14 @@ export class GraphSession implements vscode.Disposable {
     const filter = raw === null ? null : normalizeGraphFilter(raw);
     if (sameFilter(filter, this.filter)) return;
     this.filter = filter;
+    // Every row is about to re-target: drop any parked right-click target
+    // so a still-open context menu cannot act on a pre-filter commit
+    // (e.g. checkout on a row that now shows different content).
+    graphContextSlot.clearIf((target) => target.owner === this);
+    // Invalidate in-flight getGraph responses: they carry the OLD
+    // filter's data and would otherwise land on the freshly reset list
+    // until the new page arrives.
+    this.requestSeq++;
     void this.webview.postMessage({ type: 'filterState', filter });
   }
 

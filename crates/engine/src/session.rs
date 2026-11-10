@@ -96,7 +96,8 @@ pub struct Session {
     pub gix_repo: Mutex<gix::Repository>,
     pub cache: Mutex<Cache>,
     /// Memoized filtered graph views (see `graph_filter`), keyed by
-    /// filter and invalidated wholesale when the epoch or tip set moves.
+    /// (filter, limits) with LRU eviction, invalidated wholesale when
+    /// the epoch or tip set moves.
     pub filtered_views: Mutex<Option<crate::graph_filter::FilteredViews>>,
     pub undo: UndoEngine,
     pub write_tx: mpsc::Sender<(WriteCommand, tokio::sync::oneshot::Sender<WriteResult>)>,

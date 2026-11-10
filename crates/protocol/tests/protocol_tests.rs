@@ -207,6 +207,53 @@ fn graph_filter_normalized_and_validated() {
 }
 
 #[test]
+fn resolve_filter_is_the_parse_layer_in_one_step() {
+    use bamboo_protocol::BambooError;
+
+    // No filter and whitespace-only filters resolve to unfiltered.
+    assert_eq!(resolve_filter(None).unwrap(), None);
+    assert_eq!(
+        resolve_filter(Some(GraphFilter {
+            author: Some("   ".into()),
+            message: Some("".into()),
+            path: None,
+        }))
+        .unwrap(),
+        None
+    );
+
+    // A valid filter is returned normalized.
+    assert_eq!(
+        resolve_filter(Some(GraphFilter {
+            author: None,
+            message: Some(" fix ".into()),
+            path: None,
+        }))
+        .unwrap(),
+        Some(GraphFilter {
+            author: None,
+            message: Some("fix".into()),
+            path: None,
+        })
+    );
+
+    // The INVALID_ARGUMENT (-32005) the getGraph parse layer returns for
+    // oversized and control-character filters.
+    let err = resolve_filter(Some(GraphFilter {
+        message: Some("x".repeat(257)),
+        ..Default::default()
+    }))
+    .unwrap_err();
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    let err = resolve_filter(Some(GraphFilter {
+        message: Some("a\nb".into()),
+        ..Default::default()
+    }))
+    .unwrap_err();
+    assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+}
+
+#[test]
 fn commit_lane_is_u16() {
     let c = Commit {
         id: "abc123".into(),

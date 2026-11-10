@@ -9,52 +9,60 @@
 //! letting `total_approx` be the EXACT hit count.
 //!
 //! Path conditions are the expensive part: every candidate commit needs a
-//! tree-diff against its first parent. Two safety caps bound a hostile
-//! repo (see [`FilterLimits`]): a walked-commit cap and a tree-diff time
-//! budget; hitting either stops the walk and flags the response
-//! `truncated` so the UI shows "≥ N commits" instead of pretending
-//! completeness.
+//! tree-diff against its first parent. Safety caps bound a hostile repo
+//! (see [`FilterLimits`]): a walked-commit cap and a wall-clock budget
+//! over the WHOLE walk (a filtered walk holds the session's repo lock, so
+//! bounding the walk bounds how long reads and writes queue behind it);
+//! hitting either stops the walk and flags the response `truncated` so
+//! the UI shows "≥ N commits" instead of pretending completeness.
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bamboo_protocol::{BambooError, Commit, GraphFilter, GraphPage, GraphViewport};
 use tracing::{info, warn};
 
-use crate::cache::Cache;
-use crate::gix_read::{assign_lanes, resolve_commit_metas, rev_walk_newest_first};
+use crate::gix_read::{anchored_start, assign_lanes, resolve_commit_metas, rev_walk_newest_first};
 use crate::session::Session;
 
 /// How many distinct filters keep their materialized view per (epoch,
-/// tips) generation. Beyond that the old views are dropped wholesale — a
-/// user flailing on the filter box must not grow session memory.
+/// tips) generation. Beyond that the least recently used view is evicted
+/// — a user flailing on the filter box must not grow session memory.
 const MAX_MEMOIZED_VIEWS: usize = 8;
 
-/// Deadline clock checks happen every this-many commits: reading a clock
-/// per commit would itself be measurable at 100k commits, while a
-/// half-walk overshoot of the budget is harmless (it bounds abuse, not
-/// latency).
+/// Deadline clock checks happen every this-many commits for the
+/// metadata-cheap phases: reading a clock per commit would itself be
+/// measurable at 100k commits. The expensive per-commit work (tree
+/// diffs) checks after EVERY call — each diff is individually unbounded,
+/// so checking only at this granularity could overshoot the budget by
+/// `BUDGET_CHECK_INTERVAL - 1` full diffs.
 const BUDGET_CHECK_INTERVAL: usize = 512;
 
+/// Metadata is resolved (and the cache lock held) per chunk of this many
+/// commits: the gaps let other requests take the cache lock between
+/// chunks instead of queueing behind a whole filtered walk.
+const META_CHUNK: usize = 4096;
+
 /// Safety caps for one filtered walk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FilterLimits {
     /// Maximum number of commits WALKED (not hits) before the walk gives
     /// up and flags the response truncated.
     pub max_commits: usize,
-    /// Maximum cumulative time spent tree-diffing for a path condition.
-    /// Only enforced when the filter HAS a path condition — author/message
-    /// walks are metadata-bound (commit-graph + redb cache) and don't need
-    /// a budget.
-    pub tree_diff_time_budget: Duration,
+    /// Wall-clock budget for the ENTIRE filtered walk (enumerate,
+    /// metadata, predicates) — bounds how long the walk holds the
+    /// session's repo lock, so a filter-cycling client cannot starve
+    /// reads and writes.
+    pub time_budget: Duration,
 }
 
 impl Default for FilterLimits {
     fn default() -> Self {
         Self {
             max_commits: 200_000,
-            tree_diff_time_budget: Duration::from_secs(5),
+            time_budget: Duration::from_secs(5),
         }
     }
 }
@@ -73,86 +81,124 @@ struct FilteredView {
     truncated: bool,
 }
 
-/// Memoized filtered views hung on the session. In memory (not redb): the
-/// view is derived, rebuildable data, and per-session by nature. All views
-/// share one (epoch, tips) generation and are invalidated wholesale when
-/// the graph moves — there is no per-view staleness to track.
-#[derive(Debug, Default)]
+/// Memoized filtered views hung on the session, keyed by (filter,
+/// limits) — a view built under injected test caps can never be served
+/// to a default-limits call as if complete. In memory (not redb): the
+/// view is derived, rebuildable data, and per-session by nature. All
+/// views share one (epoch, tips) generation, invalidated wholesale when
+/// the graph moves; within a generation eviction is LRU.
+#[derive(Debug)]
 pub struct FilteredViews {
     epoch: u64,
     tips: Vec<gix::ObjectId>,
-    views: HashMap<GraphFilter, FilteredView>,
+    /// LRU order: front = least recently used.
+    order: VecDeque<(GraphFilter, FilterLimits)>,
+    views: HashMap<(GraphFilter, FilterLimits), Arc<FilteredView>>,
+}
+
+impl FilteredViews {
+    /// An empty slot for the (epoch, tips) generation — the first
+    /// filtered request of a generation creates it.
+    fn new() -> Self {
+        Self {
+            epoch: 0,
+            tips: Vec::new(),
+            order: VecDeque::new(),
+            views: HashMap::new(),
+        }
+    }
+    /// The memoized view for `key` under the CURRENT (epoch, tips)
+    /// generation — None when the generation moved (the slot is reset
+    /// wholesale: every memoized view is stale together) or the view is
+    /// not memoized. Touches the key (LRU) on a hit.
+    fn get(
+        &mut self,
+        key: &(GraphFilter, FilterLimits),
+        current_epoch: u64,
+        tips: &[gix::ObjectId],
+    ) -> Option<Arc<FilteredView>> {
+        if self.epoch != current_epoch || self.tips != tips {
+            self.order.clear();
+            self.views.clear();
+            self.epoch = current_epoch;
+            self.tips = tips.to_vec();
+        }
+        let view = self.views.get(key)?.clone();
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.clone());
+        }
+        Some(view)
+    }
+
+    /// Memoize a freshly built view for the CURRENT generation. Evicts
+    /// the least recently used view when the slot is full.
+    fn insert(
+        &mut self,
+        key: (GraphFilter, FilterLimits),
+        view: Arc<FilteredView>,
+        current_epoch: u64,
+        tips: &[gix::ObjectId],
+    ) {
+        if self.epoch != current_epoch || self.tips != tips {
+            self.order.clear();
+            self.views.clear();
+            self.epoch = current_epoch;
+            self.tips = tips.to_vec();
+        }
+        if !self.views.contains_key(&key) {
+            while self.views.len() >= MAX_MEMOIZED_VIEWS {
+                match self.order.pop_front() {
+                    Some(evict) => {
+                        self.views.remove(&evict);
+                    }
+                    None => break,
+                }
+            }
+        }
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.clone());
+        self.views.insert(key, view);
+    }
 }
 
 /// Serve one filtered page. The caller (`gix_read::read_graph_page_with_limits`)
-/// holds the repo and cache locks and has already checked the epoch;
-/// `filtered_page` builds (or reuses) the memoized view, then slices it.
-#[allow(clippy::too_many_arguments)]
+/// holds ONLY the repo lock here; this fn re-acquires the cache lock per
+/// metadata chunk and never holds the filtered-views lock across a
+/// build. `ensure_view` builds (or reuses) the memoized view, then the
+/// page is sliced out of it.
 pub(crate) fn filtered_page(
     session: &Session,
     repo: &gix::Repository,
-    cache: &Cache,
     tips: &[gix::ObjectId],
     viewport: &GraphViewport,
     filter: &GraphFilter,
     current_epoch: u64,
     limits: &FilterLimits,
 ) -> anyhow::Result<GraphPage> {
-    let mut views = session
-        .filtered_views
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // Wholesale invalidation: any epoch or tip-set change makes every
-    // memoized view stale, no matter which filter built it.
-    if let Some(held) = views.as_ref() {
-        if held.epoch != current_epoch || held.tips != tips {
-            *views = None;
-        }
-    }
+    let view = ensure_view(session, repo, tips, filter, current_epoch, limits)?;
 
-    let missing = views
-        .as_ref()
-        .and_then(|held| held.views.get(filter))
-        .is_none();
-    if missing {
-        let built = build_filtered_view(repo, cache, filter, tips, current_epoch, limits)?;
-        // Epoch TOCTOU guard: a filtered walk can take seconds (path
-        // condition on a big repo). Never memoize (nor serve) data from a
-        // superseded epoch.
-        if session.current_epoch() != current_epoch {
-            return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
-        }
-        let slot = views.get_or_insert_with(|| FilteredViews {
-            epoch: current_epoch,
-            tips: tips.to_vec(),
-            views: HashMap::new(),
-        });
-        if slot.views.len() >= MAX_MEMOIZED_VIEWS && !slot.views.contains_key(filter) {
-            slot.views.clear();
-        }
-        slot.views.insert(filter.clone(), built);
-    }
-    let view = views
-        .as_ref()
-        .and_then(|held| held.views.get(filter))
-        .expect("the view was just ensured");
-
-    // Page slicing: same anchor semantics as the unfiltered read — the
-    // anchor's index in the (filtered) list is the effective offset, so
-    // the pinned commit stays on screen; unknown anchors keep the offset.
-    let start = match viewport.anchor_commit.as_deref().and_then(parse_oid) {
-        Some(anchor) => view
-            .ids
-            .iter()
-            .position(|id| *id == anchor)
-            .map(|idx| idx.min(view.ids.len().saturating_sub(1)))
-            .unwrap_or(viewport.offset as usize),
-        None => viewport.offset as usize,
-    };
+    // Page slicing: same anchor semantics as the unfiltered read (see
+    // `gix_read::anchored_start`) — the anchor's index in the (filtered)
+    // list is the effective offset, so the pinned commit stays on
+    // screen; unknown anchors keep the offset, and an out-of-range
+    // offset pages past the end (empty page — offsets are
+    // client-supplied and must never panic a slice).
+    let anchor_row = viewport
+        .anchor_commit
+        .as_deref()
+        .and_then(parse_oid)
+        .and_then(|anchor| view.ids.iter().position(|id| *id == anchor));
+    let start = anchored_start(anchor_row, view.ids.len(), viewport.offset);
     let end = start
         .saturating_add(viewport.limit as usize)
         .min(view.ids.len());
-    let mut commits = resolve_commit_metas(repo, cache, &view.ids[start..end])?;
+    let mut commits = {
+        let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+        resolve_commit_metas(repo, &cache, &view.ids[start..end])?
+    };
     for (commit, lane) in commits
         .iter_mut()
         .zip(view.lanes[start..end].iter().copied())
@@ -186,6 +232,56 @@ pub(crate) fn filtered_page(
     })
 }
 
+/// The memoized view for (filter, limits), building it when absent. The
+/// build runs with NO session lock held beyond the repo lock the caller
+/// already holds: a filtered walk can take seconds, and holding the
+/// filtered-views mutex (or the cache mutex) across it would queue every
+/// other request behind one walk.
+fn ensure_view(
+    session: &Session,
+    repo: &gix::Repository,
+    tips: &[gix::ObjectId],
+    filter: &GraphFilter,
+    current_epoch: u64,
+    limits: &FilterLimits,
+) -> anyhow::Result<Arc<FilteredView>> {
+    let key = (filter.clone(), limits.clone());
+    {
+        let mut guard = session
+            .filtered_views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(view) = guard.as_mut().and_then(|views| views.get(&key, current_epoch, tips))
+        {
+            return Ok(view);
+        }
+    }
+    let built = Arc::new(build_filtered_view(
+        session, repo, filter, tips, current_epoch, limits,
+    )?);
+    // Epoch TOCTOU guard: a filtered walk can take seconds. Never
+    // memoize (nor serve) data from a superseded epoch.
+    if session.current_epoch() != current_epoch {
+        return Err(BambooError::epoch_mismatch(session.current_epoch(), current_epoch).into());
+    }
+    let mut guard = session
+        .filtered_views
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // A concurrent request may have won the build race and memoized an
+    // equivalent view — prefer it so LRU order stays coherent.
+    if let Some(view) = guard
+        .as_mut()
+        .and_then(|views| views.get(&key, current_epoch, tips))
+    {
+        return Ok(view);
+    }
+    guard
+        .get_or_insert_with(FilteredViews::new)
+        .insert(key, built.clone(), current_epoch, tips);
+    Ok(built)
+}
+
 /// Parse a full (40/64-char) hex commit id. Anchored viewports only pin
 /// ids the graph itself handed out; anything unparsable simply doesn't
 /// pin and the offset is used as-is.
@@ -194,21 +290,26 @@ fn parse_oid(id: &str) -> Option<gix::ObjectId> {
 }
 
 /// Materialize the full filtered hit list for (filter, tips) under the
-/// given caps.
+/// given caps. Holds only the repo lock (the caller's); the cache lock
+/// is taken per metadata chunk so other requests interleave.
 fn build_filtered_view(
+    session: &Session,
     repo: &gix::Repository,
-    cache: &Cache,
     filter: &GraphFilter,
     tips: &[gix::ObjectId],
     current_epoch: u64,
     limits: &FilterLimits,
 ) -> anyhow::Result<FilteredView> {
+    let deadline = Instant::now() + limits.time_budget;
+    let mut truncated = false;
+
     // Phase 1 — enumerate the full walk (bounded by max_commits). Ids
     // only; metadata comes next, cache-first.
     let mut ids: Vec<gix::ObjectId> = Vec::with_capacity(4096);
-    let mut truncated = false;
     for (idx, info) in rev_walk_newest_first(repo, tips)?.enumerate() {
-        if idx >= limits.max_commits {
+        if idx >= limits.max_commits
+            || (idx % BUDGET_CHECK_INTERVAL == 0 && Instant::now() >= deadline)
+        {
             truncated = true;
             break;
         }
@@ -217,41 +318,65 @@ fn build_filtered_view(
 
     // Phase 2 — metadata for every walked commit (cache-first; the walk
     // backfills the COMMIT_META cache exactly like the windowed read).
-    let mut all = resolve_commit_metas(repo, cache, &ids)?;
+    // Chunked: the cache lock is released between chunks and the
+    // deadline is enforced per chunk.
+    let mut all: Vec<Commit> = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(META_CHUNK) {
+        let metas = {
+            let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+            resolve_commit_metas(repo, &cache, chunk)?
+        };
+        all.extend(metas);
+        if Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+    }
 
     // Phase 3 — predicate pass. Conditions AND. Author/message needles
     // are pre-lowercased; the path needle is raw (case-sensitive).
     let author_needle = filter.author.as_ref().map(|s| s.to_lowercase());
     let message_needle = filter.message.as_ref().map(|s| s.to_lowercase());
     let path_needle = filter.path.as_ref().map(|s| s.as_bytes());
-    let diff_deadline = path_needle.map(|_| Instant::now() + limits.tree_diff_time_budget);
     let mut diff_state = gix::diff::tree::State::default();
 
     let mut hit_idx: Vec<usize> = Vec::new();
     for (idx, commit) in all.iter().enumerate() {
-        if let Some(deadline) = diff_deadline {
-            if idx % BUDGET_CHECK_INTERVAL == 0 && Instant::now() >= deadline {
-                truncated = true;
-                break;
-            }
+        // Metadata-cheap conditions check the deadline at
+        // BUDGET_CHECK_INTERVAL granularity (a clock read per commit
+        // would itself be measurable at 100k commits).
+        if idx % BUDGET_CHECK_INTERVAL == 0 && Instant::now() >= deadline {
+            truncated = true;
+            break;
         }
-        if commit_matches(
+        let matched = commit_matches(
             repo,
             &mut diff_state,
             commit,
             author_needle.as_deref(),
             message_needle.as_deref(),
             path_needle,
-        )? {
+        )?;
+        if matched {
             hit_idx.push(idx);
+        }
+        // A path condition's tree diff is individually unbounded: check
+        // the deadline after EVERY one, so the overshoot is at most one
+        // diff's cost — never BUDGET_CHECK_INTERVAL of them.
+        if path_needle.is_some() && Instant::now() >= deadline {
+            truncated = true;
+            break;
         }
     }
 
     // Phase 4 — lanes over the FULL walked topology, then keep only the
     // hits' lanes; persist them like the unfiltered read does.
     let lane_entries = assign_lanes(&mut all);
-    if let Err(e) = cache.put_lanes_with_epoch(&lane_entries, current_epoch) {
-        warn!(error = %e, "failed to cache lanes");
+    {
+        let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = cache.put_lanes_with_epoch(&lane_entries, current_epoch) {
+            warn!(error = %e, "failed to cache lanes");
+        }
     }
 
     Ok(FilteredView {

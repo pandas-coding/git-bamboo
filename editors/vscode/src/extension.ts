@@ -288,8 +288,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       title: `Filter commits by ${pick.label.toLowerCase()}`,
       prompt: 'Empty input clears this condition; other conditions are kept.',
       value: base[pick.field] ?? '',
-      validateInput: (value) =>
-        value.length > 256
+      // Early user feedback only — the engine's `validate_graph_filter`
+      // is the single enforcement point. Code points (not UTF-16 units)
+      // so the count matches the engine's `chars().count()`.
+      validateInput: (value: string) =>
+        [...value].length > 256
           ? 'Filter text is limited to 256 characters'
           : /[\x00-\x1f\x7f]/.test(value)
             ? 'Filter text must not contain control characters'

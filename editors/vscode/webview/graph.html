@@ -162,25 +162,8 @@
       box-sizing: border-box;
       cursor: pointer;
     }
-    /* Clear button: same genes as .net-btn, only shown when a condition
-     * is active. */
-    #filter-clear {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 24px;
-      height: 24px;
-      padding: 0;
-      border: none;
-      border-radius: 4px;
-      background: transparent;
-      color: var(--vscode-icon-foreground, var(--vscode-foreground));
-      cursor: pointer;
-      box-sizing: border-box;
-    }
-    #filter-clear:hover {
-      background: var(--vscode-toolbar-hoverBackground);
-    }
+    /* Clear button: a net-btn (same genes as the toolbar buttons), only
+     * shown when a condition is active. */
     #filter-clear[hidden] {
       display: none;
     }
@@ -470,7 +453,7 @@
         <option value="author">Author</option>
         <option value="path">Path</option>
       </select>
-      <button id="filter-clear" type="button" title="Clear the filter" aria-label="Clear the filter" hidden>
+      <button id="filter-clear" class="net-btn" type="button" title="Clear the filter" aria-label="Clear the filter" hidden>
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l8 8"/><path d="M12 4l-8 8"/></svg>
       </button>
       <span id="filter-count" aria-live="polite" hidden></span>

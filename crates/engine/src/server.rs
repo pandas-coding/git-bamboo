@@ -8,7 +8,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use bamboo_protocol::{
-    validate_graph_filter, BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg,
+    resolve_filter, BambooError, BranchStatus, Capabilities, CommitDetail, CommitMsg,
     CreateBranch, DeleteBranch, Discard, Fetch, GetBlame, GetBlob, GetBranchStatus,
     GetCommitDetail, GetDiff, GetGraph, GetHeadResult, GetRebasePlan, GetRebaseStatus, GetRemotes,
     GetStatus, GraphPage, HeadChanged, IndexChanged, Initialize, InitializeResult, ListUndoStack,
@@ -475,20 +475,19 @@ impl BambooServer {
                 let mut viewport = req.viewport;
                 viewport.limit = viewport.limit.min(1000);
                 // Trust boundary: the filter arrives from a webview.
-                // Normalize (trim, drop empty fields — an all-empty
+                // `resolve_filter` is the single enforcement point —
+                // normalize (trim, drop empty fields; an all-empty
                 // filter is a plain unfiltered request) and validate
                 // (length, control characters) before it reaches the
                 // walk.
-                let filter = match req.filter.map(|f| f.normalized()) {
-                    None => None,
-                    Some(f) if f.is_empty() => None,
-                    Some(f) => {
-                        validate_graph_filter(&f)?;
-                        Some(f)
-                    }
-                };
+                let filter = resolve_filter(req.filter)?;
                 let page: GraphPage = spawn_blocking_read(session, move |s| {
-                    crate::gix_read::read_graph_page_with_filter(s, &viewport, filter.as_ref())
+                    crate::gix_read::read_graph_page_with_limits(
+                        s,
+                        &viewport,
+                        filter.as_ref(),
+                        &crate::graph_filter::FilterLimits::default(),
+                    )
                 })
                 .await
                 .map_err(|e| {

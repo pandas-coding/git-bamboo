@@ -258,6 +258,24 @@ pub fn validate_graph_filter(filter: &GraphFilter) -> Result<(), BambooError> {
     Ok(())
 }
 
+/// Resolve a request's filter option in one step — the getGraph parse
+/// layer's ONLY filter handling (the single enforcement point; host-side
+/// checks are UX sugar at best). Normalize (trim, drop empty fields — an
+/// all-empty filter is an unfiltered request), then validate. `Ok(None)`
+/// means unfiltered.
+pub fn resolve_filter(
+    filter: Option<GraphFilter>,
+) -> Result<Option<GraphFilter>, BambooError> {
+    match filter.map(|f| f.normalized()) {
+        None => Ok(None),
+        Some(f) if f.is_empty() => Ok(None),
+        Some(f) => {
+            validate_graph_filter(&f)?;
+            Ok(Some(f))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStatus {
     pub paths: Option<Vec<String>>,

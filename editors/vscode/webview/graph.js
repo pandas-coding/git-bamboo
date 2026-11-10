@@ -241,15 +241,48 @@ import { formatTime, shortSha } from './util.js';
    *  for the user to pause. */
   const FILTER_DEBOUNCE_MS = 300;
 
-  /** Local mirror of the host's normalized filter (null = unfiltered).
-   *  The host is authoritative: every filterState echo — including ones
-   *  caused by this webview's own input — resyncs this (e.g. a filter
-   *  set from the command palette). */
+  /** Local mirror of the current filter (null = unfiltered). Updated
+   *  OPTIMISTICALLY when this webview sends a filter (so switching the
+   *  condition type mid-flight composes onto what was just committed)
+   *  and reconciled on every filterState echo — the host is
+   *  authoritative, and echoes from other surfaces (command palette,
+   *  reloaded webview) resync the UI. */
   let filter = null;
+
+  /** The last filter payload this webview sent, normalized the way the
+   *  host echoes it — recognizes our own echoes so a late one never
+   *  clobbers in-progress typing (see `applyFilterState`). */
+  let lastSent = null;
+
+  /** The filter the displayed list was last built under — a filterState
+   *  that differs from it resets the list (new query, new row space). */
+  let listFilter = null;
 
   let filterTimer = 0;
 
+  function sameFilter(a, b) {
+    return (
+      (a ? a.author : null) === (b ? b.author : null) &&
+      (a ? a.message : null) === (b ? b.message : null) &&
+      (a ? a.path : null) === (b ? b.path : null)
+    );
+  }
+
+  /** Normalize a payload this webview is about to send the way the host
+   *  echoes it: fields are pre-trimmed (or null); an all-null filter is
+   *  no filter. */
+  function normalizeSent(next) {
+    return next && (next.author || next.message || next.path) ? next : null;
+  }
+
   function sendFilter(next) {
+    lastSent = next;
+    // Optimistic mirror: the input's own conditions apply immediately,
+    // so a condition-type switch before the echo lands composes onto
+    // what was just committed instead of dropping it.
+    filter = normalizeSent(next);
+    renderFilterChips();
+    filterCount.hidden = true; // re-shown by the next graphPage
     vscode.postMessage({ type: 'setFilter', filter: next });
   }
 
@@ -368,22 +401,27 @@ import { formatTime, shortSha } from './util.js';
   }
 
   /** filterState from the host (every change, including ones this webview
-   *  initiated): resync the UI, and reset the list when the filter
-   *  actually changed — the host dedups no-op changes, so an unchanged
-   *  echo (the 'ready' handshake with no filter) costs nothing. */
+   *  initiated). OUR OWN echo must not touch the input box: the user may
+   *  have kept typing after the debounce fired (the pending debounce for
+   *  that text must survive), or switched the condition type — only the
+   *  LIST needs the reset, and only when the filter actually changed.
+   *  Echoes from other surfaces (palette, reload handshake) resync the
+   *  input too. */
   function applyFilterState(payload) {
     const parsed = parseFilterState(payload);
     if (parsed === undefined) return;
-    const same =
-      (parsed ? parsed.author : null) === (filter ? filter.author : null) &&
-      (parsed ? parsed.message : null) === (filter ? filter.message : null) &&
-      (parsed ? parsed.path : null) === (filter ? filter.path : null);
+    const ours = sameFilter(parsed, normalizeSent(lastSent));
     filter = parsed;
-    clearTimeout(filterTimer);
-    filterInput.value = filter ? filter[filterType.value] || '' : '';
+    if (!ours) {
+      clearTimeout(filterTimer);
+      filterInput.value = filter ? filter[filterType.value] || '' : '';
+    }
     renderFilterChips();
     filterCount.hidden = true; // re-shown by the next graphPage
-    if (!same) resetListForFilter();
+    if (!sameFilter(parsed, listFilter)) {
+      listFilter = parsed;
+      resetListForFilter();
+    }
   }
 
   /** Hit count for the toolbar: exact while a filter is active (the

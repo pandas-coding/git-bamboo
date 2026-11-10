@@ -17,20 +17,22 @@ use crate::write_queue::{redact_credentials, validate_path_arg, validate_ref_arg
 
 const PRELOAD_MARGIN: u32 = 500;
 
-pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::Result<GraphPage> {
-    read_graph_page_with_limits(session, viewport, None, &FilterLimits::default())
+/// Effective page start for an anchored viewport, shared by the
+/// unfiltered and filtered reads so the pinning semantics cannot drift:
+/// the anchor's row (pinned to the last row when the anchor IS the last
+/// commit), the raw offset when there is no (or an unknown) anchor — and
+/// ALWAYS clamped to the list, because an out-of-range offset must page
+/// past the end (empty page), never panic a slice (offsets are
+/// client-supplied).
+pub(crate) fn anchored_start(anchor_row: Option<usize>, len: usize, offset: u64) -> usize {
+    anchor_row
+        .map(|idx| idx.min(len.saturating_sub(1)))
+        .unwrap_or(offset as usize)
+        .min(len)
 }
 
-/// `read_graph_page` with a filter: `Some(filter)` routes to the
-/// engine-side filtered traversal (see `graph_filter`); `None` — or an
-/// all-empty filter, which is a no-op — keeps the exact unfiltered
-/// behavior.
-pub fn read_graph_page_with_filter(
-    session: &Session,
-    viewport: &GraphViewport,
-    filter: Option<&GraphFilter>,
-) -> anyhow::Result<GraphPage> {
-    read_graph_page_with_limits(session, viewport, filter, &FilterLimits::default())
+pub fn read_graph_page(session: &Session, viewport: &GraphViewport) -> anyhow::Result<GraphPage> {
+    read_graph_page_with_limits(session, viewport, None, &FilterLimits::default())
 }
 
 /// Graph read entry point with injectable safety caps for the filtered
@@ -50,10 +52,11 @@ pub fn read_graph_page_with_limits(
     // Poison-tolerant lock recovery: a panicked request handler must not
     // take down the whole connection.
     let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
-    let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Invalidate lane cache if epoch changed.
-    let _ = cache.invalidate_on_epoch_change(current_epoch)?;
+    {
+        let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Invalidate lane cache if epoch changed.
+        let _ = cache.invalidate_on_epoch_change(current_epoch)?;
+    }
 
     let tips = collect_tips(&repo)?;
     if tips.is_empty() {
@@ -67,18 +70,29 @@ pub fn read_graph_page_with_limits(
         });
     }
 
-    match filter.filter(|f| !f.is_empty()) {
-        Some(f) => graph_filter::filtered_page(
-            session,
-            &repo,
-            &cache,
-            &tips,
-            viewport,
-            f,
-            current_epoch,
-            limits,
-        ),
-        None => read_unfiltered_page(session, &repo, &cache, &tips, viewport, current_epoch),
+    // Routing normalizes exactly like the server parse layer (trim, drop
+    // empty fields): a whitespace-only filter is an unfiltered request,
+    // whichever layer the caller came through.
+    match filter.map(|f| f.clone().normalized()).filter(|f| !f.is_empty()) {
+        Some(f) => {
+            // The filtered walk can hold the repo lock for up to its time
+            // budget (see `FilterLimits`); it re-acquires the cache lock
+            // per metadata chunk and never holds the filtered-views lock
+            // while building, so reads and writes interleave with it.
+            graph_filter::filtered_page(
+                session,
+                &repo,
+                &tips,
+                viewport,
+                &f,
+                current_epoch,
+                limits,
+            )
+        }
+        None => {
+            let cache = session.cache.lock().unwrap_or_else(|e| e.into_inner());
+            read_unfiltered_page(session, &repo, &cache, &tips, viewport, current_epoch)
+        }
     }
 }
 
@@ -139,14 +153,11 @@ fn read_unfiltered_page(
     // across invalidations (new commits landing on top shift the page down
     // instead of scrolling the anchor out). Unknown anchors keep the
     // requested offset.
-    let start = match &viewport.anchor_commit {
-        Some(anchor) => all_commits
-            .iter()
-            .position(|c| &c.id == anchor)
-            .map(|idx| idx.min(all_commits.len().saturating_sub(1)))
-            .unwrap_or(viewport.offset as usize),
-        None => viewport.offset as usize,
+    let anchor_row = match &viewport.anchor_commit {
+        Some(anchor) => all_commits.iter().position(|c| &c.id == anchor),
+        None => None,
     };
+    let start = anchored_start(anchor_row, all_commits.len(), viewport.offset);
     let has_more = start + (viewport.limit as usize) < all_commits.len();
     let commits: Vec<Commit> = all_commits
         .into_iter()

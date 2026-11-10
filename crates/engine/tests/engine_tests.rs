@@ -749,7 +749,12 @@ async fn filtered_page(
         anchor_commit: None,
         epoch: session.current_epoch(),
     };
-    bamboo_engine::gix_read::read_graph_page_with_filter(session, &viewport, Some(filter))
+    bamboo_engine::gix_read::read_graph_page_with_limits(
+        session,
+        &viewport,
+        Some(filter),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
+    )
 }
 
 fn graph_filter(
@@ -873,19 +878,21 @@ async fn graph_filter_paginates_over_the_materialized_list() -> anyhow::Result<(
         anchor_commit: None,
         epoch: session.current_epoch(),
     };
-    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
         &session,
         &viewport(0, 2),
         Some(&filter),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
     )?;
     assert_messages(&page, &["merge feature", "fix: engine crash"]);
     assert_eq!(page.total_approx, 4);
     assert!(page.has_more);
 
-    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
         &session,
         &viewport(3, 2),
         Some(&filter),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
     )?;
     assert_messages(&page, &["init project"]);
     assert_eq!(page.total_approx, 4);
@@ -909,10 +916,11 @@ async fn graph_filter_anchor_repins_in_the_filtered_list() -> anyhow::Result<()>
         anchor_commit: Some(anchor.clone()),
         epoch: session.current_epoch(),
     };
-    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
         &session,
         &viewport,
         Some(&graph_filter(Some("alice"), None, None)),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
     )?;
     assert_messages(&page, &["init project"]);
     assert_eq!(page.total_approx, 3);
@@ -925,12 +933,89 @@ async fn graph_filter_anchor_repins_in_the_filtered_list() -> anyhow::Result<()>
         anchor_commit: Some("0000000000000000000000000000000000000000".to_string()),
         epoch: session.current_epoch(),
     };
-    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
         &session,
         &viewport,
         Some(&graph_filter(Some("alice"), None, None)),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
     )?;
     assert_messages(&page, &["fix typo in guide"]);
+    Ok(())
+}
+#[tokio::test]
+async fn graph_filter_offset_beyond_hits_pages_empty_not_panic() -> anyhow::Result<()> {
+    // Out-of-range offsets (stale scroll position, zero-hit filter) must
+    // return an empty page - never panic a slice. Offsets are
+    // client-supplied: the webview is a trust boundary.
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+    let defaults = bamboo_engine::graph_filter::FilterLimits::default();
+    let vp = |offset: u64| bamboo_protocol::GraphViewport {
+        offset,
+        limit: 10,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+
+    // Zero hits, offset past the end.
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &vp(5),
+        Some(&graph_filter(None, Some("no-such-message"), None)),
+        &defaults,
+    )?;
+    assert_messages(&page, &[]);
+    assert_eq!(page.total_approx, 0);
+    assert!(!page.has_more);
+
+    // Hits exist, offset past the end.
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &vp(99),
+        Some(&graph_filter(None, Some("fix"), None)),
+        &defaults,
+    )?;
+    assert_messages(&page, &[]);
+    assert_eq!(page.total_approx, 2);
+    assert!(!page.has_more);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_view_rebuilds_after_epoch_bump() -> anyhow::Result<()> {
+    // The memoized view is keyed by generation: an epoch bump (a write
+    // moved the refs) must drop it, so re-querying with the SAME filter
+    // includes commits made after the view was built.
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+    let filter = graph_filter(Some("alice"), None, None);
+
+    let first = filtered_page(&session, &filter).await?;
+    assert_eq!(first.total_approx, 3);
+
+    // A new alice commit lands (external CLI - deterministic without
+    // waiting on the watcher) and the epoch bumps (what the watcher does
+    // when it sees the write).
+    let out = std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "fix: late alice fix"])
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_NAME", "Alice")
+        .env("GIT_AUTHOR_EMAIL", "alice@corp.example")
+        .env("GIT_COMMITTER_NAME", "Alice")
+        .env("GIT_COMMITTER_EMAIL", "alice@corp.example")
+        .env("GIT_AUTHOR_DATE", "2026-02-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-02-01T00:00:00Z")
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    session.bump_epoch();
+
+    let second = filtered_page(&session, &filter).await?;
+    assert_eq!(second.total_approx, 4);
+    assert_eq!(second.commits[0].message, "fix: late alice fix");
     Ok(())
 }
 
@@ -947,14 +1032,27 @@ async fn graph_filter_empty_filter_equals_unfiltered() -> anyhow::Result<()> {
     };
     let unfiltered = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
 
-    // An all-None filter is a no-op, and so is a whitespace-only one after
-    // normalization (the server normalizes; the engine double-guards).
-    let page = bamboo_engine::gix_read::read_graph_page_with_filter(
+    // An all-None filter is a no-op, and so is a whitespace-only one:
+    // the engine routes on the NORMALIZED filter, so direct engine
+    // callers get the same no-op the server's parse layer produces.
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
         &session,
         &viewport,
         Some(&bamboo_protocol::GraphFilter::default()),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
     )?;
     assert_eq!(page, unfiltered);
+    let whitespace = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &viewport,
+        Some(&bamboo_protocol::GraphFilter {
+            author: Some("   ".into()),
+            message: None,
+            path: None,
+        }),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
+    )?;
+    assert_eq!(whitespace, unfiltered);
 
     // A filtered read first (populating lanes at this epoch) must not
     // disturb the unfiltered read.
@@ -976,10 +1074,11 @@ async fn graph_filter_epoch_mismatch_still_rejects() -> anyhow::Result<()> {
         anchor_commit: None,
         epoch: session.current_epoch() + 99,
     };
-    let err = bamboo_engine::gix_read::read_graph_page_with_filter(
+    let err = bamboo_engine::gix_read::read_graph_page_with_limits(
         &session,
         &viewport,
         Some(&graph_filter(None, Some("fix"), None)),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
     )
     .expect_err("stale epoch must be rejected");
     assert!(err.to_string().contains("epoch"));
@@ -1013,10 +1112,11 @@ async fn graph_filter_truncation_reports_lower_bound() -> anyhow::Result<()> {
     assert_eq!(page.total_approx, 1); // only "fix: engine crash" was reached
     assert_messages(&page, &["fix: engine crash"]);
 
-    // Time budget: a zero budget with a path condition truncates before
-    // any hit is examined.
+    // Time budget: a zero budget truncates the walk before any commit is
+    // examined (the budget now covers the WHOLE walk, not just tree
+    // diffs).
     let limits = bamboo_engine::graph_filter::FilterLimits {
-        tree_diff_time_budget: std::time::Duration::ZERO,
+        time_budget: std::time::Duration::ZERO,
         ..Default::default()
     };
     let page = bamboo_engine::gix_read::read_graph_page_with_limits(
