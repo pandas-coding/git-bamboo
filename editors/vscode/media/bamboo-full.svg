@@ -1,27 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <!-- Full-color marketplace icon source (media/icon.png is rasterized
        from this at 128x128; the PNG is committed, builds do not regenerate
-       it). Same composition as bamboo.svg but with brand colors — the
-       marketplace is not constrained to the activity bar's monochrome
-       rule. Rasterize with: rsvg-convert -w 128 -h 128 media/bamboo-full.svg
-       -o media/icon.png -->
+       it).
+
+       Brand mark "Merge Lane": a bamboo grove read as a git commit graph —
+       one tall lane, one branch curving in (a merge), two bamboo joint
+       bands, a single lime commit dot at the head. Deep forest-ink field,
+       near-white bold geometry, one accent color. media/bamboo.svg is the
+       monochrome 24x24 activity-bar version of the same composition.
+       Alternates (monogram B, growth) live in media/design/ with
+       preview.html.
+
+       Rasterize with:  rsvg-convert -w 128 -h 128 media/bamboo-full.svg
+                        -o media/icon.png
+       (or: npx sharp-cli resize 128 128 -i media/bamboo-full.svg
+            -o media/icon.png) -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2E7D32"/>
-      <stop offset="1" stop-color="#14501F"/>
+      <stop offset="0" stop-color="#1A4630"/>
+      <stop offset="1" stop-color="#0C2A1C"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.55" cy="0.28" r="0.65">
+      <stop offset="0" stop-color="#8FE388" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#8FE388" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.09"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
   </defs>
-  <rect width="24" height="24" rx="4.5" fill="url(#bg)"/>
-  <g transform="translate(2.4 2.4) scale(0.8)">
-    <g fill="none" stroke="#E8F5E9" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M5.5 21.5 V10.5" stroke-width="2.2"/>
-      <path d="M12 21.5 V4.5" stroke-width="2.2"/>
-      <path d="M18.5 21.5 V13.5" stroke-width="2.2"/>
-      <path d="M5.5 10.5 C5.5 15.5 8 17.5 12 17.5" stroke-width="2"/>
-      <path d="M9.9 9.5 h4.2" stroke-width="1.8"/>
-      <path d="M9.9 14.5 h4.2" stroke-width="1.8"/>
-    </g>
-    <circle cx="12" cy="4.5" r="2" fill="#FFCA28"/>
-    <circle cx="18.5" cy="13.5" r="2" fill="#FFCA28"/>
+  <rect width="128" height="128" rx="27" fill="url(#bg)"/>
+  <rect width="128" height="128" rx="27" fill="url(#glow)"/>
+  <g fill="none" stroke="#ECF5ED" stroke-linecap="round">
+    <path d="M72 102 V44" stroke-width="13"/>
+    <path d="M44 102 V88 C44 72 56 64 72 64" stroke-width="13"/>
+    <path d="M60 54 H84" stroke-width="8"/>
+    <path d="M60 90 H84" stroke-width="8"/>
   </g>
+  <circle cx="72" cy="24" r="8.5" fill="#A3E635"/>
+  <rect width="128" height="128" rx="27" fill="url(#sheen)"/>
 </svg>
