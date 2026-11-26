@@ -5,6 +5,8 @@ A fast, native Git integration for Visual Studio Code, powered by a Rust engine.
 ## Features
 
 - **Commit graph** — interactive visualization of your repository's branch and commit history
+- **Branch switching** — click the branch name in the status bar or the graph toolbar to search local and remote branches, check out a remote branch as a local tracking branch, or create a new one
+- **Graph filtering** — narrow the graph to selected branches, and stack message / author / path conditions on top
 - **Commit details** — inspect diffs and file changes for any commit
 - **Working tree view** — review, stage, and commit changes
 - **Native performance** — all Git operations run in a bundled Rust engine (`bamboo-engine`), no external Git process required

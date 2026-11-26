@@ -138,6 +138,7 @@ fn get_graph_filter_roundtrip_and_default() {
             author: Some("Alice".into()),
             message: None,
             path: Some("src/main.rs".into()),
+            refs: None,
         }),
     };
     let json = serde_json::to_string(&with_filter).unwrap();
@@ -173,6 +174,7 @@ fn graph_filter_normalized_and_validated() {
         author: Some("  ".into()),
         message: Some("".into()),
         path: Some(" src ".into()),
+        refs: None,
     }
     .normalized();
     assert!(f.author.is_none());
@@ -207,6 +209,74 @@ fn graph_filter_normalized_and_validated() {
 }
 
 #[test]
+fn graph_filter_refs_scope_normalizes_and_validates() {
+    // Trim, drop empties, de-duplicate (order preserved).
+    let f = GraphFilter {
+        refs: Some(vec![
+            " main ".into(),
+            String::new(),
+            "origin/main".into(),
+            "main".into(),
+        ]),
+        ..Default::default()
+    }
+    .normalized();
+    assert_eq!(
+        f.refs,
+        Some(vec!["main".to_string(), "origin/main".to_string()])
+    );
+    // A refs-only filter is a filter (it scopes the walk) but carries no
+    // predicate, so the read stays on the windowed path.
+    assert!(!f.is_empty());
+    assert!(!f.has_predicates());
+    // An all-empty refs list collapses to absent.
+    assert!(GraphFilter {
+        refs: Some(vec!["  ".into()]),
+        ..Default::default()
+    }
+    .normalized()
+    .is_empty());
+
+    // Wire: absent for old clients, present when set.
+    let json = serde_json::to_string(&GraphFilter::default()).unwrap();
+    assert!(!json.contains("refs"));
+    let back: GraphFilter = serde_json::from_str(r#"{"refs":["main"]}"#).unwrap();
+    assert_eq!(back.refs, Some(vec!["main".to_string()]));
+
+    // Validation: option-like, oversized, control-character and over-count
+    // ref lists are INVALID_ARGUMENT.
+    use bamboo_protocol::BambooError;
+    for bad in [
+        vec!["--all".to_string()],
+        vec!["x".repeat(257)],
+        vec!["a\nb".to_string()],
+        (0..=bamboo_protocol::MAX_FILTER_REFS)
+            .map(|i| format!("b{i}"))
+            .collect(),
+    ] {
+        let err = resolve_filter(Some(GraphFilter {
+            refs: Some(bad),
+            ..Default::default()
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, BambooError::INVALID_ARGUMENT);
+    }
+    // Empty names are normalized away by the parse layer; validation
+    // itself still rejects them (it guards non-normalized callers).
+    assert!(validate_graph_filter(&GraphFilter {
+        refs: Some(vec![String::new()]),
+        ..Default::default()
+    })
+    .is_err());
+    assert!(resolve_filter(Some(GraphFilter {
+        refs: Some(vec!["main".into(), "origin/topic".into()]),
+        ..Default::default()
+    }))
+    .unwrap()
+    .is_some());
+}
+
+#[test]
 fn resolve_filter_is_the_parse_layer_in_one_step() {
     use bamboo_protocol::BambooError;
 
@@ -217,6 +287,7 @@ fn resolve_filter_is_the_parse_layer_in_one_step() {
             author: Some("   ".into()),
             message: Some("".into()),
             path: None,
+            refs: Some(vec!["  ".into(), String::new()]),
         }))
         .unwrap(),
         None
@@ -228,12 +299,14 @@ fn resolve_filter_is_the_parse_layer_in_one_step() {
             author: None,
             message: Some(" fix ".into()),
             path: None,
+            refs: None,
         }))
         .unwrap(),
         Some(GraphFilter {
             author: None,
             message: Some("fix".into()),
             path: None,
+            refs: None,
         })
     );
 

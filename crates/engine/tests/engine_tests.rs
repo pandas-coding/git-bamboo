@@ -766,6 +766,15 @@ fn graph_filter(
         author: author.map(str::to_string),
         message: message.map(str::to_string),
         path: path.map(str::to_string),
+        refs: None,
+    }
+}
+
+/// A refs-scoped filter (branch selection in the graph toolbar).
+fn refs_filter(names: &[&str]) -> bamboo_protocol::GraphFilter {
+    bamboo_protocol::GraphFilter {
+        refs: Some(names.iter().map(|s| s.to_string()).collect()),
+        ..Default::default()
     }
 }
 
@@ -1049,6 +1058,7 @@ async fn graph_filter_empty_filter_equals_unfiltered() -> anyhow::Result<()> {
             author: Some("   ".into()),
             message: None,
             path: None,
+            refs: Some(vec!["  ".into()]),
         }),
         &bamboo_engine::graph_filter::FilterLimits::default(),
     )?;
@@ -1060,6 +1070,110 @@ async fn graph_filter_empty_filter_equals_unfiltered() -> anyhow::Result<()> {
     assert_eq!(filtered.commits.len(), 1);
     let again = bamboo_engine::gix_read::read_graph_page(&session, &viewport)?;
     assert_eq!(again.commits.len(), 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_refs_scope_narrows_the_walk() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    // feature stops before the merge: the merge commit is main-only.
+    let page = filtered_page(&session, &refs_filter(&["feature"])).await?;
+    assert_messages(
+        &page,
+        &[
+            "fix: engine crash",
+            "feat: add engine",
+            "fix typo in guide",
+            "init project",
+        ],
+    );
+    assert!(!page.has_more);
+
+    // Several refs are a union, and ordering stays newest-first.
+    let page = filtered_page(&session, &refs_filter(&["feature", "main"])).await?;
+    assert_messages(
+        &page,
+        &[
+            "merge feature",
+            "fix: engine crash",
+            "feat: add engine",
+            "fix typo in guide",
+            "init project",
+        ],
+    );
+
+    // A ref that no longer resolves is skipped, not an error; when none
+    // resolve the page is empty (the client's filter outlived the branch).
+    let page = filtered_page(&session, &refs_filter(&["feature", "gone"])).await?;
+    assert_eq!(page.commits.len(), 4);
+    let page = filtered_page(&session, &refs_filter(&["gone"])).await?;
+    assert_messages(&page, &[]);
+    assert_eq!(page.total_approx, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_refs_scope_combines_with_predicates() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    // Scope AND predicate: the merge commit matches "merge" but is out of
+    // feature's reach, so it must not appear.
+    let mut filter = refs_filter(&["feature"]);
+    filter.message = Some("fix".into());
+    let page = filtered_page(&session, &filter).await?;
+    assert_messages(&page, &["fix: engine crash", "fix typo in guide"]);
+    assert_eq!(page.total_approx, 2);
+
+    // Same predicate, wider scope: the merge is back.
+    let mut filter = refs_filter(&["main"]);
+    filter.message = Some("merge".into());
+    assert_messages(&filtered_page(&session, &filter).await?, &["merge feature"]);
+
+    // Paging over a scoped+filtered view slices the memoized hit list.
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 1,
+        limit: 1,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+    let mut filter = refs_filter(&["feature"]);
+    filter.message = Some("fix".into());
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &viewport,
+        Some(&filter),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
+    )?;
+    assert_messages(&page, &["fix typo in guide"]);
+    assert_eq!(page.total_approx, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_filter_refs_scope_pages_without_materializing() -> anyhow::Result<()> {
+    let dir = filter_repo()?;
+    let session = open_session(&dir).await?;
+
+    // refs-only stays on the windowed path: a page limit smaller than the
+    // branch history still reports has_more (a materialized filtered view
+    // would report the exact hit count instead).
+    let viewport = bamboo_protocol::GraphViewport {
+        offset: 0,
+        limit: 1,
+        anchor_commit: None,
+        epoch: session.current_epoch(),
+    };
+    let page = bamboo_engine::gix_read::read_graph_page_with_limits(
+        &session,
+        &viewport,
+        Some(&refs_filter(&["feature"])),
+        &bamboo_engine::graph_filter::FilterLimits::default(),
+    )?;
+    assert_messages(&page, &["fix: engine crash"]);
+    assert!(page.has_more);
     Ok(())
 }
 
@@ -1221,6 +1335,60 @@ async fn switch_branch_auto_stash_carries_changes() -> anyhow::Result<()> {
         .output()?;
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_branch_checks_out_remote_branch_as_tracking_branch() -> anyhow::Result<()> {
+    let (work, _origin) = test_repo_with_origin()?;
+    // origin/feature exists, the local branch does not.
+    gitq(work.path(), &["push", "-q", "origin", "feature"])?;
+    gitq(work.path(), &["branch", "-D", "feature"])?;
+    let session = open_session(&work).await?;
+
+    session
+        .enqueue_write(WriteCommand::SwitchBranch {
+            name: "origin/feature".to_string(),
+            auto_stash: true,
+        })
+        .await?
+        .expect_output();
+
+    let head = std::fs::read_to_string(work.path().join(".git").join("HEAD"))?;
+    assert!(head.trim() == "ref: refs/heads/feature", "HEAD: {head}");
+    assert_eq!(
+        gitq(work.path(), &["rev-parse", "--abbrev-ref", "feature@{upstream}"])?
+            .trim(),
+        "origin/feature"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_branch_prefers_an_existing_local_branch_over_the_remote_name() -> anyhow::Result<()> {
+    let (work, _origin) = test_repo_with_origin()?;
+    // Both origin/feature and a local feature exist: the local branch is
+    // what the user means, and no second branch is created.
+    gitq(work.path(), &["push", "-q", "origin", "feature"])?;
+    let session = open_session(&work).await?;
+
+    session
+        .enqueue_write(WriteCommand::SwitchBranch {
+            name: "origin/feature".to_string(),
+            auto_stash: true,
+        })
+        .await?
+        .expect_output();
+
+    let head = std::fs::read_to_string(work.path().join(".git").join("HEAD"))?;
+    assert!(head.trim() == "ref: refs/heads/feature", "HEAD: {head}");
+    assert_eq!(
+        gitq(work.path(), &["branch", "--list", "--format=%(refname:short)"])?
+            .lines()
+            .filter(|l| *l == "feature")
+            .count(),
+        1
+    );
     Ok(())
 }
 

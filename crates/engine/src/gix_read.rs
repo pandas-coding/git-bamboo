@@ -58,7 +58,22 @@ pub fn read_graph_page_with_limits(
         let _ = cache.invalidate_on_epoch_change(current_epoch)?;
     }
 
-    let tips = collect_tips(&repo)?;
+    // Normalize exactly like the server parse layer (trim, drop empty
+    // fields): a whitespace-only filter is an unfiltered request,
+    // whichever layer the caller came through.
+    let filter = filter
+        .map(|f| f.clone().normalized())
+        .filter(|f| !f.is_empty());
+
+    // A `refs` scope narrows the walk's starting points: only commits
+    // reachable from the selected branches are shown. Names that no longer
+    // resolve (a branch deleted since the client built its filter) are
+    // skipped like unreadable refs in `collect_tips`; when none resolve the
+    // page is empty, exactly like a repo with no refs.
+    let tips = match filter.as_ref().and_then(|f| f.refs.as_deref()) {
+        Some(names) => collect_scoped_tips(&repo, names),
+        None => collect_tips(&repo)?,
+    };
     if tips.is_empty() {
         return Ok(GraphPage {
             commits: Vec::new(),
@@ -70,10 +85,10 @@ pub fn read_graph_page_with_limits(
         });
     }
 
-    // Routing normalizes exactly like the server parse layer (trim, drop
-    // empty fields): a whitespace-only filter is an unfiltered request,
-    // whichever layer the caller came through.
-    match filter.map(|f| f.clone().normalized()).filter(|f| !f.is_empty()) {
+    // `refs` alone is a scope, not a predicate: the windowed read pages
+    // over the (narrowed) walk directly, so branch-only filtering stays
+    // O(limit) instead of materializing the whole branch history.
+    match filter.as_ref().filter(|f| f.has_predicates()) {
         Some(f) => {
             // The filtered walk can hold the repo lock for up to its time
             // budget (see `FilterLimits`); it re-acquires the cache lock
@@ -84,7 +99,7 @@ pub fn read_graph_page_with_limits(
                 &repo,
                 &tips,
                 viewport,
-                &f,
+                f,
                 current_epoch,
                 limits,
             )
@@ -219,6 +234,30 @@ fn collect_tips(repo: &gix::Repository) -> anyhow::Result<Vec<gix::ObjectId>> {
         }
     }
     Ok(tips)
+}
+
+/// Tips for a `refs`-scoped graph read: resolve each requested name (a
+/// branch, a remote-tracking branch, or any other revision gix accepts)
+/// and peel it to a commit. Unresolvable names are skipped — a filter can
+/// outlive the branch it names, and that must not fail the page.
+fn collect_scoped_tips(repo: &gix::Repository, names: &[String]) -> Vec<gix::ObjectId> {
+    let mut tips = Vec::new();
+    for name in names {
+        let commit = repo
+            .rev_parse_single(name.as_bytes())
+            .ok()
+            .and_then(|id| id.object().ok())
+            .and_then(|obj| obj.peel_to_commit().ok());
+        match commit {
+            Some(commit) => {
+                if !tips.contains(&commit.id) {
+                    tips.push(commit.id);
+                }
+            }
+            None => debug!(ref_name = %name, "skipping graph filter ref that does not resolve"),
+        }
+    }
+    tips
 }
 
 /// The shared graph walk: newest-first by commit time, commit-graph

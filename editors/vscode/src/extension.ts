@@ -195,6 +195,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     });
   }
+  // Context-menu "Switch to This Branch": only offered on rows that show
+  // a branch pill (`branchTip == yes` in the row's webview context). Several
+  // branches can tip the same commit — pick one when they do.
+  registerCommand(context, 'gitBamboo.graph.switchBranchAt', () =>
+    withGraphTarget(async ({ client, commit }) => {
+      if (commit.branches.length === 0) {
+        vscode.window.showInformationMessage(
+          'Git Bamboo: no branch points at this commit — use "Checkout Commit (New Branch)…" instead.',
+        );
+        return;
+      }
+      const name =
+        commit.branches.length === 1
+          ? commit.branches[0]
+          : await vscode.window.showQuickPick(commit.branches, {
+              placeHolder: `Switch to which branch at ${commit.id.slice(0, 8)}?`,
+            });
+      if (!name) return;
+      try {
+        await switchToBranch(client, name);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Git Bamboo: switch failed — ${errorMessage(err)}`);
+      }
+    }));
   registerCommand(context, 'gitBamboo.graph.createBranchAt', () =>
     withGraphTarget(async ({ client, commit }) => {
       const name = await promptBranchName(`Create branch at ${commit.id.slice(0, 8)}`);
@@ -266,8 +290,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       return;
     }
-    type FilterField = 'message' | 'author' | 'path';
+    type FilterField = 'message' | 'author' | 'path' | 'refs';
     const items: { label: string; description: string; field: FilterField | null }[] = [
+      { label: 'Branches', description: 'Show only commits reachable from the selected branches', field: 'refs' },
       { label: 'Message', description: 'Case-insensitive substring of the summary line', field: 'message' },
       { label: 'Author', description: 'Case-insensitive substring of name or email', field: 'author' },
       { label: 'Path', description: 'Case-sensitive substring of a changed path', field: 'path' },
@@ -279,9 +304,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       placeHolder: 'Filter the commit graph by…',
     });
     if (!pick) return;
-    const base: GraphFilter = current ?? { author: null, message: null, path: null };
+    const base: GraphFilter = current ?? { author: null, message: null, path: null, refs: null };
     if (pick.field === null) {
-      applyGraphFilter(activeClient, { author: null, message: null, path: null });
+      applyGraphFilter(activeClient, { author: null, message: null, path: null, refs: null });
+      return;
+    }
+    if (pick.field === 'refs') {
+      const refs = await activeClient.getRefs();
+      const names = refs
+        .filter((ref) => ref.kind === 'branch' || ref.kind === 'remote_branch')
+        .map((ref) => ref.name)
+        .sort((a, b) => a.localeCompare(b));
+      const picked = await vscode.window.showQuickPick(
+        names.map((name) => ({ label: name, picked: base.refs?.includes(name) ?? false })),
+        { placeHolder: 'Show commits reachable from… (none selected = all branches)', canPickMany: true },
+      );
+      if (!picked) return; // cancelled — keep the current filter
+      applyGraphFilter(activeClient, {
+        ...base,
+        refs: picked.length > 0 ? picked.map((item) => item.label) : null,
+      });
       return;
     }
     const text = await vscode.window.showInputBox({
@@ -299,7 +341,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             : '',
     });
     if (text === undefined) return; // cancelled — keep the current filter
-    const next: GraphFilter = { author: base.author, message: base.message, path: base.path };
+    const next: GraphFilter = { ...base };
     next[pick.field] = text.trim() || null;
     applyGraphFilter(activeClient, next);
   });
@@ -505,6 +547,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // branch). getBranchStatus (Phase 1) is the data source; the same
   // refsChanged/headChanged notifications that refresh the graph drive it.
   const branchItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  // Clicking the branch name opens the branch switcher (the same picker
+  // the graph toolbar's branch pill and the palette use).
+  branchItem.command = 'gitBamboo.switchBranch';
   context.subscriptions.push(branchItem);
   let branchLabel = '';
   let branchTooltip = '';
@@ -521,8 +566,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       state.currentBranch = branch ?? undefined;
       branchLabel = branch ?? head.slice(0, 8);
       branchTooltip = branch
-        ? `Git Bamboo: on branch ${branch}`
-        : `Git Bamboo: detached HEAD at ${head}`;
+        ? `Git Bamboo: on branch ${branch} — click to switch branch`
+        : `Git Bamboo: detached HEAD at ${head} — click to switch branch`;
       renderBranchItem();
       branchItem.show();
     } catch (err) {

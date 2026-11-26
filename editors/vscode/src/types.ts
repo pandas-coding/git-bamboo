@@ -81,11 +81,14 @@ export interface GraphViewport {
  *  all-null filter means unfiltered. Semantics mirror the engine:
  *  author matches name OR email, case-insensitive substring; message
  *  matches the summary line, case-insensitive substring; path is a
- *  case-sensitive substring of any first-parent-changed path. */
+ *  case-sensitive substring of any first-parent-changed path.
+ *  `refs` is a SCOPE, not a predicate: the walk starts from those refs
+ *  only (union), so the graph shows just the selected branches. */
 export interface GraphFilter {
   author: string | null;
   message: string | null;
   path: string | null;
+  refs: string[] | null;
 }
 
 export interface GraphPage {

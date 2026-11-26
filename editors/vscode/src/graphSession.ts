@@ -10,6 +10,7 @@ import * as vscode from 'vscode';
 import { EngineClient, RpcError } from './engineClient';
 import { ConflictFlow } from './conflictFlow';
 import { openCommitDetailPanel } from './commitDetail';
+import { switchBranch } from './commands';
 import { createContextTargetSlot } from './contextTargetSlot';
 import * as netOps from './netOps';
 import { runRebaseStep } from './rebaseControl';
@@ -60,6 +61,11 @@ interface BranchStatusMessage {
   behind: number;
 }
 
+/** Ref-count cap for a graph filter, mirrored from the engine's
+ *  `MAX_FILTER_REFS` (the engine re-validates; this drops payloads the UI
+ *  could never have produced). */
+const MAX_FILTER_REFS = 64;
+
 /** Lane-area width bounds, mirrored from the webview (graph.js) so the host
  *  can validate webview-supplied widths before persisting them. */
 const GRAPH_MIN_WIDTH = 44;
@@ -78,8 +84,9 @@ interface GraphViewMessage {
    *  override and return to auto width. */
   width?: number | null;
   /** contextTarget payload: the commit under the webview's context menu
-   *  (null = right-click landed on a non-commit row; clears any target). */
-  commit?: { id?: unknown; message?: unknown } | null;
+   *  (null = right-click landed on a non-commit row; clears any target).
+   *  `branches` are the branch tips rendered on that row. */
+  commit?: { id?: unknown; message?: unknown; branches?: unknown } | null;
   /** openCommitDetail payload: the full id of the single-clicked commit. */
   id?: unknown;
   /** netOp payload: which toolbar operation the webview requested. */
@@ -100,6 +107,9 @@ function widthKey(host: GraphHost): string {
 export interface GraphContextCommit {
   id: string;
   message: string;
+  /** Branch names whose tips are this commit (local and remote-tracking,
+   *  as getRefs reports them); empty when the row shows no branch pill. */
+  branches: string[];
 }
 
 /** The parked context-menu target: the commit plus the engine client of the
@@ -140,23 +150,37 @@ export function currentGraphFilter(client: EngineClient): GraphFilter | null | u
 }
 
 /** Trim a filter's string fields and drop empty ones; an all-empty
- *  filter normalizes to null (no filter — the unfiltered path). */
+ *  filter normalizes to null (no filter — the unfiltered path). Ref
+ *  names are trimmed and de-duplicated the same way the engine does, so
+ *  selecting one branch twice is not a new query. */
 export function normalizeGraphFilter(filter: GraphFilter): GraphFilter | null {
   const trim = (value: string | null): string | null => {
     const trimmed = value?.trim();
     return trimmed ? trimmed : null;
   };
+  const refs = [...new Set((filter.refs ?? []).map((name) => name.trim()).filter(Boolean))];
   const normalized: GraphFilter = {
     author: trim(filter.author),
     message: trim(filter.message),
     path: trim(filter.path),
+    refs: refs.length > 0 ? refs : null,
   };
-  return normalized.author || normalized.message || normalized.path ? normalized : null;
+  return normalized.author || normalized.message || normalized.path || normalized.refs
+    ? normalized
+    : null;
 }
 
 /** Whether two normalized filters are the same (null = unfiltered). */
 function sameFilter(a: GraphFilter | null, b: GraphFilter | null): boolean {
-  return a?.author === b?.author && a?.message === b?.message && a?.path === b?.path;
+  const refsA = a?.refs ?? [];
+  const refsB = b?.refs ?? [];
+  return (
+    a?.author === b?.author &&
+    a?.message === b?.message &&
+    a?.path === b?.path &&
+    refsA.length === refsB.length &&
+    refsA.every((name, i) => name === refsB[i])
+  );
 }
 
 /** Parse a webview-supplied filter payload (trust boundary). Every
@@ -183,7 +207,39 @@ function parseWebviewFilter(payload: unknown): GraphFilter | null | undefined {
   if (author === undefined || message === undefined || path === undefined) {
     return undefined;
   }
-  return normalizeGraphFilter({ author, message, path });
+  // refs: null/absent, or an array of strings within the engine's count
+  // cap (a longer list is malformed here rather than an RPC error — the
+  // UI cannot produce one).
+  let refs: string[] | null = null;
+  if (record.refs !== null && record.refs !== undefined) {
+    if (
+      !Array.isArray(record.refs) ||
+      record.refs.length > MAX_FILTER_REFS ||
+      !record.refs.every((name) => typeof name === 'string')
+    ) {
+      return undefined;
+    }
+    refs = record.refs as string[];
+  }
+  return normalizeGraphFilter({ author, message, path, refs });
+}
+
+/** Branch names riding a contextTarget payload (trust boundary): only
+ *  well-formed ref names survive, so a forged payload cannot smuggle an
+ *  option-like argument into the switch command. The engine's
+ *  `validate_ref_arg` is the enforcement point; this is the host's gate. */
+function parseContextBranches(payload: unknown): string[] {
+  if (!Array.isArray(payload)) return [];
+  return payload
+    .filter(
+      (name): name is string =>
+        typeof name === 'string' &&
+        name.length > 0 &&
+        name.length <= 512 &&
+        !name.startsWith('-') &&
+        !/[\x00-\x1f\x7f]/.test(name),
+    )
+    .slice(0, MAX_FILTER_REFS);
 }
 
 /** Returns (and clears) the commit targeted by the graph context menu, if
@@ -381,12 +437,20 @@ export class GraphSession implements vscode.Disposable {
       ) {
         graphContextSlot.park({
           client: this.client,
-          commit: { id: commit.id, message: commit.message },
+          commit: {
+            id: commit.id,
+            message: commit.message,
+            branches: parseContextBranches(commit.branches),
+          },
           owner: this,
         });
       } else {
         graphContextSlot.clear();
       }
+    } else if (message?.type === 'switchBranch') {
+      // Toolbar branch pill: the same picker the status bar and the
+      // command palette open (one implementation, three entry points).
+      void switchBranch(this.client);
     } else if (message?.type === 'netOp') {
       // Toolbar button / badge click. The op is validated against the
       // NET_OPS table's keys before anything runs — the webview is a trust
