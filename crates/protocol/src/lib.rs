@@ -110,6 +110,11 @@ pub enum StatusCode {
 /// - `path`: case-SENSITIVE substring of any path changed vs. the first
 ///   parent (full tree diff for root commits).
 ///
+/// `refs` is not a predicate but a SCOPE: the walk starts from those refs
+/// only, so the graph shows just the commits reachable from the selected
+/// branches (union when several are given). Absent = every ref, the
+/// historical behavior.
+///
 /// Multiple set conditions AND together; each field is validated at the
 /// server parse layer: non-empty, ≤ 256 chars, no control characters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -120,24 +125,51 @@ pub struct GraphFilter {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Vec<String>>,
 }
+
+/// Maximum number of refs one graph filter may scope the walk to.
+pub const MAX_FILTER_REFS: usize = 64;
 
 impl GraphFilter {
     /// True when no condition is set — a filter with no fields is a no-op
     /// and callers treat it as `None` (the unfiltered fast path).
     pub fn is_empty(&self) -> bool {
-        self.author.is_none() && self.message.is_none() && self.path.is_none()
+        self.author.is_none()
+            && self.message.is_none()
+            && self.path.is_none()
+            && self.refs.as_deref().unwrap_or_default().is_empty()
+    }
+
+    /// True when no PREDICATE is set: a refs-only filter narrows the walk's
+    /// tips but still reads pages off the windowed (unfiltered) path.
+    pub fn has_predicates(&self) -> bool {
+        self.author.is_some() || self.message.is_some() || self.path.is_some()
     }
 
     /// Normalize after deserialization: trim whitespace, drop empty strings.
     /// The server parse layer calls this before validation so an `""` field
-    /// behaves exactly like an absent field on the wire.
+    /// behaves exactly like an absent field on the wire. Ref names are also
+    /// de-duplicated (order preserved) — selecting the same branch twice
+    /// must not build a second memoized view.
     pub fn normalized(self) -> Self {
         let trim = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let refs = self.refs.map(|names| {
+            let mut seen = Vec::new();
+            for name in names {
+                let name = name.trim().to_string();
+                if !name.is_empty() && !seen.contains(&name) {
+                    seen.push(name);
+                }
+            }
+            seen
+        });
         Self {
             author: trim(self.author),
             message: trim(self.message),
             path: trim(self.path),
+            refs: refs.filter(|names| !names.is_empty()),
         }
     }
 }
@@ -251,6 +283,25 @@ pub fn validate_graph_filter(filter: &GraphFilter) -> Result<(), BambooError> {
             if text.chars().any(|c| c.is_ascii_control()) {
                 return Err(BambooError::invalid_argument(format!(
                     "getGraph: filter field {field} contains control characters"
+                )));
+            }
+        }
+    }
+    if let Some(refs) = &filter.refs {
+        if refs.len() > MAX_FILTER_REFS {
+            return Err(BambooError::invalid_argument(format!(
+                "getGraph: filter field refs exceeds {MAX_FILTER_REFS} entries"
+            )));
+        }
+        for name in refs {
+            if name.is_empty() || name.starts_with('-') {
+                return Err(BambooError::invalid_argument(format!(
+                    "getGraph: filter ref {name:?} is not a valid ref name"
+                )));
+            }
+            if name.chars().count() > 256 || name.chars().any(|c| c.is_ascii_control()) {
+                return Err(BambooError::invalid_argument(format!(
+                    "getGraph: filter ref {name:?} exceeds 256 characters or contains control characters"
                 )));
             }
         }

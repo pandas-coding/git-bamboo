@@ -37,9 +37,90 @@ async function pickBranch(
   return picked?.branchName;
 }
 
+/** One entry of the branch switcher: a branch to switch to, or the
+ *  "create new branch" entry. */
+interface SwitchPickItem extends vscode.QuickPickItem {
+  branchName?: string;
+  create?: boolean;
+}
+
+/** The branch switcher shared by the status bar item, the graph toolbar's
+ *  branch pill and the command palette: current branch first, then the
+ *  other local branches, then remote-tracking branches (checking one out
+ *  creates a local tracking branch — the engine handles that), plus a
+ *  "create new branch" entry. */
 export async function switchBranch(client: EngineClient): Promise<void> {
-  const name = await pickBranch(client, 'Switch to branch');
-  if (!name) return;
+  let refs: Ref[];
+  let current: string | null;
+  try {
+    [refs, current] = await Promise.all([
+      client.request<Ref[]>('getRefs', {}),
+      client.getHead().then((head) => head.branch),
+    ]);
+  } catch (err) {
+    vscode.window.showErrorMessage(`Git Bamboo: could not read branches — ${errorMessage(err)}`);
+    return;
+  }
+  const locals = refs
+    .filter((ref) => ref.kind === 'branch')
+    .map((ref) => ref.name)
+    .sort((a, b) => (a === current ? -1 : b === current ? 1 : a.localeCompare(b)));
+  const remotes = refs
+    .filter((ref) => ref.kind === 'remote_branch')
+    .map((ref) => ref.name)
+    .sort((a, b) => a.localeCompare(b));
+
+  const items: SwitchPickItem[] = [
+    {
+      label: '$(add) Create new branch…',
+      description: 'from a base you pick next',
+      create: true,
+      alwaysShow: true,
+    },
+  ];
+  if (locals.length > 0) {
+    items.push({ label: 'Local branches', kind: vscode.QuickPickItemKind.Separator });
+    for (const name of locals) {
+      items.push({
+        label: name === current ? `$(check) ${name}` : name,
+        description: name === current ? 'current branch' : undefined,
+        branchName: name,
+      });
+    }
+  }
+  if (remotes.length > 0) {
+    items.push({ label: 'Remote branches', kind: vscode.QuickPickItemKind.Separator });
+    for (const name of remotes) {
+      // A remote branch whose short name is already local switches to that
+      // local branch (engine rule) — say so instead of promising a checkout.
+      const short = name.slice(name.indexOf('/') + 1);
+      items.push({
+        label: name,
+        description: locals.includes(short)
+          ? `switches to local ${short}`
+          : 'checks out as a local tracking branch',
+        branchName: name,
+      });
+    }
+  }
+
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: 'Switch to branch (type to search)',
+    matchOnDescription: true,
+  });
+  if (!picked) return;
+  if (picked.create) {
+    // Creating from the switcher means "create and go there".
+    const created = await createBranch(client);
+    if (created) await switchToBranch(client, created);
+    return;
+  }
+  if (picked.branchName) await switchToBranch(client, picked.branchName);
+}
+
+/** Switch to `name` with auto-stash, surfacing progress and errors. The
+ *  engine checks a remote-tracking name out as a local tracking branch. */
+export async function switchToBranch(client: EngineClient, name: string): Promise<void> {
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `Git Bamboo: switching to ${name}…` },
     async () => {
@@ -53,12 +134,14 @@ export async function switchBranch(client: EngineClient): Promise<void> {
   );
 }
 
-export async function createBranch(client: EngineClient): Promise<void> {
+/** Create a branch; resolves to its name on success (the switcher checks
+ *  the new branch out afterwards), undefined when cancelled or failed. */
+export async function createBranch(client: EngineClient): Promise<string | undefined> {
   const name = await vscode.window.showInputBox({
     prompt: 'Branch name',
     validateInput: (value) => (value.trim() ? undefined : 'Name is required'),
   });
-  if (!name) return;
+  if (!name) return undefined;
   // Optional base: HEAD by default, cancel keeps base unspecified (engine uses HEAD).
   const picked = await vscode.window.showQuickPick<BranchPickItem>(
     [
@@ -69,13 +152,15 @@ export async function createBranch(client: EngineClient): Promise<void> {
     ],
     { placeHolder: `Create ${name} from` },
   );
-  if (picked === undefined) return; // treat ESC as abort of the whole command
+  if (picked === undefined) return undefined; // treat ESC as abort of the whole command
   const base = picked.branchName === 'HEAD' ? undefined : picked.branchName;
   try {
     await client.request('createBranch', { name, ...(base ? { base } : {}) });
     vscode.window.showInformationMessage(`Git Bamboo: created branch ${name}`);
+    return name;
   } catch (err) {
     vscode.window.showErrorMessage(`Git Bamboo: create branch failed — ${errorMessage(err)}`);
+    return undefined;
   }
 }
 

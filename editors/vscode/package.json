@@ -85,7 +85,7 @@
         "command": "gitBamboo.commitAmend",
         "title": "Amend Last Commit",
         "category": "Git Bamboo",
-        "icon": "$(edit)"
+        "icon": "$(replace)"
       },
       {
         "command": "gitBamboo.refreshChanges",
@@ -102,6 +102,12 @@
         "command": "gitBamboo.graph.copyMessage",
         "title": "Copy Commit Message",
         "category": "Git Bamboo"
+      },
+      {
+        "command": "gitBamboo.graph.switchBranchAt",
+        "title": "Switch to This Branch",
+        "category": "Git Bamboo",
+        "icon": "$(git-branch)"
       },
       {
         "command": "gitBamboo.graph.createBranchAt",
@@ -225,7 +231,7 @@
         "command": "gitBamboo.commitView.discardAllUntracked",
         "title": "Discard All Untracked Files",
         "category": "Git Bamboo",
-        "icon": "$(discard)"
+        "icon": "$(trash)"
       },
       {
         "command": "gitBamboo.commitView.openMergeEditor",
@@ -301,6 +307,10 @@
         },
         {
           "command": "gitBamboo.graph.copyMessage",
+          "when": "false"
+        },
+        {
+          "command": "gitBamboo.graph.switchBranchAt",
           "when": "false"
         },
         {
@@ -407,9 +417,14 @@
           "group": "0_details"
         },
         {
+          "command": "gitBamboo.graph.switchBranchAt",
+          "when": "webviewSection == commitRow && branchTip == yes && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
+          "group": "1_checkout@1"
+        },
+        {
           "command": "gitBamboo.graph.checkoutNewBranch",
           "when": "webviewSection == commitRow && (webviewId == gitBamboo.graph || webviewId == gitBamboo.graphPanel)",
-          "group": "1_checkout"
+          "group": "1_checkout@2"
         },
         {
           "command": "gitBamboo.graph.createBranchAt",

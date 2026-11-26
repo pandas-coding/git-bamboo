@@ -227,6 +227,20 @@ import { formatTime, shortSha } from './util.js';
     vscode.postMessage({ type: 'netOp', op: 'publish' });
   });
 
+  // Current-branch pill: the host opens the same branch switcher the
+  // status bar item does (one picker, three entry points).
+  const branchPill = document.getElementById('branch-pill');
+  const branchPillName = document.getElementById('branch-pill-name');
+  branchPill.addEventListener('click', () => vscode.postMessage({ type: 'switchBranch' }));
+
+  /** Shows the checked-out branch (or the short sha when detached). */
+  function updateBranchPill(branch, sha) {
+    branchPillName.textContent = branch || shortSha(sha);
+    branchPill.title = branch ? `On branch ${branch} — click to switch` : 'Detached HEAD — click to switch branch';
+    branchPill.setAttribute('aria-label', branchPill.title);
+    branchPill.hidden = false;
+  }
+
   updateToolbar();
 
   // -------------------------------------------------------------- filter bar
@@ -260,11 +274,18 @@ import { formatTime, shortSha } from './util.js';
 
   let filterTimer = 0;
 
+  function sameRefs(a, b) {
+    const left = (a && a.refs) || [];
+    const right = (b && b.refs) || [];
+    return left.length === right.length && left.every((name, i) => name === right[i]);
+  }
+
   function sameFilter(a, b) {
     return (
       (a ? a.author : null) === (b ? b.author : null) &&
       (a ? a.message : null) === (b ? b.message : null) &&
-      (a ? a.path : null) === (b ? b.path : null)
+      (a ? a.path : null) === (b ? b.path : null) &&
+      sameRefs(a, b)
     );
   }
 
@@ -272,7 +293,9 @@ import { formatTime, shortSha } from './util.js';
    *  echoes it: fields are pre-trimmed (or null); an all-null filter is
    *  no filter. */
   function normalizeSent(next) {
-    return next && (next.author || next.message || next.path) ? next : null;
+    return next && (next.author || next.message || next.path || (next.refs && next.refs.length))
+      ? next
+      : null;
   }
 
   function sendFilter(next) {
@@ -290,7 +313,7 @@ import { formatTime, shortSha } from './util.js';
    *  sends the whole filter (empty text clears that condition). */
   function commitFilterInput() {
     clearTimeout(filterTimer);
-    const base = filter ?? { author: null, message: null, path: null };
+    const base = filter ?? { author: null, message: null, path: null, refs: null };
     const text = filterInput.value.trim();
     sendFilter({ ...base, [filterType.value]: text || null });
   }
@@ -318,6 +341,12 @@ import { formatTime, shortSha } from './util.js';
     sendFilter(null);
   });
 
+  /** Replace the branch scope (null/empty = all branches). */
+  function sendRefs(names) {
+    const base = filter ?? { author: null, message: null, path: null, refs: null };
+    sendFilter({ ...base, refs: names && names.length ? names : null });
+  }
+
   /** Inline DOM SVG × for chip remove buttons (CSP allows inline SVG).
    *  Invariant, so built once and cloned per chip. */
   const CHIP_REMOVE_ICON = (() => {
@@ -343,29 +372,48 @@ import { formatTime, shortSha } from './util.js';
     const active = filter
       ? ['author', 'message', 'path'].filter((type) => filter[type])
       : [];
-    filterClear.hidden = active.length === 0;
+    const refs = (filter && filter.refs) || [];
+    filterClear.hidden = active.length === 0 && refs.length === 0;
     for (const type of active) {
-      const chip = document.createElement('span');
-      chip.className = 'filter-chip';
-      const label = document.createElement('span');
-      label.className = 'chip-label';
-      label.textContent = `${type} ${filter[type]}`;
-      label.title = `${type}: ${filter[type]}`;
-      chip.appendChild(label);
-      const remove = document.createElement('button');
-      remove.className = 'chip-remove';
-      remove.type = 'button';
-      remove.title = `Remove the ${type} condition`;
-      remove.setAttribute('aria-label', `Remove the ${type} condition`);
-      remove.appendChild(CHIP_REMOVE_ICON.cloneNode(true));
-      remove.addEventListener('click', () => {
-        clearTimeout(filterTimer);
-        if (type === filterType.value) filterInput.value = '';
-        sendFilter({ ...filter, [type]: null });
-      });
-      chip.appendChild(remove);
-      filterChips.appendChild(chip);
+      filterChips.appendChild(
+        filterChip(`${type} ${filter[type]}`, `${type}: ${filter[type]}`, `Remove the ${type} condition`, () => {
+          clearTimeout(filterTimer);
+          if (type === filterType.value) filterInput.value = '';
+          sendFilter({ ...filter, [type]: null });
+        }),
+      );
     }
+    // One chip per selected branch: the scope is a union, and each branch
+    // drops out individually.
+    for (const name of refs) {
+      filterChips.appendChild(
+        filterChip(`branch ${name}`, `branch: ${name}`, `Remove ${name} from the branch scope`, () => {
+          sendRefs(((filter && filter.refs) || []).filter((ref) => ref !== name));
+        }),
+      );
+    }
+    updateBranchFilterLabel();
+  }
+
+  /** One removable condition chip (textContent only — filter text and ref
+   *  names are untrusted). */
+  function filterChip(text, title, removeTitle, onRemove) {
+    const chip = document.createElement('span');
+    chip.className = 'filter-chip';
+    const label = document.createElement('span');
+    label.className = 'chip-label';
+    label.textContent = text;
+    label.title = title;
+    chip.appendChild(label);
+    const remove = document.createElement('button');
+    remove.className = 'chip-remove';
+    remove.type = 'button';
+    remove.title = removeTitle;
+    remove.setAttribute('aria-label', removeTitle);
+    remove.appendChild(CHIP_REMOVE_ICON.cloneNode(true));
+    remove.addEventListener('click', onRemove);
+    chip.appendChild(remove);
+    return chip;
   }
 
   /** Validates a host filterState payload: a filter object with
@@ -380,7 +428,14 @@ import { formatTime, shortSha } from './util.js';
     const message = field(payload.message);
     const path = field(payload.path);
     if (author === undefined || message === undefined || path === undefined) return undefined;
-    return author || message || path ? { author, message, path } : null;
+    let refs = null;
+    if (payload.refs !== null && payload.refs !== undefined) {
+      if (!Array.isArray(payload.refs) || !payload.refs.every((n) => typeof n === 'string')) {
+        return undefined;
+      }
+      refs = payload.refs.length ? [...payload.refs] : null;
+    }
+    return author || message || path || refs ? { author, message, path, refs } : null;
   }
 
   /** A new filter is a new query: the hit list occupies a different row
@@ -433,12 +488,127 @@ import { formatTime, shortSha } from './util.js';
       filterCount.hidden = true;
       return;
     }
+    // A branch-only scope stays on the engine's windowed walk, so its
+    // total is a lower bound exactly like the unfiltered graph's — show
+    // "≥ N" rather than a precise-looking count that would lie.
+    const lowerBound = page.truncated || !(filter.author || filter.message || filter.path);
     filterCount.hidden = false;
-    filterCount.textContent = `${page.truncated ? '\u2265 ' : ''}${total} commit${total === 1 ? '' : 's'}`;
+    filterCount.textContent = `${lowerBound ? '\u2265 ' : ''}${total} commit${total === 1 ? '' : 's'}`;
     filterCount.title = page.truncated
       ? 'At least this many commits match — the walk hit a safety cap'
-      : 'Commits matching the filter';
+      : lowerBound
+        ? 'At least this many commits are on the selected branches — scroll to load more'
+        : 'Commits matching the filter';
   }
+
+  // ------------------------------------------------------- branch scope menu
+
+  const branchFilterBtn = document.getElementById('branch-filter-btn');
+  const branchFilterLabel = document.getElementById('branch-filter-label');
+  const branchMenu = document.getElementById('branch-menu');
+  const branchSearch = document.getElementById('branch-search');
+  const branchList = document.getElementById('branch-list');
+  const branchAll = document.getElementById('branch-all');
+
+  /** Selectable branches (local + remote-tracking) from the latest refs
+   *  push — the dropdown's option space. */
+  let branchRefs = [];
+
+  /** Button label: the single selected branch, a count, or "All branches". */
+  function updateBranchFilterLabel() {
+    const refs = (filter && filter.refs) || [];
+    branchFilterLabel.textContent =
+      refs.length === 0 ? 'All branches' : refs.length === 1 ? refs[0] : `${refs.length} branches`;
+    branchFilterBtn.title = refs.length
+      ? `Showing commits reachable from: ${refs.join(', ')}`
+      : 'Show only commits reachable from the selected branches';
+    // Sync in place rather than rebuilding: a rebuild would drop the
+    // keyboard focus from the checkbox the user just toggled.
+    if (!branchMenu.hidden) {
+      for (const box of branchList.querySelectorAll('input[type="checkbox"]')) {
+        box.checked = refs.includes(box.dataset.name);
+      }
+    }
+  }
+
+  /** Rebuilds the checkbox list from branchRefs + the search text. Checked
+   *  state comes from the authoritative filter, so an echo from another
+   *  surface (palette, reloaded webview) resyncs the open menu too. */
+  function renderBranchList() {
+    const needle = branchSearch.value.trim().toLowerCase();
+    const selected = (filter && filter.refs) || [];
+    const matches = branchRefs.filter((ref) => ref.name.toLowerCase().includes(needle));
+    branchList.textContent = '';
+    if (matches.length === 0) {
+      const empty = document.createElement('div');
+      empty.id = 'branch-empty';
+      empty.textContent = branchRefs.length ? 'No matching branch' : 'No branches';
+      branchList.appendChild(empty);
+      return;
+    }
+    let group = '';
+    for (const ref of matches) {
+      const kind = ref.kind === 'branch' ? 'Local branches' : 'Remote branches';
+      if (kind !== group) {
+        group = kind;
+        const heading = document.createElement('div');
+        heading.className = 'branch-group';
+        heading.textContent = kind;
+        branchList.appendChild(heading);
+      }
+      const item = document.createElement('label');
+      item.className = ref.kind === 'branch' ? 'branch-item' : 'branch-item remote';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.dataset.name = ref.name;
+      box.checked = selected.includes(ref.name);
+      box.addEventListener('change', () => {
+        const current = (filter && filter.refs) || [];
+        sendRefs(
+          box.checked
+            ? [...current, ref.name]
+            : current.filter((name) => name !== ref.name),
+        );
+      });
+      const name = document.createElement('span');
+      name.className = 'branch-item-name';
+      name.textContent = ref.name; // textContent: ref names are untrusted
+      name.title = ref.name;
+      item.appendChild(box);
+      item.appendChild(name);
+      branchList.appendChild(item);
+    }
+  }
+
+  function setBranchMenuOpen(open) {
+    branchMenu.hidden = !open;
+    branchFilterBtn.setAttribute('aria-expanded', String(open));
+    if (open) {
+      branchSearch.value = '';
+      renderBranchList();
+      branchSearch.focus();
+    }
+  }
+
+  branchFilterBtn.addEventListener('click', () => setBranchMenuOpen(branchMenu.hidden));
+  branchSearch.addEventListener('input', renderBranchList);
+  branchAll.addEventListener('click', () => {
+    sendRefs(null);
+    setBranchMenuOpen(false);
+  });
+  // Click-away and Escape close the menu (the graph rows below must stay
+  // clickable — the menu is an overlay, not a modal).
+  document.addEventListener('pointerdown', (e) => {
+    if (branchMenu.hidden) return;
+    if (e.target instanceof Node && document.getElementById('branch-filter').contains(e.target)) return;
+    setBranchMenuOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !branchMenu.hidden) {
+      setBranchMenuOpen(false);
+      branchFilterBtn.focus();
+    }
+  });
 
   /** Refs by commit id (branch/tag/remote tips, from getRefs). */
   let branchTips = new Map();
@@ -511,9 +681,19 @@ import { formatTime, shortSha } from './util.js';
     const commit = commits.get(Number(rowEl.dataset.row));
     vscode.postMessage({
       type: 'contextTarget',
-      commit: commit ? { id: commit.id, message: commit.message } : null,
+      commit: commit
+        ? { id: commit.id, message: commit.message, branches: branchNamesAt(commit.id) }
+        : null,
     });
   });
+
+  /** Branch names (local + remote-tracking) whose tip is this commit —
+   *  what "Switch to This Branch" acts on. Tags are not branches. */
+  function branchNamesAt(id) {
+    return (branchTips.get(id) || [])
+      .filter((ref) => ref.kind === 'branch' || ref.kind === 'remote_branch')
+      .map((ref) => ref.name);
+  }
 
   // ------------------------------------------------------------- row rendering
 
@@ -566,9 +746,17 @@ import { formatTime, shortSha } from './util.js';
     // Native webview/context menu targeting: only real commit rows opt in
     // (skeleton rows show no menu). The value is static JSON, not markup.
     if (commit) {
+      // `branchTip` gates the "Switch to This Branch" entry: only rows
+      // that actually show a branch pill offer it. A string (not a
+      // boolean) so the menu's `branchTip == yes` clause compares two
+      // strings, like every other webviewSection clause.
       el.setAttribute(
         'data-vscode-context',
-        JSON.stringify({ webviewSection: 'commitRow', preventDefaultContextMenuItems: true }),
+        JSON.stringify({
+          webviewSection: 'commitRow',
+          branchTip: branchNamesAt(commit.id).length > 0 ? 'yes' : 'no',
+          preventDefaultContextMenuItems: true,
+        }),
       );
     } else {
       el.removeAttribute('data-vscode-context');
@@ -973,6 +1161,7 @@ import { formatTime, shortSha } from './util.js';
     } else if (message.type === 'head' && typeof message.sha === 'string') {
       // Force re-fill of rendered rows so the HEAD marker moves.
       headSha = message.sha;
+      updateBranchPill(typeof message.branch === 'string' ? message.branch : null, message.sha);
       refillRows();
     } else if (message.type === 'graphWidth') {
       // Host-persisted width from the 'ready' handshake (null = auto). Clamp
@@ -1012,13 +1201,28 @@ import { formatTime, shortSha } from './util.js';
   /** Index ref tips (branch/tag/remote) by target commit id and re-render. */
   function applyRefs(refs) {
     branchTips = new Map();
+    const selectable = [];
     for (const ref of refs) {
       if (!ref || typeof ref.name !== 'string' || !ref.target) continue;
       if (!Object.hasOwn(REF_ORDER, ref.kind)) continue; // branch | tag | remote_branch
       const list = branchTips.get(ref.target);
       if (list) list.push({ name: ref.name, kind: ref.kind });
       else branchTips.set(ref.target, [{ name: ref.name, kind: ref.kind }]);
+      if (ref.kind === 'branch' || ref.kind === 'remote_branch') {
+        selectable.push({ name: ref.name, kind: ref.kind });
+      }
     }
+    // Local branches first, then remote-tracking ones, each alphabetical.
+    branchRefs = selectable.sort(
+      (a, b) => REF_ORDER[a.kind] - REF_ORDER[b.kind] || a.name.localeCompare(b.name),
+    );
+    // A selected branch can be deleted outside the graph: drop it from the
+    // scope instead of silently showing an empty graph forever.
+    const selected = (filter && filter.refs) || [];
+    const alive = selected.filter((name) => branchRefs.some((ref) => ref.name === name));
+    if (alive.length !== selected.length) sendRefs(alive);
+    else updateBranchFilterLabel();
+    if (!branchMenu.hidden) renderBranchList(); // the option space moved
     // Force re-fill of already-rendered rows so tags appear without a scroll.
     refillRows();
   }

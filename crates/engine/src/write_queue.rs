@@ -2108,19 +2108,49 @@ async fn switch_branch(
     auto_stash: bool,
 ) -> anyhow::Result<String> {
     validate_ref_arg(name)?;
+    let argv = switch_argv(session, name);
     let repo_path = session.repo_path.clone();
     let repo_path_for_op = repo_path.clone();
-    let name = name.to_string();
     let op_desc = format!("switch to branch {name:?}");
     run_with_auto_stash(
         &repo_path,
         &op_desc,
         auto_stash,
         move || async move {
-            run_git_checked(&repo_path_for_op, &["switch", &name], &[]).await
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            run_git_checked(&repo_path_for_op, &args, &[]).await
         },
     )
     .await
+}
+
+/// `git switch` argv for a target name. A remote-tracking name
+/// (`origin/topic`) is checked out as a local tracking branch — plain
+/// `git switch origin/topic` refuses — unless a local branch of the short
+/// name already exists, in which case that branch is what the user means.
+/// Anything else is handed to git unchanged (its own DWIM covers a bare
+/// `topic` that exists on exactly one remote).
+fn switch_argv(session: &Session, name: &str) -> Vec<String> {
+    let plain = || vec!["switch".to_string(), name.to_string()];
+    let Some((_, short)) = name.split_once('/') else {
+        return plain();
+    };
+    // No await while the repo lock is held: this is a pure ref lookup.
+    let repo = session.gix_repo.lock().unwrap_or_else(|e| e.into_inner());
+    let has_ref = |full: &str| repo.try_find_reference(full).ok().flatten().is_some();
+    if has_ref(&format!("refs/heads/{name}")) || !has_ref(&format!("refs/remotes/{name}")) {
+        return plain();
+    }
+    if has_ref(&format!("refs/heads/{short}")) {
+        return vec!["switch".to_string(), short.to_string()];
+    }
+    vec![
+        "switch".to_string(),
+        "-c".to_string(),
+        short.to_string(),
+        "--track".to_string(),
+        name.to_string(),
+    ]
 }
 
 // ---------------------------------------------------------------------------
